@@ -65,7 +65,7 @@ fail_invreq_level(struct command *cmd,
 				"invoice_error", errdata);
 }
 
-static struct command_result *WARN_UNUSED_RESULT
+static struct command_result *WARN_UNUSED_RESULT PRINTF_FMT(3,4)
 fail_invreq(struct command *cmd,
 	    const struct invreq *invreq,
 	    const char *fmt, ...)
@@ -254,6 +254,13 @@ static struct command_result *check_period(struct command *cmd,
 		if (err)
 			return err;
 		period_idx += *ir->invreq->recurrence_start;
+
+		/* BOLT-offers #12:
+		 * - MUST set (or not set) `recurrence_start` exactly as the
+		 *   invoice_request did.
+		 */
+		ir->inv->recurrence_start
+			= tal_dup(ir->inv, u32, ir->invreq->recurrence_start);
 	} else {
 		/* BOLT-offers #12:
 		 *
@@ -354,7 +361,7 @@ static struct command_result *prev_invoice_done(struct command *cmd,
 	status = json_get_member(buf, arr + 1, "status");
 	if (!json_tok_streq(buf, status, "paid")) {
 		return fail_invreq(cmd, ir,
-				   "Previous invoice #%u status *.%s",
+				   "Previous invoice #%u status %.*s",
 				   *ir->inv->recurrence_counter - 1,
 				   json_tok_full_len(status),
 				   json_tok_full(buf, status));
@@ -409,15 +416,15 @@ static struct command_result *check_previous_invoice(struct command *cmd,
 }
 
 /* BOLT-offers #12:
- *  - MUST fail the request if `recurrence_signature` is not correct.
+ *  - MUST fail the request if `payer_signature` is not correct.
  */
-static bool check_recurrence_sig(const struct tlv_invoice_request *invreq,
-				 const struct pubkey32 *payer_key,
-				 const struct bip340sig *sig)
+static bool check_payer_sig(const struct tlv_invoice_request *invreq,
+			    const struct pubkey32 *payer_key,
+			    const struct bip340sig *sig)
 {
 	struct sha256 merkle, sighash;
 	merkle_tlv(invreq->fields, &merkle);
-	sighash_from_merkle("invoice_request", "recurrence_signature",
+	sighash_from_merkle("invoice_request", "payer_signature",
 			    &merkle, &sighash);
 
 	return secp256k1_schnorrsig_verify(secp256k1_ctx,
@@ -473,7 +480,7 @@ static struct command_result *invreq_base_amount_simple(struct command *cmd,
 		 * - otherwise:
 		 * - MUST fail the request if it does not contain `amount`.
 		 * - MUST use the request `amount` as the *base invoice amount*.
-		 *   (Note: invoice amount can be further modiifed by recurrence
+		 *   (Note: invoice amount can be further modified by recurrence
 		 *    below)
 		 */
 		err = invreq_must_have(cmd, ir, amount);
@@ -706,43 +713,37 @@ static struct command_result *listoffers_done(struct command *cmd,
 			return err;
 	}
 
+	err = invreq_must_have(cmd, ir, payer_signature);
+	if (err)
+		return err;
+	if (!check_payer_sig(ir->invreq,
+			     ir->invreq->payer_key,
+			     ir->invreq->payer_signature)) {
+		return fail_invreq(cmd, ir, "bad payer_signature");
+	}
+
 	if (ir->offer->recurrence) {
 		/* BOLT-offers #12:
 		 *
 		 * - if the offer had a `recurrence`:
 		 *   - MUST fail the request if there is no `recurrence_counter`
 		 *     field.
-		 *   - MUST fail the request if there is no
-		 *    `recurrence_signature` field.
-		 *   - MUST fail the request if `recurrence_signature` is not
-		 *     correct.
 		 */
 		err = invreq_must_have(cmd, ir, recurrence_counter);
 		if (err)
 			return err;
-
-		err = invreq_must_have(cmd, ir, recurrence_signature);
-		if (err)
-			return err;
-
-		if (!check_recurrence_sig(ir->invreq,
-					  ir->invreq->payer_key,
-					  ir->invreq->recurrence_signature)) {
-			return fail_invreq(cmd, ir,
-					   "bad recurrence_signature");
-		}
 	} else {
 		/* BOLT-offers #12:
 		 * - otherwise (the offer had no `recurrence`):
 		 *   - MUST fail the request if there is a `recurrence_counter`
 		 *     field.
-		 *   - MUST fail the request if there is a `recurrence_signature`
+		 *   - MUST fail the request if there is a `recurrence_start`
 		 *     field.
 		 */
 		err = invreq_must_not_have(cmd, ir, recurrence_counter);
 		if (err)
 			return err;
-		err = invreq_must_not_have(cmd, ir, recurrence_signature);
+		err = invreq_must_not_have(cmd, ir, recurrence_start);
 		if (err)
 			return err;
 	}
@@ -777,6 +778,7 @@ static struct command_result *listoffers_done(struct command *cmd,
 	 */
 	if (ir->offer->quantity_min || ir->offer->quantity_max)
 		ir->inv->quantity = tal_dup(ir->inv, u64, ir->invreq->quantity);
+
 	/* BOLT-offers #12:
 	 *  - MUST set `payer_key` exactly as the invoice_request did.
 	 */
@@ -789,6 +791,14 @@ static struct command_result *listoffers_done(struct command *cmd,
 	 */
 	ir->inv->payer_info
 		= tal_dup_talarr(ir->inv, u8, ir->invreq->payer_info);
+
+	/* BOLT-offers #12:
+	 * - MUST set (or not set) `payer_note` exactly as the invoice_request
+	 *   did, or MUST not set it.
+	 */
+	/* i.e. we don't have to do anything, but we do. */
+	ir->inv->payer_note
+		= tal_dup_talarr(ir->inv, char, ir->invreq->payer_note);
 
 	randombytes_buf(&ir->preimage, sizeof(ir->preimage));
 	ir->inv->payment_hash = tal(ir->inv, struct sha256);

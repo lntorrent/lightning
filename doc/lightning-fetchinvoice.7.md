@@ -15,6 +15,10 @@ The **fetchinvoice** RPC command contacts the issuer of an *offer* to get
 an actual invoice that can be paid.  It highlights any changes between the
 offer and the returned invoice.
 
+If **fetchinvoice-noconnect** is not specified in the configuation, it
+will connect to the destination in the (currently common!) case where it
+cannot find a route which supports `option_onion_messages`.
+
 The offer must not contain *send_invoice*; see lightning-sendinvoice(7).
 
 *msatoshi* is required if the *offer* does not specify
@@ -42,29 +46,22 @@ we fail (default, 60 seconds).
 RETURN VALUE
 ------------
 
-On success, an object as follows is returned:
-
-* *invoice*: the bolt12-encoded invoice string, starting with "lni1".
-* *changes*: an object detailing changes between the offer and invoice.
-
-Optionally:
-* *next_period*: an object returned for recurring invoices if the next 
-  period is under the recurrence_limit (if any).
-  
-The *changes* object can have and of the following members:
-* *description_appended*: extra characters appended to the *description* field.
-* *description*: a completely replaced *description* field.
-* *vendor_removed*": the offer vendor field, which has been omitted from the invoice.
-* *vendor*": the offer vendor field, which has changed from the invoice.
-* *msat*": the amount, if different from the offer amount multiplied
-  by any *quantity* (or the offer had no amount, or was not in BTC).
-
-The *next_period* object has at least the following members:
-* *counter*: the index of the next period to be fetchinvoice.
-* *starttime*: the time that the next period starts (seconds since 1970)
-* *endtime*: the time that the next period ends (seconds since 1970)
-* *paywindow_start*: the earliest time that the next invoice can be fetched (seconds since 1970)
-* *paywindow_end*: the latest time that the next invoice can be fetched (seconds since 1970)
+[comment]: # (GENERATE-FROM-SCHEMA-START)
+On success, an object is returned, containing:
+- **invoice** (string): The BOLT12 invoice we fetched
+- **changes** (object): Summary of changes from offer:
+  - **description_appended** (string, optional): extra characters appended to the *description* field.
+  - **description** (string, optional): a completely replaced *description* field
+  - **vendor_removed** (string, optional): The *vendor* from the offer, which is missing in the invoice
+  - **vendor** (string, optional): a completely replaced *vendor* field
+  - **msat** (msat, optional): the amount, if different from the offer amount multiplied by any *quantity* (or the offer had no amount, or was not in BTC).
+- **next_period** (object, optional): Only for recurring invoices if the next period is under the *recurrence_limit*:
+  - **counter** (u64): the index of the next period to fetchinvoice
+  - **starttime** (u64): UNIX timestamp that the next period starts
+  - **endtime** (u64): UNIX timestamp that the next period ends
+  - **paywindow_start** (u64): UNIX timestamp of the earliest time that the next invoice can be fetched
+  - **paywindow_end** (u64): UNIX timestamp of the latest time that the next invoice can be fetched
+[comment]: # (GENERATE-FROM-SCHEMA-END)
 
 The following error codes may occur:
 - -1: Catchall nonspecific error.
@@ -88,3 +85,4 @@ RESOURCES
 
 Main web site: <https://github.com/ElementsProject/lightning>
 
+[comment]: # ( SHA256STAMP:c98a6dd644a23fb336aa2ce190e15ae602da8b4142afbed28e4243114f679e90)

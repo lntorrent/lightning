@@ -1,5 +1,7 @@
 #include <bitcoin/preimage.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/asort/asort.h>
+#include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
 #include <common/gossmap.h>
 #include <common/type_to_string.h>
@@ -28,6 +30,7 @@ static struct node_id my_id;
 
 struct keysend_data {
 	struct preimage preimage;
+	struct tlv_field *extra_tlvs;
 };
 
 REGISTER_PAYMENT_MODIFIER_HEADER(keysend, struct keysend_data);
@@ -44,6 +47,9 @@ static struct keysend_data *keysend_init(struct payment *p)
 		randombytes_buf(&d->preimage, sizeof(d->preimage));
 		ccan_sha256(&payment_hash, &d->preimage, sizeof(d->preimage));
 		p->payment_hash = tal_dup(p, struct sha256, &payment_hash);
+#if EXPERIMENTAL_FEATURES
+		d->extra_tlvs = NULL;
+#endif
 		return d;
 	} else {
 		/* If we are a child payment (retry or split) we copy the
@@ -91,6 +97,16 @@ static void keysend_cb(struct keysend_data *d, struct payment *p) {
 	tlvstream_set_raw(&last_payload->tlv_payload->fields, PREIMAGE_TLV_TYPE,
 			  &d->preimage, sizeof(struct preimage));
 
+#if EXPERIMENTAL_FEATURES
+	if (d->extra_tlvs != NULL) {
+		for (size_t i = 0; i < tal_count(d->extra_tlvs); i++) {
+			struct tlv_field *f = &d->extra_tlvs[i];
+			tlvstream_set_raw(&last_payload->tlv_payload->fields,
+					  f->numtype, f->value, f->length);
+		}
+	}
+#endif
+
 	return payment_continue(p);
 }
 
@@ -114,11 +130,12 @@ static const char *init(struct plugin *p, const char *buf UNUSED,
 	return NULL;
 }
 
-struct payment_modifier *pay_mods[8] = {
+struct payment_modifier *pay_mods[] = {
     &keysend_pay_mod,
     &local_channel_hints_pay_mod,
     &directpay_pay_mod,
     &shadowroute_pay_mod,
+    &routehints_pay_mod,
     &exemptfee_pay_mod,
     &waitblockheight_pay_mod,
     &retry_pay_mod,
@@ -135,6 +152,11 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	u64 *maxfee_pct_millionths;
 	u32 *maxdelay;
 	unsigned int *retryfor;
+	struct route_info **hints;
+#if EXPERIMENTAL_FEATURES
+	struct tlv_field *extra_fields;
+#endif
+
 #if DEVELOPER
 	bool *use_shadow;
 #endif
@@ -151,6 +173,10 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 #if DEVELOPER
 		   p_opt_def("use_shadow", param_bool, &use_shadow, true),
 #endif
+		   p_opt("routehints", param_routehint_array, &hints),
+#if EXPERIMENTAL_FEATURES
+		   p_opt("extratlvs", param_extra_tlvs, &extra_fields),
+#endif
 		   NULL))
 		return command_param_failed();
 
@@ -162,8 +188,9 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	p->destination_has_tlv = true;
 	p->payment_secret = NULL;
 	p->amount = *msat;
-	p->routes = NULL;
-	p->min_final_cltv_expiry = DEFAULT_FINAL_CLTV_DELTA;
+	p->routes = tal_steal(p, hints);
+	// 22 is the Rust-Lightning default and the highest minimum we know of.
+	p->min_final_cltv_expiry = 22;
 	p->features = NULL;
 	p->invstring = NULL;
 	p->why = "Initial attempt";
@@ -185,6 +212,11 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	}
 
 	p->constraints.cltv_budget = *maxdelay;
+
+#if EXPERIMENTAL_FEATURES
+	payment_mod_keysend_get_data(p)->extra_tlvs =
+	    tal_steal(p, extra_fields);
+#endif
 
 	payment_mod_exemptfee_get_data(p)->amount = *exemptfee;
 #if DEVELOPER
@@ -232,16 +264,54 @@ struct keysend_in {
 	struct tlv_field *preimage_field;
 };
 
+static int tlvfield_cmp(const struct tlv_field *a,
+			const struct tlv_field *b, void *unused)
+{
+	if (a->numtype > b->numtype)
+		return 1;
+	else if (a->numtype < b->numtype)
+		return -1;
+	return 0;
+}
+
 static struct command_result *
-htlc_accepted_invoice_created(struct command *cmd, const char *buf UNUSED,
-			      const jsmntok_t *result UNUSED,
+htlc_accepted_invoice_created(struct command *cmd, const char *buf,
+			      const jsmntok_t *result,
 			      struct keysend_in *ki)
 {
+	struct tlv_field field;
 	int preimage_field_idx = ki->preimage_field - ki->payload->fields;
 
 	/* Remove the preimage field so `lightningd` knows how to handle
 	 * this. */
 	tal_arr_remove(&ki->payload->fields, preimage_field_idx);
+
+	/* Now we can fill in the payment secret, from invoice. */
+	ki->payload->payment_data = tal(ki->payload,
+					struct tlv_tlv_payload_payment_data);
+	json_to_secret(buf, json_get_member(buf, result, "payment_secret"),
+		       &ki->payload->payment_data->payment_secret);
+
+	/* We checked that amt_to_forward was non-NULL before */
+	ki->payload->payment_data->total_msat = *ki->payload->amt_to_forward;
+
+	/* In order to put payment_data into ->fields, I'd normally re-serialize,
+	 * but we can have completely unknown fields.  So insert manually. */
+	/* BOLT #4:
+	 *     1. type: 8 (`payment_data`)
+	 *     2. data:
+	 *         * [`32*byte`:`payment_secret`]
+	 *         * [`tu64`:`total_msat`]
+	 */
+	field.numtype = 8;
+	field.value = tal_arr(ki->payload, u8, 0);
+	towire_secret(&field.value, &ki->payload->payment_data->payment_secret);
+	towire_tu64(&field.value, ki->payload->payment_data->total_msat);
+	field.length = tal_bytelen(field.value);
+	tal_arr_expand(&ki->payload->fields, field);
+
+	asort(ki->payload->fields, tal_count(ki->payload->fields),
+	      tlvfield_cmp, NULL);
 
 	/* Finally we can resolve the payment with the preimage. */
 	plugin_log(cmd->plugin, LOG_INFORM,
@@ -249,6 +319,20 @@ htlc_accepted_invoice_created(struct command *cmd, const char *buf UNUSED,
 		   "provided in the onion payload.",
 		   tal_hexstr(tmpctx, &ki->payment_hash, sizeof(struct sha256)));
 	return htlc_accepted_continue(cmd, ki->payload);
+
+}
+
+static struct command_result *
+htlc_accepted_invoice_failed(struct command *cmd, const char *buf,
+			     const jsmntok_t *error,
+			     struct keysend_in *ki)
+{
+	plugin_log(cmd->plugin, LOG_BROKEN,
+		   "Could not create invoice for keysend: %.*s",
+		   json_tok_full_len(error),
+		   json_tok_full(buf, error));
+	/* Continue, but don't change it: it will fail. */
+	return htlc_accepted_continue(cmd, NULL);
 
 }
 
@@ -260,9 +344,8 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	struct sha256 payment_hash;
 	size_t max;
 	struct tlv_tlv_payload *payload;
-	struct tlv_field *preimage_field = NULL;
+	struct tlv_field *preimage_field = NULL, *unknown_field = NULL;
 	bigsize_t s;
-	bool unknown_even_type = false;
 	struct tlv_field *field;
 	struct keysend_in *ki;
 	struct out_req *req;
@@ -298,8 +381,7 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 			preimage_field = field;
 			break;
 		} else if (field->numtype % 2 == 0 && field->meta == NULL) {
-			unknown_even_type = true;
-			break;
+			unknown_field = field;
 		}
 	}
 
@@ -308,12 +390,26 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	if (preimage_field == NULL)
 		return htlc_accepted_continue(cmd, NULL);
 
-	if (unknown_even_type) {
+	if (unknown_field != NULL) {
+#if !EXPERIMENTAL_FEATURES
 		plugin_log(cmd->plugin, LOG_UNUSUAL,
 			   "Payload contains unknown even TLV-type %" PRIu64
 			   ", can't safely accept the keysend. Deferring to "
 			   "other plugins.",
-			   preimage_field->numtype);
+			   unknown_field->numtype);
+		return htlc_accepted_continue(cmd, NULL);
+#else
+		plugin_log(cmd->plugin, LOG_INFORM,
+			   "Experimental: Accepting the keysend payment "
+			   "despite having unknown even TLV type %" PRIu64 ".",
+			   unknown_field->numtype);
+#endif
+	}
+
+	/* If malformed (amt is compulsory), let lightningd handle it. */
+	if (!payload->amt_to_forward) {
+		plugin_log(cmd->plugin, LOG_UNUSUAL,
+			   "Sender omitted amount.  Ignoring this HTLC.");
 		return htlc_accepted_continue(cmd, NULL);
 	}
 
@@ -358,7 +454,7 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	 * will be nice and reject the payment. */
 	req = jsonrpc_request_start(cmd->plugin, cmd, "invoice",
 				    &htlc_accepted_invoice_created,
-				    &htlc_accepted_invoice_created,
+				    &htlc_accepted_invoice_failed,
 				    ki);
 
 	plugin_log(cmd->plugin, LOG_INFORM, "Inserting a new invoice for keysend with payment_hash %s", type_to_string(tmpctx, struct sha256, &payment_hash));
@@ -377,6 +473,11 @@ static const struct plugin_hook hooks[] = {
 	},
 };
 
+static const char *notification_topics[] = {
+	"pay_success",
+	"pay_failure",
+};
+
 int main(int argc, char *argv[])
 {
 	struct feature_set features;
@@ -388,5 +489,5 @@ int main(int argc, char *argv[])
 
 	plugin_main(argv, init, PLUGIN_STATIC, true, &features, commands,
 		    ARRAY_SIZE(commands), NULL, 0, hooks, ARRAY_SIZE(hooks),
-		    NULL);
+		    notification_topics, ARRAY_SIZE(notification_topics), NULL);
 }

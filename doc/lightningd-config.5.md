@@ -72,25 +72,25 @@ Alias for *network=testnet*.
  **signet**
 Alias for *network=signet*.
 
- **bitcoin-cli**=*PATH*
+ **bitcoin-cli**=*PATH* [plugin `bcli`]
 The name of *bitcoin-cli* executable to run.
 
- **bitcoin-datadir**=*DIR*
+ **bitcoin-datadir**=*DIR* [plugin `bcli`]
 *-datadir* argument to supply to bitcoin-cli(1).
 
- **bitcoin-rpcuser**=*USER*
+ **bitcoin-rpcuser**=*USER* [plugin `bcli`]
 The RPC username for talking to bitcoind(1).
 
- **bitcoin-rpcpassword**=*PASSWORD*
+ **bitcoin-rpcpassword**=*PASSWORD* [plugin `bcli`]
 The RPC password for talking to bitcoind(1).
 
- **bitcoin-rpcconnect**=*HOST*
+ **bitcoin-rpcconnect**=*HOST* [plugin `bcli`]
 The bitcoind(1) RPC host to connect to.
 
- **bitcoin-rpcport**=*PORT*
+ **bitcoin-rpcport**=*PORT* [plugin `bcli`]
 The bitcoind(1) RPC port to connect to.
 
- **bitcoin-retry-timeout**=*SECONDS*
+ **bitcoin-retry-timeout**=*SECONDS* [plugin `bcli`]
 Number of seconds to keep trying a bitcoin-cli(1) command. If the
 command keeps failing after this time, exit with a fatal error.
 
@@ -156,6 +156,10 @@ with multiple daemons.
  **log-file**=*PATH*
 Log to this file instead of stdout. Sending lightningd(8) SIGHUP will
 cause it to reopen this file (useful for log rotation).
+
+ **log-timestamps**=*BOOL*
+Set this to false to turn off timestamp prefixes (they will still appear
+in crash log files).
 
  **rpc-file**=*PATH*
 Set JSON-RPC socket (or /dev/tty), such as for lightning-cli(1).
@@ -253,6 +257,19 @@ How long to wait before sending commitment messages to the peer: in
 theory increasing this would reduce load, but your node would have to be
 extremely busy node for you to even notice.
 
+ **force-feerates**==*VALUES*
+Networks like regtest and testnet have unreliable fee estimates: we
+usually treat them as the minumum (253 sats/kw) if we can't get them.
+This allows override of one or more of our standard feerates (see
+lightning-feerates(7)).  Up to 5 values, separated by '/' can be
+provided: if fewer are provided, then the final value is used for the
+remainder.  The values are in per-kw (roughly 1/4 of bitcoind's per-kb
+values), an in order are "opening", "mutual_close",
+"unilateral_close", "delayed_to_us", "htlc_resolution", and "penalty".
+
+You would usually put this option in the per-chain config file, to avoid
+setting it on Bitcoin mainnet!  e.g. `~rusty/.lightning/regtest/config`.
+
 ### Lightning channel and HTLC options
 
  **large-channels**
@@ -277,7 +294,7 @@ create a channel, and if an HTLC asks for longer, we’ll refuse it.
 Confirmations required for the funding transaction when the other side
 opens a channel before the channel is usable.
 
- **commit-fee**=*PERCENT*
+ **commit-fee**=*PERCENT* [plugin `bcli`]
 The percentage of *estimatesmartfee 2/CONSERVATIVE* to use for the commitment
 transactions: default is 100.
 
@@ -298,18 +315,18 @@ have to do that.
 
 Invoice control options:
 
- **autocleaninvoice-cycle**=*SECONDS*
+ **autocleaninvoice-cycle**=*SECONDS* [plugin `autoclean`]
 Perform cleanup of expired invoices every *SECONDS* seconds, or disable
 if 0. Usually unpaid expired invoices are uninteresting, and just take
 up space in the database.
 
- **autocleaninvoice-expired-by**=*SECONDS*
+ **autocleaninvoice-expired-by**=*SECONDS* [plugin `autoclean`]
 Control how long invoices must have been expired before they are cleaned
 (if *autocleaninvoice-cycle* is non-zero).
 
 Payment control options:
 
- **disable-mpp**
+ **disable-mpp** [plugin `pay`]
 Disable the multi-part payment sending support in the `pay` plugin. By default
 the MPP support is enabled, but it can be desirable to disable in situations
 in which each payment should result in a single HTLC being forwarded in the
@@ -410,9 +427,6 @@ all DNS lookups, to avoid leaking information.
  **disable-dns**
 Disable the DNS bootstrapping mechanism to find a node by its node ID.
 
- **enable-autotor-v2-mode**
-Try to get a v2 onion address from the Tor service call, default is v3.
-
  **tor-service-password**=*PASSWORD*
 Set a Tor control password, which may be needed for *autotor:* to
 authenticate to the Tor control port.
@@ -483,12 +497,25 @@ corresponding functionality, which are in draft status as BOLT12.
 This usually requires **experimental-onion-messages** as well.  See
 lightning-offer(7) and lightning-fetchinvoice(7).
 
+ **fetchinvoice-noconnect**
+
+Specifying this prevents `fetchinvoice` and `sendinvoice` from
+trying to connect directly to the offering node as a last resort.
+
  **experimental-shutdown-wrong-funding**
 
 Specifying this allows the `wrong_funding` field in shutdown: if a
 remote node has opened a channel but claims it used the incorrect txid
 (and the channel hasn't been used yet at all) this allows them to
 negotiate a clean shutdown with the txid they offer.
+
+ **experimental-dual-fund**
+ 
+Specifying this enables support for the dual funding protocol,
+allowing both parties to contribute funds to a channel. The decision
+about whether to add funds or not to a proposed channel is handled
+automatically by a plugin that implements the appropriate logic for
+your needs. The default behavior is to not contribute funds.
 
 BUGS
 ----
@@ -499,7 +526,7 @@ to gain our eternal gratitude!
 AUTHOR
 ------
 
-Rusty Russell &lt;<rusty@rustcorp.com.au>&gt; wrote this man page, and
+Rusty Russell <<rusty@rustcorp.com.au>> wrote this man page, and
 much of the configuration language, but many others did the hard work of
 actually implementing these options.
 

@@ -79,7 +79,7 @@ static bool closing_fee_is_acceptable(struct lightningd *ld,
 	if (amount_sat_less(fee, min_fee)) {
 		log_debug(channel->log, "... That's below our min %s"
 			  " for weight %"PRIu64" at feerate %u",
-			  type_to_string(tmpctx, struct amount_sat, &fee),
+			  type_to_string(tmpctx, struct amount_sat, &min_fee),
 			  weight, min_feerate);
 		return false;
 	}
@@ -97,15 +97,27 @@ static void peer_received_closing_signature(struct channel *channel,
 	struct bitcoin_tx *tx;
 	struct bitcoin_txid tx_id;
 	struct lightningd *ld = channel->peer->ld;
+	u8 *funding_wscript;
 
 	if (!fromwire_closingd_received_signature(msg, msg, &sig, &tx)) {
-		channel_internal_error(channel, "Bad closing_received_signature %s",
+		channel_internal_error(channel,
+				       "Bad closing_received_signature %s",
 				       tal_hex(msg, msg));
 		return;
 	}
 	tx->chainparams = chainparams;
 
-	/* FIXME: Make sure signature is correct! */
+	funding_wscript = bitcoin_redeem_2of2(tmpctx,
+				       	      &channel->local_funding_pubkey,
+				       	      &channel->channel_info.remote_fundingkey);
+	if (!check_tx_sig(tx, 0, NULL, funding_wscript,
+			  &channel->channel_info.remote_fundingkey, &sig)) {
+		channel_internal_error(channel,
+				       "Bad closing_received_signature %s",
+				       tal_hex(msg, msg));
+		return;
+	}
+
 	if (closing_fee_is_acceptable(ld, channel, tx)) {
 		channel_set_last_tx(channel, tx, &sig, TX_CHANNEL_CLOSE);
 		wallet_channel_save(ld->wallet, channel);
@@ -133,7 +145,7 @@ static void peer_closing_complete(struct channel *channel, const u8 *msg)
 	channel_set_billboard(channel, false, NULL);
 
 	/* Retransmission only, ignore closing. */
-	if (channel->state == CLOSINGD_COMPLETE)
+	if (channel_closed(channel))
 		return;
 
 	/* Channel gets dropped to chain cooperatively. */
@@ -165,13 +177,9 @@ static unsigned closing_msg(struct subd *sd, const u8 *msg, const int *fds UNUSE
 	}
 
 	switch ((enum common_wire)t) {
-#if DEVELOPER
 	case WIRE_CUSTOMMSG_IN:
 		handle_custommsg_in(sd->ld, sd->node_id, msg);
 		break;
-#else
-	case WIRE_CUSTOMMSG_IN:
-#endif
 	/* We send these. */
 	case WIRE_CUSTOMMSG_OUT:
 		break;
@@ -181,17 +189,13 @@ static unsigned closing_msg(struct subd *sd, const u8 *msg, const int *fds UNUSE
 }
 
 void peer_start_closingd(struct channel *channel,
-			 struct per_peer_state *pps,
-			 bool reconnected,
-			 const u8 *channel_reestablish)
+			 struct per_peer_state *pps)
 {
 	u8 *initmsg;
 	u32 feerate;
-	struct amount_sat minfee, startfee, feelimit;
-	u64 num_revocations;
 	struct amount_msat their_msat;
+	struct amount_sat feelimit;
 	int hsmfd;
-	struct secret last_remote_per_commit_secret;
 	struct lightningd *ld = channel->peer->ld;
 	u32 final_commit_feerate;
 
@@ -239,10 +243,6 @@ void peer_start_closingd(struct channel *channel,
 	feelimit = commit_tx_base_fee(final_commit_feerate, 0,
 				      channel->option_anchor_outputs);
 
-	/* Pick some value above slow feerate (or min possible if unknown) */
-	minfee = commit_tx_base_fee(feerate_min(ld, NULL), 0,
-				    channel->option_anchor_outputs);
-
 	/* If we can't determine feerate, start at half unilateral feerate. */
 	feerate = mutual_close_feerate(ld->topology);
 	if (!feerate) {
@@ -250,16 +250,6 @@ void peer_start_closingd(struct channel *channel,
 		if (feerate < feerate_floor())
 			feerate = feerate_floor();
 	}
-	startfee = commit_tx_base_fee(feerate, 0,
-				      channel->option_anchor_outputs);
-
-	if (amount_sat_greater(startfee, feelimit))
-		startfee = feelimit;
-	if (amount_sat_greater(minfee, feelimit))
-		minfee = feelimit;
-
-	num_revocations
-		= revocations_received(&channel->their_shachain.chain);
 
 	/* BOLT #3:
 	 *
@@ -280,25 +270,6 @@ void peer_start_closingd(struct channel *channel,
 		return;
 	}
 
-	/* BOLT #2:
-	 *     - if `next_revocation_number` equals 0:
-	 *       - MUST set `your_last_per_commitment_secret` to all zeroes
-	 *     - otherwise:
-	 *       - MUST set `your_last_per_commitment_secret` to the last
-	 *         `per_commitment_secret` it received
-	 */
-	if (num_revocations == 0)
-		memset(&last_remote_per_commit_secret, 0,
-		       sizeof(last_remote_per_commit_secret));
-	else if (!shachain_get_secret(&channel->their_shachain.chain,
-				      num_revocations-1,
-				      &last_remote_per_commit_secret)) {
-		channel_fail_permanent(channel,
-				       REASON_LOCAL,
-				       "Could not get revocation secret %"PRIu64,
-				       num_revocations-1);
-		return;
-	}
 	initmsg = towire_closingd_init(tmpctx,
 				       chainparams,
 				       pps,
@@ -312,17 +283,11 @@ void peer_start_closingd(struct channel *channel,
 				       amount_msat_to_sat_round_down(channel->our_msat),
 				       amount_msat_to_sat_round_down(their_msat),
 				       channel->our_config.dust_limit,
-				       minfee, feelimit, startfee,
+				       feerate_min(ld, NULL), feerate, feelimit,
 				       channel->shutdown_scriptpubkey[LOCAL],
 				       channel->shutdown_scriptpubkey[REMOTE],
 				       channel->closing_fee_negotiation_step,
 				       channel->closing_fee_negotiation_step_unit,
-				       reconnected,
-				       channel->next_index[LOCAL],
-				       channel->next_index[REMOTE],
-				       num_revocations,
-				       channel_reestablish,
-				       &last_remote_per_commit_secret,
 				       IFDEV(ld->dev_fast_gossip, false),
 				       channel->shutdown_wrong_funding);
 

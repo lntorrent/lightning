@@ -18,6 +18,10 @@ send an invoice for us to pay (technically, this is referred to as a
 offer).  It automatically enables the accepting and payment of
 corresponding invoice message (we will only pay once, however!).
 
+Note that it creates two variants of the offer: a signed and an
+unsigned one (which is smaller).  Wallets should accept both: the
+current specification allows either.
+
 The *amount* parameter can be the string "any", which creates an offer
 that can be paid with any amount (e.g. a donation).  Otherwise it can
 be a positive value in millisatoshi precision; it can be a whole
@@ -49,15 +53,16 @@ that previous `payer_key`.
 RETURN VALUE
 ------------
 
-On success, an object as follows is returned:
-
-* *offer_id*: the hash of the offer.
-* *active*: true
-* *single_use*: true
-* *bolt12*: the bolt12 offer, starting with "lno1"
-
-Optionally:
-* *label*: the user-specified label.
+[comment]: # (GENERATE-FROM-SCHEMA-START)
+On success, an object is returned, containing:
+- **offer_id** (hex): the id of this offer (merkle hash of non-signature fields) (always 64 characters)
+- **active** (boolean): whether this will pay a matching incoming invoice (always *true*)
+- **single_use** (boolean): whether this expires as soon as it's paid out (always *true*)
+- **bolt12** (string): the bolt12 encoding of the offer
+- **bolt12_unsigned** (string): the bolt12 encoding of the offer, without a signature
+- **used** (boolean): True if an incoming invoice has been paid (always *false*)
+- **label** (string, optional): the (optional) user-specified label
+[comment]: # (GENERATE-FROM-SCHEMA-END)
 
 On failure, an error is returned and no offer is created. If the
 lightning process fails before responding, the caller should use
@@ -85,10 +90,11 @@ Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible.
 SEE ALSO
 --------
 
-lightning-offer(7), lightning-listoffers(7), lightning-disableoffer(7).
+lightning-sendinvoice(7), lightning-offer(7), lightning-listoffers(7), lightning-disableoffer(7).
 
 RESOURCES
 ---------
 
 Main web site: <https://github.com/ElementsProject/lightning>
 
+[comment]: # ( SHA256STAMP:2b7e7b543a88a10dbfbca2508e034af79f43ed0845abdb9df1fdf7e28ee33c26)

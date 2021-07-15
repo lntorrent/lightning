@@ -9,7 +9,8 @@ from utils import (
     DEVELOPER, only_one, sync_blockheight, TIMEOUT, wait_for, TEST_NETWORK,
     DEPRECATED_APIS, expected_peer_features, expected_node_features,
     expected_channel_features, account_balance,
-    check_coin_moves, first_channel_id, check_coin_moves_idx, EXPERIMENTAL_FEATURES
+    check_coin_moves, first_channel_id, check_coin_moves_idx,
+    EXPERIMENTAL_FEATURES, EXPERIMENTAL_DUAL_FUND
 )
 
 import ast
@@ -20,6 +21,7 @@ import random
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import time
 import unittest
@@ -575,6 +577,8 @@ def test_invoice_payment_hook_hold(node_factory):
     l1.rpc.pay(inv1['bolt11'])
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_openchannel_hook(node_factory, bitcoind):
     """ l2 uses the reject_odd_funding_amounts plugin to reject some openings.
     """
@@ -599,14 +603,14 @@ def test_openchannel_hook(node_factory, bitcoind):
     if l2.config('experimental-dual-fund'):
         # openchannel2 var checks
         expected.update({
-            'commitment_feerate_per_kw': '750',
+            'channel_id': '.*',
+            'commitment_feerate_per_kw': '7500',
+            'funding_feerate_per_kw': '7500',
             'feerate_our_max': '150000',
             'feerate_our_min': '1875',
-            'funding_feerate_best': '7500',
-            'funding_feerate_max': '150000',
-            'funding_feerate_min': '1875',
             'locktime': '.*',
             'their_funding': '100000000msat',
+            'channel_max_msat': '16777215000msat',
         })
     else:
         expected.update({
@@ -631,6 +635,8 @@ def test_openchannel_hook(node_factory, bitcoind):
         l1.rpc.fundchannel(l2.info['id'], 100001)
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_openchannel_hook_error_handling(node_factory, bitcoind):
     """ l2 uses a plugin that should fatal() crash the node.
 
@@ -653,6 +659,8 @@ def test_openchannel_hook_error_handling(node_factory, bitcoind):
     assert l2.daemon.is_in_log("BROKEN.*Plugin rejected openchannel[2]? but also set close_to")
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_openchannel_hook_chaining(node_factory, bitcoind):
     """ l2 uses a set of plugin that all use the openchannel_hook.
 
@@ -672,7 +680,7 @@ def test_openchannel_hook_chaining(node_factory, bitcoind):
     hook_msg = "openchannel2? hook rejects and says '"
     # 100005sat fundchannel should fail fatal() for l2
     # because hook_accepter.py rejects on that amount 'for a reason'
-    with pytest.raises(RpcError, match=r'They sent error channel'):
+    with pytest.raises(RpcError, match=r'reject for a reason'):
         l1.rpc.fundchannel(l2.info['id'], 100005)
 
     assert l2.daemon.wait_for_log(hook_msg + "reject for a reason")
@@ -683,11 +691,14 @@ def test_openchannel_hook_chaining(node_factory, bitcoind):
 
     # 100000sat is good for hook_accepter, so it should fail 'on principle'
     # at third hook openchannel_reject.py
-    with pytest.raises(RpcError, match=r'They sent error channel'):
+    with pytest.raises(RpcError, match=r'reject on principle'):
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
         l1.rpc.fundchannel(l2.info['id'], 100000)
     assert l2.daemon.wait_for_log(hook_msg + "reject on principle")
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_channel_state_changed_bilateral(node_factory, bitcoind):
     """ We open and close a channel and check notifications both sides.
 
@@ -710,9 +721,9 @@ def test_channel_state_changed_bilateral(node_factory, bitcoind):
     # check channel 'opener' and 'closer' within this testcase ...
     assert(l1.rpc.listpeers()['peers'][0]['channels'][0]['opener'] == 'local')
     assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['opener'] == 'remote')
-    # the 'closer' should be null initially
-    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] is None)
-    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] is None)
+    # the 'closer' should be missing initially
+    assert 'closer' not in l1.rpc.listpeers()['peers'][0]['channels'][0]
+    assert 'closer' not in l2.rpc.listpeers()['peers'][0]['channels'][0]
 
     event1 = wait_for_event(l1)
     event2 = wait_for_event(l2)
@@ -826,6 +837,8 @@ def test_channel_state_changed_bilateral(node_factory, bitcoind):
     assert(event2['message'] == "Onchain init reply")
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_channel_state_changed_unilateral(node_factory, bitcoind):
     """ We open, disconnect, force-close a channel and check for notifications.
 
@@ -835,6 +848,9 @@ def test_channel_state_changed_unilateral(node_factory, bitcoind):
     # such errors a soft because LND.
     opts = {"plugin": os.path.join(os.getcwd(), "tests/plugins/misc_notifications.py"),
             "allow_warning": True}
+    if EXPERIMENTAL_DUAL_FUND:
+        opts['may_reconnect'] = True
+
     l1, l2 = node_factory.line_graph(2, opts=opts)
 
     l1_id = l1.rpc.getinfo()["id"]
@@ -890,6 +906,9 @@ def test_channel_state_changed_unilateral(node_factory, bitcoind):
     wait_for(lambda: len(l1.rpc.listpeers()['peers']) == 1)
     # check 'closer' on l2 while the peer is not yet forgotten
     assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] == 'local')
+    if EXPERIMENTAL_DUAL_FUND:
+        l1.daemon.wait_for_log(r'Peer has reconnected, state')
+        l2.daemon.wait_for_log(r'Peer has reconnected, state')
 
     # settle the channel closure
     bitcoind.generate_block(100)
@@ -926,6 +945,8 @@ def test_channel_state_changed_unilateral(node_factory, bitcoind):
     assert(event1['message'] == "Onchain init reply")
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_channel_state_change_history(node_factory, bitcoind):
     """ We open and close a channel and check for state_canges entries.
 
@@ -965,7 +986,7 @@ def test_channel_state_change_history(node_factory, bitcoind):
         assert(history[3]['message'] == "Closing complete")
 
 
-@unittest.skipIf(not DEVELOPER, "without DEVELOPER=1, gossip v slow")
+@pytest.mark.developer("without DEVELOPER=1, gossip v slow")
 def test_htlc_accepted_hook_fail(node_factory):
     """Send payments from l1 to l2, but l2 just declines everything.
 
@@ -981,13 +1002,14 @@ def test_htlc_accepted_hook_fail(node_factory):
     ], wait_for_announce=True)
 
     # This must fail
-    phash = l2.rpc.invoice(1000, "lbl", "desc")['payment_hash']
+    inv = l2.rpc.invoice(1000, "lbl", "desc")
+    phash = inv['payment_hash']
     route = l1.rpc.getroute(l2.info['id'], 1000, 1)['route']
 
     # Here shouldn't use `pay` command because l2 rejects with WIRE_TEMPORARY_NODE_FAILURE,
     # then it will be excluded when l1 try another pay attempt.
     # Note if the destination is excluded, the route result is undefined.
-    l1.rpc.sendpay(route, phash)
+    l1.rpc.sendpay(route, phash, payment_secret=inv['payment_secret'])
     with pytest.raises(RpcError) as excinfo:
         l1.rpc.waitsendpay(phash)
     assert excinfo.value.error['data']['failcode'] == 0x2002
@@ -1008,7 +1030,7 @@ def test_htlc_accepted_hook_fail(node_factory):
     assert len(inv) == 1 and inv[0]['status'] == 'unpaid'
 
 
-@unittest.skipIf(not DEVELOPER, "without DEVELOPER=1, gossip v slow")
+@pytest.mark.developer("without DEVELOPER=1, gossip v slow")
 def test_htlc_accepted_hook_resolve(node_factory):
     """l3 creates an invoice, l2 knows the preimage and will shortcircuit.
     """
@@ -1039,6 +1061,13 @@ def test_htlc_accepted_hook_direct_restart(node_factory, executor):
     f1 = executor.submit(l1.rpc.pay, i1)
 
     l2.daemon.wait_for_log(r'Holding onto an incoming htlc for 10 seconds')
+
+    # Check that the status mentions the HTLC being held
+    l2.rpc.listpeers()
+    peers = l2.rpc.listpeers()['peers']
+    htlc_status = peers[0]['channels'][0]['htlcs'][0].get('status', None)
+    assert htlc_status == "Waiting for the htlc_accepted hook of plugin hold_htlcs.py"
+
     needle = l2.daemon.logsearch_start
     l2.restart()
 
@@ -1050,7 +1079,7 @@ def test_htlc_accepted_hook_direct_restart(node_factory, executor):
     f1.result()
 
 
-@unittest.skipIf(not DEVELOPER, "without DEVELOPER=1, gossip v slow")
+@pytest.mark.developer("without DEVELOPER=1, gossip v slow")
 def test_htlc_accepted_hook_forward_restart(node_factory, executor):
     """l2 restarts while it is pondering what to do with an HTLC.
     """
@@ -1120,7 +1149,7 @@ def test_warning_notification(node_factory):
     l1.daemon.wait_for_log('plugin-pretend_badlog.py: log: Test warning notification\\(for broken event\\)')
 
 
-@unittest.skipIf(not DEVELOPER, "needs to deactivate shadow routing")
+@pytest.mark.developer("needs to deactivate shadow routing")
 def test_invoice_payment_notification(node_factory):
     """
     Test the 'invoice_payment' notification
@@ -1139,7 +1168,7 @@ def test_invoice_payment_notification(node_factory):
                            .format(label, preimage, msats))
 
 
-@unittest.skipIf(not DEVELOPER, "needs to deactivate shadow routing")
+@pytest.mark.developer("needs to deactivate shadow routing")
 def test_invoice_creation_notification(node_factory):
     """
     Test the 'invoice_creation' notification
@@ -1173,7 +1202,7 @@ def test_channel_opened_notification(node_factory):
                            .format(l1.info["id"], amount))
 
 
-@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
+@pytest.mark.developer("needs DEVELOPER=1")
 def test_forward_event_notification(node_factory, bitcoind, executor):
     """ test 'forward_event' notifications
     """
@@ -1204,22 +1233,24 @@ def test_forward_event_notification(node_factory, bitcoind, executor):
 
     wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 8)
 
-    payment_hash13 = l3.rpc.invoice(amount, "first", "desc")['payment_hash']
+    inv = l3.rpc.invoice(amount, "first", "desc")
+    payment_hash13 = inv['payment_hash']
     route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
 
     # status: offered -> settled
-    l1.rpc.sendpay(route, payment_hash13)
+    l1.rpc.sendpay(route, payment_hash13, payment_secret=inv['payment_secret'])
     l1.rpc.waitsendpay(payment_hash13)
 
     # status: offered -> failed
     route = l1.rpc.getroute(l4.info['id'], amount, 1)['route']
     payment_hash14 = "f" * 64
     with pytest.raises(RpcError):
-        l1.rpc.sendpay(route, payment_hash14)
+        l1.rpc.sendpay(route, payment_hash14, payment_secret="f" * 64)
         l1.rpc.waitsendpay(payment_hash14)
 
     # status: offered -> local_failed
-    payment_hash15 = l5.rpc.invoice(amount, 'onchain_timeout', 'desc')['payment_hash']
+    inv = l5.rpc.invoice(amount, 'onchain_timeout', 'desc')
+    payment_hash15 = inv['payment_hash']
     fee = amount * 10 // 1000000 + 1
     c12 = l1.get_channel_scid(l2)
     c25 = l2.get_channel_scid(l5)
@@ -1232,7 +1263,7 @@ def test_forward_event_notification(node_factory, bitcoind, executor):
               'delay': 5,
               'channel': c25}]
 
-    executor.submit(l1.rpc.sendpay, route, payment_hash15)
+    executor.submit(l1.rpc.sendpay, route, payment_hash15, payment_secret=inv['payment_secret'])
 
     l5.daemon.wait_for_log('permfail')
     l5.wait_for_channel_onchain(l2.info['id'])
@@ -1293,16 +1324,18 @@ def test_sendpay_notifications(node_factory, bitcoind):
     l1, l2, l3 = node_factory.line_graph(3, opts=opts, wait_for_announce=True)
     chanid23 = l2.get_channel_scid(l3)
 
-    payment_hash1 = l3.rpc.invoice(amount, "first", "desc")['payment_hash']
-    payment_hash2 = l3.rpc.invoice(amount, "second", "desc")['payment_hash']
+    inv1 = l3.rpc.invoice(amount, "first", "desc")
+    payment_hash1 = inv1['payment_hash']
+    inv2 = l3.rpc.invoice(amount, "second", "desc")
+    payment_hash2 = inv2['payment_hash']
     route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
 
-    l1.rpc.sendpay(route, payment_hash1)
+    l1.rpc.sendpay(route, payment_hash1, payment_secret=inv1['payment_secret'])
     response1 = l1.rpc.waitsendpay(payment_hash1)
 
     l2.rpc.close(chanid23, 1)
 
-    l1.rpc.sendpay(route, payment_hash2)
+    l1.rpc.sendpay(route, payment_hash2, payment_secret=inv2['payment_secret'])
     with pytest.raises(RpcError) as err:
         l1.rpc.waitsendpay(payment_hash2)
 
@@ -1322,16 +1355,18 @@ def test_sendpay_notifications_nowaiter(node_factory):
     chanid23 = l2.get_channel_scid(l3)
     amount = 10**8
 
-    payment_hash1 = l3.rpc.invoice(amount, "first", "desc")['payment_hash']
-    payment_hash2 = l3.rpc.invoice(amount, "second", "desc")['payment_hash']
+    inv1 = l3.rpc.invoice(amount, "first", "desc")
+    payment_hash1 = inv1['payment_hash']
+    inv2 = l3.rpc.invoice(amount, "second", "desc")
+    payment_hash2 = inv2['payment_hash']
     route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
 
-    l1.rpc.sendpay(route, payment_hash1)
+    l1.rpc.sendpay(route, payment_hash1, payment_secret=inv1['payment_secret'])
     l1.daemon.wait_for_log(r'Received a sendpay_success')
 
     l2.rpc.close(chanid23, 1)
 
-    l1.rpc.sendpay(route, payment_hash2)
+    l1.rpc.sendpay(route, payment_hash2, payment_secret=inv2['payment_secret'])
     l1.daemon.wait_for_log(r'Received a sendpay_failure')
 
     results = l1.rpc.call('listsendpays_plugin')
@@ -1358,6 +1393,9 @@ def test_rpc_command_hook(node_factory):
     assert decoded["description"] == "rpc_command_1 modified this description"
     l1.daemon.wait_for_log("rpc_command hook 'invoice' already modified, ignoring.")
 
+    # Disable schema checking here!
+    schemas = l1.rpc.jsonschemas
+    l1.rpc.jsonschemas = {}
     # rpc_command_1 plugin sends a custom response to "listfunds"
     funds = l1.rpc.listfunds()
     assert funds[0] == "Custom rpc_command_1 result"
@@ -1377,6 +1415,8 @@ def test_rpc_command_hook(node_factory):
         l1.rpc.plugin_stop('rpc_command_1.py')
         l1.rpc.plugin_stop('rpc_command_2.py')
 
+    l1.rpc.jsonschemas = schemas
+
 
 def test_libplugin(node_factory):
     """Sanity checks for plugins made with libplugin"""
@@ -1392,15 +1432,15 @@ def test_libplugin(node_factory):
     l1.rpc.check("helloworld")
 
     # Test commands
-    assert l1.rpc.call("helloworld") == "hello world"
-    assert l1.rpc.call("helloworld", {"name": "test"}) == "hello test"
+    assert l1.rpc.call("helloworld") == {"hello": "world"}
+    assert l1.rpc.call("helloworld", {"name": "test"}) == {"hello": "test"}
     l1.stop()
     l1.daemon.opts["plugin"] = plugin
     l1.daemon.opts["name"] = "test_opt"
     l1.start()
-    assert l1.rpc.call("helloworld") == "hello test_opt"
+    assert l1.rpc.call("helloworld") == {"hello": "test_opt"}
     # But param takes over!
-    assert l1.rpc.call("helloworld", {"name": "test"}) == "hello test"
+    assert l1.rpc.call("helloworld", {"name": "test"}) == {"hello": "test"}
 
     # Test hooks and notifications
     l2 = node_factory.get_node()
@@ -1440,7 +1480,7 @@ def test_libplugin_deprecated(node_factory):
                                         'name-deprecated': 'test_opt depr',
                                         'allow-deprecated-apis': True})
 
-    assert l1.rpc.call("helloworld") == "hello test_opt depr"
+    assert l1.rpc.call("helloworld") == {"hello": "test_opt depr"}
     l1.rpc.help('testrpc-deprecated')
     assert l1.rpc.call("testrpc-deprecated") == l1.rpc.getinfo()
 
@@ -1448,6 +1488,8 @@ def test_libplugin_deprecated(node_factory):
 @unittest.skipIf(
     not DEVELOPER or DEPRECATED_APIS, "needs LIGHTNINGD_DEV_LOG_IO and new API"
 )
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_plugin_feature_announce(node_factory):
     """Check that features registered by plugins show up in messages.
 
@@ -1469,7 +1511,8 @@ def test_plugin_feature_announce(node_factory):
 
     extra = []
     if l1.config('experimental-dual-fund'):
-        extra.append(223)
+        extra.append(21)  # option-anchor-outputs
+        extra.append(29)  # option-dual-fund
 
     # Check the featurebits we've set in the `init` message from
     # feature-test.py.
@@ -1701,15 +1744,16 @@ def test_hook_crash(node_factory, executor, bitcoind):
         f1.result(10)
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_feature_set(node_factory):
     plugin = os.path.join(os.path.dirname(__file__), 'plugins/show_feature_set.py')
     l1 = node_factory.get_node(options={"plugin": plugin})
 
     fs = l1.rpc.call('getfeatureset')
-    extra = [233] if l1.config('experimental-dual-fund') else []
 
-    assert fs['init'] == expected_peer_features(extra=extra)
-    assert fs['node'] == expected_node_features(extra=extra)
+    assert fs['init'] == expected_peer_features()
+    assert fs['node'] == expected_node_features()
     assert fs['channel'] == expected_channel_features()
     assert 'invoice' in fs
 
@@ -1738,7 +1782,7 @@ def test_replacement_payload(node_factory):
     assert l2.daemon.wait_for_log("Attept to pay.*with wrong secret")
 
 
-@unittest.skipIf(not DEVELOPER, "Requires dev_sign_last_tx")
+@pytest.mark.developer("Requires dev_sign_last_tx")
 def test_watchtower(node_factory, bitcoind, directory, chainparams):
     """Test watchtower hook.
 
@@ -1827,7 +1871,9 @@ def test_plugin_fail(node_factory):
     l1.daemon.wait_for_log(r': exited during normal operation')
 
 
-@unittest.skipIf(not DEVELOPER, "without DEVELOPER=1, gossip v slow")
+@pytest.mark.developer("without DEVELOPER=1, gossip v slow")
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
 def test_coin_movement_notices(node_factory, bitcoind, chainparams):
     """Verify that coin movements are triggered correctly.
     """
@@ -1846,8 +1892,8 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
             {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'channel_mvt', 'credit': 0, 'debit': 100000000, 'tag': 'routed'},
             {'type': 'channel_mvt', 'credit': 50000501, 'debit': 0, 'tag': 'routed'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 4477501, 'tag': 'chain_fees'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 945523000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 4271501, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 945729000, 'tag': 'withdrawal'},
         ]
 
         l2_wallet_mvts = [
@@ -1860,7 +1906,7 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
             {'type': 'chain_mvt', 'credit': 0, 'debit': 8092000, 'tag': 'chain_fees'},
             {'type': 'chain_mvt', 'credit': 991908000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 100001000, 'debit': 0, 'tag': 'deposit'},
-            {'type': 'chain_mvt', 'credit': 945523000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 945729000, 'debit': 0, 'tag': 'deposit'},
         ]
     elif EXPERIMENTAL_FEATURES:
         # option_anchor_outputs
@@ -1868,8 +1914,8 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
             {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'channel_mvt', 'credit': 0, 'debit': 100000000, 'tag': 'routed'},
             {'type': 'channel_mvt', 'credit': 50000501, 'debit': 0, 'tag': 'routed'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 4215501, 'tag': 'chain_fees'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 945785000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 2520501, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 947480000, 'tag': 'withdrawal'},
         ]
 
         l2_wallet_mvts = [
@@ -1883,15 +1929,15 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
             {'type': 'chain_mvt', 'credit': 0, 'debit': 4567000, 'tag': 'chain_fees'},
             {'type': 'chain_mvt', 'credit': 995433000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 100001000, 'debit': 0, 'tag': 'deposit'},
-            {'type': 'chain_mvt', 'credit': 945785000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 947480000, 'debit': 0, 'tag': 'deposit'},
         ]
     else:
         l2_l3_mvts = [
             {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'channel_mvt', 'credit': 0, 'debit': 100000000, 'tag': 'routed'},
             {'type': 'channel_mvt', 'credit': 50000501, 'debit': 0, 'tag': 'routed'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 2715501, 'tag': 'chain_fees'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 947285000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 2520501, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 947480000, 'tag': 'withdrawal'},
         ]
 
         l2_wallet_mvts = [
@@ -1905,7 +1951,7 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
             {'type': 'chain_mvt', 'credit': 0, 'debit': 4567000, 'tag': 'chain_fees'},
             {'type': 'chain_mvt', 'credit': 995433000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 100001000, 'debit': 0, 'tag': 'deposit'},
-            {'type': 'chain_mvt', 'credit': 947285000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 947480000, 'debit': 0, 'tag': 'deposit'},
         ]
 
     l1, l2, l3 = node_factory.line_graph(3, opts=[
@@ -1916,51 +1962,66 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
 
     # Special case for dual-funded channel opens
     if l2.config('experimental-dual-fund'):
+        # option_anchor_outputs
+        l2_l3_mvts = [
+            {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'channel_mvt', 'credit': 0, 'debit': 100000000, 'tag': 'routed'},
+            {'type': 'channel_mvt', 'credit': 50000501, 'debit': 0, 'tag': 'routed'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 2520501, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 947480000, 'tag': 'withdrawal'},
+        ]
         l2_wallet_mvts = [
             {'type': 'chain_mvt', 'credit': 2000000000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 995410000, 'tag': 'withdrawal'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 1000000000, 'tag': 'withdrawal'},
+            # Could go in either order
+            [
+                {'type': 'chain_mvt', 'credit': 0, 'debit': 995410000, 'tag': 'withdrawal'},
+                {'type': 'chain_mvt', 'credit': 0, 'debit': 1000000000, 'tag': 'withdrawal'},
+            ],
             {'type': 'chain_mvt', 'credit': 0, 'debit': 4590000, 'tag': 'chain_fees'},
             {'type': 'chain_mvt', 'credit': 995410000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 100001000, 'debit': 0, 'tag': 'deposit'},
-            {'type': 'chain_mvt', 'credit': 945785000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 947480000, 'debit': 0, 'tag': 'deposit'},
         ]
 
     bitcoind.generate_block(5)
     wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 4)
     amount = 10**8
 
-    payment_hash13 = l3.rpc.invoice(amount, "first", "desc")['payment_hash']
+    inv = l3.rpc.invoice(amount, "first", "desc")
+    payment_hash13 = inv['payment_hash']
     route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
 
     # status: offered -> settled
-    l1.rpc.sendpay(route, payment_hash13)
+    l1.rpc.sendpay(route, payment_hash13, payment_secret=inv['payment_secret'])
     l1.rpc.waitsendpay(payment_hash13)
 
     # status: offered -> failed
     route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
     payment_hash13 = "f" * 64
     with pytest.raises(RpcError):
-        l1.rpc.sendpay(route, payment_hash13)
+        l1.rpc.sendpay(route, payment_hash13, payment_secret=inv['payment_secret'])
         l1.rpc.waitsendpay(payment_hash13)
 
     # go the other direction
-    payment_hash31 = l1.rpc.invoice(amount // 2, "first", "desc")['payment_hash']
+    inv = l1.rpc.invoice(amount // 2, "first", "desc")
+    payment_hash31 = inv['payment_hash']
     route = l3.rpc.getroute(l1.info['id'], amount // 2, 1)['route']
-    l3.rpc.sendpay(route, payment_hash31)
+    l3.rpc.sendpay(route, payment_hash31, payment_secret=inv['payment_secret'])
     l3.rpc.waitsendpay(payment_hash31)
 
     # receive a payment (endpoint)
-    payment_hash12 = l2.rpc.invoice(amount, "first", "desc")['payment_hash']
+    inv = l2.rpc.invoice(amount, "first", "desc")
+    payment_hash12 = inv['payment_hash']
     route = l1.rpc.getroute(l2.info['id'], amount, 1)['route']
-    l1.rpc.sendpay(route, payment_hash12)
+    l1.rpc.sendpay(route, payment_hash12, payment_secret=inv['payment_secret'])
     l1.rpc.waitsendpay(payment_hash12)
 
     # send a payment (originator)
-    payment_hash21 = l1.rpc.invoice(amount // 2, "second", "desc")['payment_hash']
+    inv = l1.rpc.invoice(amount // 2, "second", "desc")
+    payment_hash21 = inv['payment_hash']
     route = l2.rpc.getroute(l1.info['id'], amount // 2, 1)['route']
-    l2.rpc.sendpay(route, payment_hash21)
+    l2.rpc.sendpay(route, payment_hash21, payment_secret=inv['payment_secret'])
     l2.rpc.waitsendpay(payment_hash21)
 
     # restart to test index
@@ -2117,7 +2178,7 @@ def test_important_plugin(node_factory):
     assert get_logfile_match(logpath, 'pay: Plugin marked as important, shutting down lightningd')
 
 
-@unittest.skipIf(not DEVELOPER, "tests developer-only option.")
+@pytest.mark.developer("tests developer-only option.")
 def test_dev_builtin_plugins_unimportant(node_factory):
     n = node_factory.get_node(options={"dev-builtin-plugins-unimportant": None})
     n.rpc.plugin_stop(plugin="pay")
@@ -2402,3 +2463,77 @@ def test_self_disable(node_factory):
     # Also works with dynamic load attempts
     with pytest.raises(RpcError, match="Disabled via selfdisable option"):
         l1.rpc.plugin_start(p2, selfdisable=True)
+
+
+def test_custom_notification_topics(node_factory):
+    plugin = os.path.join(
+        os.path.dirname(__file__), "plugins", "custom_notifications.py"
+    )
+    l1, l2 = node_factory.line_graph(2, opts=[{'plugin': plugin}, {}])
+    l1.rpc.emit()
+    l1.daemon.wait_for_log(r'Got a custom notification Hello world')
+
+    inv = l2.rpc.invoice(42, "lbl", "desc")['bolt11']
+    l1.rpc.pay(inv)
+
+    l1.daemon.wait_for_log(r'Got a pay_success notification from plugin pay for payment_hash [0-9a-f]{64}')
+
+    # And now make sure that we drop unannounced notifications
+    l1.rpc.faulty_emit()
+    l1.daemon.wait_for_log(
+        r"Plugin attempted to send a notification to topic .* not forwarding"
+    )
+    time.sleep(1)
+    assert not l1.daemon.is_in_log(r'Got the ididntannouncethis event')
+
+    # The plugin just dist what previously was a fatal mistake (emit
+    # an unknown notification), make sure we didn't kill it.
+    assert 'custom_notifications.py' in [p['name'] for p in l1.rpc.listconfigs()['plugins']]
+
+
+def test_restart_on_update(node_factory):
+    """Tests if plugin rescan restarts modified plugins
+    """
+    # we need to write plugin content dynamically
+    content = """#!/usr/bin/env python3
+from pyln.client import Plugin
+import time
+plugin = Plugin()
+@plugin.init()
+def init(options, configuration, plugin):
+    plugin.log("test_restart_on_update %s")
+plugin.run()
+    """
+
+    # get a node that is not started so we can put a plugin in its lightning_dir
+    n = node_factory.get_node(start=False)
+    lndir = n.daemon.lightning_dir
+
+    # write hello world plugin to lndir/plugins
+    os.makedirs(os.path.join(lndir, 'plugins'), exist_ok=True)
+    path = os.path.join(lndir, 'plugins', 'test_restart_on_update.py')
+    file = open(path, 'w+')
+    file.write(content % "1")
+    file.close()
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+
+    # now fire up the node and wait for the plugin to print hello
+    n.daemon.start()
+    n.daemon.logsearch_start = 0
+    n.daemon.wait_for_log(r"test_restart_on_update 1")
+
+    # a rescan should not yet reload the plugin on the same file
+    n.rpc.plugin_rescan()
+    assert not n.daemon.is_in_log(r"Plugin changed, needs restart.")
+
+    # modify the file
+    file = open(path, 'w+')
+    file.write(content % "2")
+    file.close()
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+
+    # rescan and check
+    n.rpc.plugin_rescan()
+    n.daemon.wait_for_log(r"Plugin changed, needs restart.")
+    n.daemon.wait_for_log(r"test_restart_on_update 2")
+    n.stop()

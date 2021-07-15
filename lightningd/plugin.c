@@ -1,4 +1,6 @@
 #include <ccan/array_size/array_size.h>
+#include <ccan/ccan/tal/grab_file/grab_file.h>
+#include <ccan/crc32c/crc32c.h>
 #include <ccan/list/list.h>
 #include <ccan/mem/mem.h>
 #include <ccan/opt/opt.h>
@@ -74,7 +76,7 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 	p->log = new_log(p, log_book, NULL, "plugin-manager");
 	p->ld = ld;
 	p->startup = true;
-	p->json_cmds = tal_arr(p, struct command *, 0);
+	p->plugin_cmds = tal_arr(p, struct plugin_command *, 0);
 	p->blacklist = tal_arr(p, const char *, 0);
 	p->shutdown = false;
 	p->plugin_idx = 0;
@@ -103,9 +105,26 @@ void plugins_free(struct plugins *plugins)
 	tal_free(plugins);
 }
 
+/* Check that all the plugin's subscriptions are actually for known
+ * notification topics. Emit a warning if that's not the case, but
+ * don't kill the plugin. */
+static void plugin_check_subscriptions(struct plugins *plugins,
+				       struct plugin *plugin)
+{
+	for (size_t i = 0; i < tal_count(plugin->subscriptions); i++) {
+		const char *topic = plugin->subscriptions[i];
+		if (!notifications_have_topic(plugins, topic))
+			log_unusual(
+			    plugin->log,
+			    "topic '%s' is not a known notification topic",
+			    topic);
+	}
+}
+
 /* Once they've all replied with their manifests, we can order them. */
 static void check_plugins_manifests(struct plugins *plugins)
 {
+	struct plugin *plugin;
 	struct plugin **depfail;
 
 	if (plugins_any_in_state(plugins, AWAITING_GETMANIFEST_RESPONSE))
@@ -121,6 +140,12 @@ static void check_plugins_manifests(struct plugins *plugins)
 			    "Cannot meet required hook dependencies");
 	}
 
+	/* Check that all the subscriptions are matched with real
+	 * topics. */
+	list_for_each(&plugins->plugins, plugin, list) {
+		plugin_check_subscriptions(plugin->plugins, plugin);
+	}
+
 	/* As startup, we break out once all getmanifest are returned */
 	if (plugins->startup)
 		io_break(plugins);
@@ -131,27 +156,27 @@ static void check_plugins_manifests(struct plugins *plugins)
 
 static void check_plugins_initted(struct plugins *plugins)
 {
-	struct command **json_cmds;
+	struct plugin_command **plugin_cmds;
 
 	if (!plugins_all_in_state(plugins, INIT_COMPLETE))
 		return;
 
 	/* Clear commands first, in case callbacks add new ones.
 	 * Paranoia, but wouldn't that be a nasty bug to find? */
-	json_cmds = plugins->json_cmds;
-	plugins->json_cmds = tal_arr(plugins, struct command *, 0);
-	for (size_t i = 0; i < tal_count(json_cmds); i++)
-		plugin_cmd_all_complete(plugins, json_cmds[i]);
-	tal_free(json_cmds);
+	plugin_cmds = plugins->plugin_cmds;
+	plugins->plugin_cmds = tal_arr(plugins, struct plugin_command *, 0);
+	for (size_t i = 0; i < tal_count(plugin_cmds); i++)
+		plugin_cmd_all_complete(plugins, plugin_cmds[i]);
+	tal_free(plugin_cmds);
 }
 
 struct command_result *plugin_register_all_complete(struct lightningd *ld,
-						    struct command *cmd)
+						    struct plugin_command *pcmd)
 {
 	if (plugins_all_in_state(ld->plugins, INIT_COMPLETE))
-		return plugin_cmd_all_complete(ld->plugins, cmd);
+		return plugin_cmd_all_complete(ld->plugins, pcmd);
 
-	tal_arr_expand(&ld->plugins->json_cmds, cmd);
+	tal_arr_expand(&ld->plugins->plugin_cmds, pcmd);
 	return NULL;
 }
 
@@ -192,21 +217,36 @@ static void destroy_plugin(struct plugin *p)
 	}
 }
 
+static u32 file_checksum(const char* path)
+{
+	char *content = grab_file(tmpctx, path);
+	if (content == NULL) return 0;
+	return crc32c(0, content, tal_count(content));
+}
+
 struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES,
-			       struct command *start_cmd, bool important,
+			       struct plugin_command *start_cmd, bool important,
 			       const char *parambuf STEALS,
 			       const jsmntok_t *params STEALS)
 {
 	struct plugin *p, *p_temp;
+	u32 chksum;
 
 	/* Don't register an already registered plugin */
 	list_for_each(&plugins->plugins, p_temp, list) {
 		if (streq(path, p_temp->cmd)) {
-			if (taken(path))
-				tal_free(path);
-		 	/* If added as "important", upgrade to "important".  */
+			/* If added as "important", upgrade to "important".  */
 			if (important)
 				p_temp->important = true;
+			/* stop and restart plugin on different checksum */
+			chksum = file_checksum(path);
+			if (p_temp->checksum != chksum && !p_temp->important) {
+				plugin_kill(p_temp, LOG_INFORM,
+					    "Plugin changed, needs restart.");
+				break;
+			}
+			if (taken(path))
+				tal_free(path);
 			return NULL;
 		}
 	}
@@ -214,17 +254,19 @@ struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES,
 	p = tal(plugins, struct plugin);
 	p->plugins = plugins;
 	p->cmd = tal_strdup(p, path);
+	p->checksum = file_checksum(p->cmd);
+	p->shortname = path_basename(p, p->cmd);
 	p->start_cmd = start_cmd;
 
 	p->plugin_state = UNCONFIGURED;
 	p->js_arr = tal_arr(p, struct json_stream *, 0);
 	p->used = 0;
+	p->notification_topics = tal_arr(p, const char *, 0);
 	p->subscriptions = NULL;
 	p->dynamic = false;
 	p->index = plugins->plugin_idx++;
 
-	p->log = new_log(p, plugins->log_book, NULL, "plugin-%s",
-			 path_basename(tmpctx, p->cmd));
+	p->log = new_log(p, plugins->log_book, NULL, "plugin-%s", p->shortname);
 	p->methods = tal_arr(p, const char *, 0);
 	list_head_init(&p->plugin_opts);
 
@@ -390,6 +432,18 @@ static const char *plugin_notify_handle(struct plugin *plugin,
 	return NULL;
 }
 
+/* Check if the plugin is allowed to send a notification of the
+ * specified topic, i.e., whether the plugin has announced the topic
+ * correctly in its manifest. */
+static bool plugin_notification_allowed(const struct plugin *plugin, const char *topic)
+{
+	for (size_t i=0; i<tal_count(plugin->notification_topics); i++)
+		if (streq(plugin->notification_topics[i], topic))
+			return true;
+
+	return false;
+}
+
 /* Returns the error string, or NULL */
 static const char *plugin_notification_handle(struct plugin *plugin,
 					      const jsmntok_t *toks)
@@ -399,7 +453,8 @@ static const char *plugin_notification_handle(struct plugin *plugin,
 					      const jsmntok_t *toks)
 {
 	const jsmntok_t *methtok, *paramstok;
-
+	const char *methname;
+	struct jsonrpc_notification *n;
 	methtok = json_get_member(plugin->buffer, toks, "method");
 	paramstok = json_get_member(plugin->buffer, toks, "params");
 
@@ -420,11 +475,25 @@ static const char *plugin_notification_handle(struct plugin *plugin,
 	} else if (json_tok_streq(plugin->buffer, methtok, "message")
 		   || json_tok_streq(plugin->buffer, methtok, "progress")) {
 		return plugin_notify_handle(plugin, methtok, paramstok);
-	} else {
-		return tal_fmt(plugin, "Unknown notification method %.*s",
-			       json_tok_full_len(methtok),
-			       json_tok_full(plugin->buffer, methtok));
 	}
+
+	methname = json_strdup(tmpctx, plugin->buffer, methtok);
+
+	if (!plugin_notification_allowed(plugin, methname)) {
+		log_unusual(plugin->log,
+			    "Plugin attempted to send a notification to topic "
+			    "\"%s\" it hasn't declared in its manifest, not "
+			    "forwarding to subscribers.",
+			    methname);
+	} else if (notifications_have_topic(plugin->plugins, methname)) {
+		n = jsonrpc_notification_start(NULL, methname);
+		json_add_string(n->stream, "origin", plugin->shortname);
+		json_add_tok(n->stream, "payload", paramstok, plugin->buffer);
+		jsonrpc_notification_end(n);
+
+		plugins_notify(plugin->plugins, take(n));
+	}
+	return NULL;
 }
 
 /* Returns the error string, or NULL */
@@ -1136,14 +1205,12 @@ static const char *plugin_subscriptions_add(struct plugin *plugin,
 					json_tok_full_len(s),
 					json_tok_full(buffer, s));
 		}
+
+		/* We add all subscriptions while parsing the
+		 * manifest, without checking that they exist, since
+		 * later plugins may also emit notifications of custom
+		 * types that we don't know about yet. */
 		topic = json_strdup(plugin, plugin->buffer, s);
-
-		if (!notifications_have_topic(topic)) {
-			return tal_fmt(
-			    plugin,
-			    "topic '%s' is not a known notification topic", topic);
-		}
-
 		tal_arr_expand(&plugin->subscriptions, topic);
 	}
 	return NULL;
@@ -1248,6 +1315,52 @@ static void plugin_manifest_timeout(struct plugin *plugin)
 		fatal("Can't recover from plugin failure, terminating.");
 }
 
+static const char *plugin_notifications_add(const char *buffer,
+					    const jsmntok_t *result,
+					    struct plugin *plugin)
+{
+	char *name;
+	size_t i;
+	const jsmntok_t *method, *obj;
+	const jsmntok_t *notifications =
+	    json_get_member(buffer, result, "notifications");
+
+	if (!notifications)
+		return NULL;
+
+	if (notifications->type != JSMN_ARRAY)
+		return tal_fmt(plugin,
+			       "\"result.notifications\" is not an array");
+
+	json_for_each_arr(i, obj, notifications) {
+		if (obj->type != JSMN_OBJECT)
+			return tal_fmt(
+			    plugin,
+			    "\"result.notifications[%zu]\" is not an object",
+			    i);
+
+		method = json_get_member(buffer, obj, "method");
+		if (method == NULL || method->type != JSMN_STRING)
+			return tal_fmt(plugin,
+				       "\"result.notifications[%zu].name\" "
+				       "missing or not a string.",
+				       i);
+
+		name = json_strdup(plugin, buffer, method);
+
+		if (notifications_topic_is_native(name))
+			return tal_fmt(plugin,
+				       "plugin attempted to register a native "
+				       "notification topic \"%s\", these may "
+				       "however only be sent by lightningd",
+				       name);
+
+		tal_arr_expand(&plugin->notification_topics, name);
+	}
+
+	return NULL;
+}
+
 static const char *plugin_parse_getmanifest_response(const char *buffer,
 						     const jsmntok_t *toks,
 						     const jsmntok_t *idtok,
@@ -1328,7 +1441,9 @@ static const char *plugin_parse_getmanifest_response(const char *buffer,
 		}
 	}
 
-	err = plugin_opts_add(plugin, buffer, resulttok);
+	err = plugin_notifications_add(buffer, resulttok, plugin);
+	if (!err)
+		err = plugin_opts_add(plugin, buffer, resulttok);
 	if (!err)
 		err = plugin_rpcmethods_add(plugin, buffer, resulttok);
 	if (!err)
@@ -1763,7 +1878,6 @@ void json_add_opt_plugins_array(struct json_stream *response,
 				bool important)
 {
 	struct plugin *p;
-	const char *plugin_name;
 	struct plugin_opt *opt;
 	const char *opt_name;
 
@@ -1778,9 +1892,7 @@ void json_add_opt_plugins_array(struct json_stream *response,
 		json_add_string(response, "path", p->cmd);
 
 		/* FIXME: use executables basename until plugins can define their names */
-		plugin_name = path_basename(NULL, p->cmd);
-		json_add_string(response, "name", plugin_name);
-		tal_free(plugin_name);
+		json_add_string(response, "name", p->shortname);
 
 		if (!list_empty(&p->plugin_opts)) {
 			json_object_start(response, "options");

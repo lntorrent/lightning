@@ -34,9 +34,22 @@ WIRE_OBJS := $(WIRE_SRC:.c=.o)
 WIRE_PRINT_OBJS := $(WIRE_PRINT_SRC:.c=.o)
 $(WIRE_OBJS) $(WIRE_PRINT_OBJS): $(WIRE_HEADERS)
 
-# Make sure these depend on everything.
-ALL_C_SOURCES += $(WIRE_SRC) $(WIRE_PRINT_SRC)
-ALL_C_HEADERS += $(WIRE_HEADERS)
+# Make sure these depend on everything: in case we're experimental,
+# include non-experimental ones here so they get rebuilt.
+WIRE_NONEXP_SRC := wire/bolt12_wiregen.c	\
+		wire/peer_wiregen.c		\
+		wire/onion_wiregen.c		\
+		wire/onion_printgen.c		\
+		wire/peer_printgen.c
+WIRE_NONEXP_HEADERS := wire/peer_wiregen.h	\
+		wire/onion_wiregen.h		\
+		wire/bolt12_wiregen.h		\
+		wire/peer_printgen.h		\
+		wire/onion_printgen.h
+
+ALL_C_SOURCES += $(WIRE_SRC) $(WIRE_PRINT_SRC) $(WIRE_NONEXP_SRC)
+
+ALL_C_HEADERS += $(WIRE_HEADERS) $(WIRE_NONEXP_HEADERS)
 
 # They may not have the bolts.
 BOLT_EXTRACT=$(LOCAL_BOLTDIR)/tools/extract-formats.py
@@ -45,14 +58,17 @@ WIRE_BOLT_DEPS := $(BOLT_DEPS) tools/gen/impl_template tools/gen/header_template
 
 ALL_PEER_PATCHES := $(sort $(wildcard wire/extracted_peer*.patch))
 ALL_ONION_PATCHES := $(sort $(wildcard wire/extracted_onion*.patch))
+ALL_BOLT12_PATCHES := $(sort $(wildcard wire/extracted_bolt12*.patch))
 
 # These are applied to the non-exp csvs to make the exp csvs.
 PEER_EXP_PATCHES := $(sort $(wildcard wire/extracted_peer_exp*.patch))
 ONION_EXP_PATCHES := $(sort $(wildcard wire/extracted_onion_exp*.patch))
+BOLT12_EXP_PATCHES := $(sort $(wildcard wire/extracted_bolt12_exp*.patch))
 
 # These are always applied to the bolts.
 PEER_PATCHES := $(filter-out $(PEER_EXP_PATCHES),$(ALL_PEER_PATCHES))
 ONION_PATCHES := $(filter-out $(ONION_EXP_PATCHES),$(ALL_ONION_PATCHES))
+BOLT12_PATCHES := $(filter-out $(BOLT12_EXP_PATCHES),$(ALL_BOLT12_PATCHES))
 
 # Explicit command to re-extract CSV from BOLTs and patch.
 # This is not a normal make depencency, since we don't want this
@@ -123,7 +139,7 @@ wire/bolt12_exp_wiregen.c_args := $(wire/bolt12_wiregen.c_args)
 wire/peer_wiregen.h_args := --include='common/channel_id.h' --include='bitcoin/tx.h' --include='bitcoin/preimage.h' --include='bitcoin/short_channel_id.h' --include='common/node_id.h' --include='common/bigsize.h' --include='bitcoin/block.h' --include='bitcoin/privkey.h' -s --expose-tlv-type=n1 --expose-tlv-type=n2
 
 # All generated wire/ files depend on this Makefile
-$(filter %printgen.h %printgen.c %wiregen.h %wiregen.c, $(WIRE_SRC) $(WIRE_PRINT_SRC) $(WIRE_HEADERS)): wire/Makefile
+$(filter %printgen.h %printgen.c %wiregen.h %wiregen.c, $(WIRE_SRC) $(WIRE_PRINT_SRC) $(WIRE_NONEXP_SRC) $(WIRE_HEADERS) $(WIRE_NONEXP_HEADERS)): wire/Makefile
 
 maintainer-clean: wire-maintainer-clean
 

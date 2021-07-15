@@ -1149,11 +1149,11 @@ static u8 *handle_peer_in(struct state *state)
 	u8 *msg = sync_crypto_read(tmpctx, state->pps);
 	enum peer_wire t = fromwire_peektype(msg);
 	struct channel_id channel_id;
+	bool extracted;
 
 	if (t == WIRE_OPEN_CHANNEL)
 		return fundee_channel(state, msg);
 
-#if DEVELOPER
 	/* Handle custommsgs */
 	enum peer_wire type = fromwire_peektype(msg);
 	if (type % 2 == 1 && !peer_wire_is_defined(type)) {
@@ -1163,16 +1163,23 @@ static u8 *handle_peer_in(struct state *state)
 		wire_sync_write(REQ_FD, take(towire_custommsg_in(NULL, msg)));
 		return NULL;
 	}
-#endif
 
 	/* Handles standard cases, and legal unknown ones. */
 	if (handle_peer_gossip_or_error(state->pps,
 					&state->channel_id, false, msg))
 		return NULL;
 
+	extracted = extract_channel_id(msg, &channel_id);
+
+	/* Reestablish on some now-closed channel?  Be nice. */
+	if (extracted && fromwire_peektype(msg) == WIRE_CHANNEL_REESTABLISH) {
+		return towire_openingd_got_reestablish(NULL,
+						       &channel_id, msg,
+						       state->pps);
+	}
 	sync_crypto_write(state->pps,
 			  take(towire_warningfmt(NULL,
-						 extract_channel_id(msg, &channel_id) ? &channel_id : NULL,
+						 extracted ? &channel_id : NULL,
 						 "Unexpected message %s: %s",
 						 peer_wire_name(t),
 						 tal_hex(tmpctx, msg))));
@@ -1195,22 +1202,6 @@ static void handle_gossip_in(struct state *state)
 			      "Reading gossip: %s", strerror(errno));
 
 	handle_gossip_msg(state->pps, take(msg));
-}
-
-/*~ Is this message of a `warning` or `error`?  If lightningd asked us to send
- * such a thing, it wants to close the connection. */
-static void fail_if_warning_or_error(const u8 *inner)
-{
-	struct channel_id channel_id;
-	u8 *data;
-
-	if (!fromwire_warning(tmpctx, inner, &channel_id, &data)
-	    && !fromwire_error(tmpctx, inner, &channel_id, &data))
-		return;
-
-	status_info("Master said send %s",
-		    sanitize_error(tmpctx, inner, NULL));
-	exit(0);
 }
 
 /* Memory leak detection is DEVELOPER-only because we go to great lengths to
@@ -1236,6 +1227,7 @@ static void handle_dev_memleak(struct state *state, const u8 *msg)
 			take(towire_openingd_dev_memleak_reply(NULL,
 							      found_leak)));
 }
+#endif /* DEVELOPER */
 
 /* We were told to send a custommsg to the peer by `lightningd`. All the
  * verification is done on the side of `lightningd` so we should be good to
@@ -1247,7 +1239,6 @@ static void openingd_send_custommsg(struct state *state, const u8 *msg)
 		master_badmsg(WIRE_CUSTOMMSG_OUT, msg);
 	sync_crypto_write(state->pps, take(inner));
 }
-#endif /* DEVELOPER */
 
 /* Standard lightningd-fd-is-ready-to-read demux code.  Again, we could hang
  * here, but if we can't trust our parent, who can we trust? */
@@ -1303,18 +1294,15 @@ static u8 *handle_master_in(struct state *state)
 	case WIRE_OPENINGD_FUNDER_FAILED:
 	case WIRE_OPENINGD_GOT_OFFER:
 	case WIRE_OPENINGD_GOT_OFFER_REPLY:
+	case WIRE_OPENINGD_GOT_REESTABLISH:
 		break;
 	}
 
 	/* Now handle common messages. */
 	switch ((enum common_wire)t) {
-#if DEVELOPER
 	case WIRE_CUSTOMMSG_OUT:
 		openingd_send_custommsg(state, msg);
 		return NULL;
-#else
-	case WIRE_CUSTOMMSG_OUT:
-#endif
 	/* We send these. */
 	case WIRE_CUSTOMMSG_IN:
 		break;
@@ -1336,7 +1324,7 @@ int main(int argc, char *argv[])
 {
 	setup_locale();
 
-	u8 *msg, *inner;
+	u8 *msg;
 	struct pollfd pollfd[3];
 	struct state *state = tal(NULL, struct state);
 	struct secret *none;
@@ -1364,7 +1352,6 @@ int main(int argc, char *argv[])
 				   &state->their_features,
 				   &state->option_static_remotekey,
 				   &state->option_anchor_outputs,
-				   &inner,
 				   &force_tmp_channel_id,
 				   &dev_fast_gossip))
 		master_badmsg(WIRE_OPENINGD_INIT, msg);
@@ -1375,14 +1362,6 @@ int main(int argc, char *argv[])
 
 	/* 3 == peer, 4 == gossipd, 5 = gossip_store, 6 = hsmd */
 	per_peer_state_set_fds(state->pps, 3, 4, 5);
-
-	/*~ If lightningd wanted us to send a msg, do so before we waste time
-	 * doing work.  If it's a warning, we'll close immediately. */
-	if (inner != NULL) {
-		sync_crypto_write(state->pps, inner);
-		fail_if_warning_or_error(inner);
-		tal_free(inner);
-	}
 
 	/*~ Initially we're not associated with a channel, but
 	 * handle_peer_gossip_or_error compares this. */

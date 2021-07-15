@@ -19,9 +19,12 @@ which allows for interactive transaction construction.
 RETURN VALUE
 ------------
 
-On success, returns the *channel_id* for this channel; an boolean indicating
-if the channel has been successfully canceled, *channel_canceled*;
-a reason for the cancellation, *reason*.
+[comment]: # (GENERATE-FROM-SCHEMA-START)
+On success, an object is returned, containing:
+- **channel_id** (hex): the channel id of the aborted channel (always 64 characters)
+- **channel_canceled** (boolean): whether this is completely canceled (there may be remaining in-flight transactions)
+- **reason** (string): usually "Abort requested", but if it happened to fail at the same time it could be different
+[comment]: # (GENERATE-FROM-SCHEMA-END)
 
 On error the returned object will contain `code` and `message` properties,
 with `code` being one of the following:
@@ -50,3 +53,4 @@ RESOURCES
 ---------
 
 Main web site: <https://github.com/ElementsProject/lightning>
+[comment]: # ( SHA256STAMP:491dc25c659eb957138fc0578c8158835f3892345bc4613885d61f761e03a624)

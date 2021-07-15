@@ -199,6 +199,10 @@ struct lightningd {
 	/* RPC response to send once we've shut down. */
 	const char *stop_response;
 
+	/* Used these feerates instead of whatever bcli returns (up to
+	 * FEERATE_PENALTY). */
+	u32 *force_feerates;
+
 #if DEVELOPER
 	/* If we want to debug a subdaemon/plugin. */
 	const char *dev_debug_subprocess;
@@ -275,6 +279,13 @@ struct lightningd {
 
 	/* The round-robin list of channels, for use when doing MPP.  */
 	u64 rr_counter;
+
+	/* Should we re-exec ourselves instead of just exiting? */
+	bool try_reexec;
+
+	/* Array of (even) TLV types that we should allow. This is required
+	 * since we otherwise would outright reject them. */
+	u64 *accept_extra_tlv_types;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.

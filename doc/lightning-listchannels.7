@@ -3,7 +3,7 @@
 lightning-listchannels - Command to query active lightning channels in the entire network
 .SH SYNOPSIS
 
-\fBlistchannels\fR [\fIshort_channel_id\fR] [\fIsource\fR]
+\fBlistchannels\fR [\fIshort_channel_id\fR] [\fIsource\fR] [\fIdestination\fR]
 
 .SH DESCRIPTION
 
@@ -20,72 +20,53 @@ If \fIsource\fR is a node id, then only channels leading from that node id
 are returned\.
 
 
-If neither is supplied, data on all lightning channels known to this
+If \fIdestination\fR is a node id, then only channels leading to that node id
+are returned\.
+
+
+Only one of \fIshort_channgel_id\fR, \fIsource\fR or \fIdestination\fR can be supplied\.
+If nothing is supplied, data on all lightning channels known to this
 node, are returned\. These can be local channels or public channels
 broadcast on the gossip network\.
 
 .SH RETURN VALUE
 
-On success, an object with a "channels" key is returned containing a
-list of 0 or more objects\.
-
-
-Each object in the list contains the following data:
+On success, an object containing \fBchannels\fR is returned\.  It is an array of objects, where each object contains:
 
 .RS
 .IP \[bu]
-\fIsource\fR : The node providing entry to the channel, specifying the
-fees charged for using the channel in that direction\.
+\fBsource\fR (pubkey): the source node
 .IP \[bu]
-\fIdestination\fR : The node providing the exit point for the channel\.
+\fBdestination\fR (pubkey): the destination node
 .IP \[bu]
-\fIshort_channel_id\fR : The channel identifier\.
+\fBpublic\fR (boolean): true if this is announced (otherwise it must be our channel)
 .IP \[bu]
-\fIpublic\fR : Boolean value, is publicly available\. Non-local channels
-will only ever have this value set to true\. Local channels are
-side-loaded by this node, rather than obtained through the gossip
-network, and so may have this value set to false\.
+\fBamount_msat\fR (msat): the total capacity of this channel (always a whole number of satoshis)
 .IP \[bu]
-\fIsatoshis\fR : Funds available in the channel\.
+\fBmessage_flags\fR (u8): as defined by BOLT #7
 .IP \[bu]
-\fIamount_sat\fR : Same as above, but ending in \fIsat\fR\.
+\fBchannel_flags\fR (u8): as defined by BOLT #7
 .IP \[bu]
-\fImessage_flags\fR : Bitfield showing the presence of optional fields
-in the \fIchannel_update\fR message (BOLT #7)\.
+\fBactive\fR (boolean): true unless source has disabled it, or it's a local channel and the peer is disconnected or it's still opening or closing
 .IP \[bu]
-\fIchannel_flags\fR : Bitfields indicating the direction of the channel
-and signaling various options concerning the channel\. (BOLT #7)\.
+\fBlast_update\fR (u32): UNIX timestamp on the last channel_update from \fIsource\fR
 .IP \[bu]
-\fIactive\fR : Boolean value, is available for routing\. This is linked
-to the channel flags data, where if the second bit is set, signals a
-channels temporary unavailability (due to loss of connectivity) OR
-permanent unavailability where the channel has been closed but not
-settlement on-chain\.
+\fBbase_fee_millisatoshi\fR (u32): Base fee changed by \fIsource\fR to use this channel
 .IP \[bu]
-\fIlast_update\fR : Unix timestamp (seconds) showing when the last
-channel_update message was received\.
+\fBfee_per_millionth\fR (u32): Proportional fee changed by \fIsource\fR to use this channel, in parts-per-million
 .IP \[bu]
-\fIbase_fee_millisatoshi\fR : The base fee (in millisatoshi) charged
-for the HTLC (BOLT #7; equivalent to \fBfee_base_msat\fR)\.
+\fBdelay\fR (u32): The number of blocks delay required by \fIsource\fR to use this channel
 .IP \[bu]
-\fIfee_per_millionth\fR : The amount (in millionths of a satoshi)
-charged per transferred satoshi (BOLT #7; equivalent to
-\fBfee_proportional_millionths\fR)\.
+\fBhtlc_minimum_msat\fR (msat): The smallest payment \fIsource\fR will allow via this channel
 .IP \[bu]
-\fIdelay\fR : The number of blocks of additional delay required when
-forwarding an HTLC in this direction\. (BOLT #7; equivalent to
-\fBcltv_expiry_delta\fR)\.
+\fBfeatures\fR (hex): BOLT #9 features bitmap for this channel
 .IP \[bu]
-\fIhtlc_minimum_msat\fR : The minimum payment which can be sent
-through this channel\.
-.IP \[bu]
-\fIhtlc_maximum_msat\fR : The maximum payment which can be sent
-through this channel\.
+\fBhtlc_maximum_msat\fR (msat, optional): The largest payment \fIsource\fR will allow via this channel
 
 .RE
 
-If \fIshort_channel_id\fR or \fIsource\fR is supplied and no matching channels
-are found, a "channels" object with an empty list is returned\.
+If one of \fIshort_channel_id\fR, \fIsource\fR or \fIdestination\fR is supplied and no
+matching channels are found, a "channels" object with an empty list is returned\.
 
 
 On error the returned object will contain \fBcode\fR and \fBmessage\fR properties,
@@ -117,4 +98,4 @@ BOLT #7:
 \fIhttps://github.com/lightningnetwork/lightning-rfc/blob/master/07-routing-gossip.md\fR
 
 .RE
-\" SHA256STAMP:c7c5d846dc08733728bbc358394da54c2d90b0d31633bdd2df48e89d46c359c0
+\" SHA256STAMP:b53e67e29b3ac9efe5157e8656ea5af5b2e418559655cc6f39fa99875f52bdc0

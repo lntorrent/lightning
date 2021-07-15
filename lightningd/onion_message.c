@@ -15,9 +15,9 @@ struct onion_message_hook_payload {
 	struct tlv_onionmsg_payload *om;
 };
 
-static void
-onion_message_serialize(struct onion_message_hook_payload *payload,
-			   struct json_stream *stream)
+static void onion_message_serialize(struct onion_message_hook_payload *payload,
+				    struct json_stream *stream,
+				    struct plugin *plugin)
 {
 	json_object_start(stream, "onion_message");
 	if (payload->blinding_in)
@@ -437,7 +437,7 @@ static struct command_result *json_send_onion_message(struct command *cmd,
 				hops[i].rawtlv, tal_bytelen(hops[i].rawtlv));
 		sphinx_add_hop(sphinx_path, &hops[i].id, take(tlv_with_len));
 	}
-	/* BOLT-offers #4:
+	/* BOLT-onion-message #4:
 	 * - SHOULD set `len` to 1366 or 32834.
 	 */
 	if (sphinx_path_payloads_size(sphinx_path) <= ROUTING_INFO_SIZE)

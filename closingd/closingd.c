@@ -114,7 +114,6 @@ static u8 *closing_read_peer_msg(const tal_t *ctx,
 			handle_gossip_msg(pps, take(msg));
 			continue;
 		}
-#if DEVELOPER
 		/* Handle custommsgs */
 		enum peer_wire type = fromwire_peektype(msg);
 		if (type % 2 == 1 && !peer_wire_is_defined(type)) {
@@ -124,146 +123,8 @@ static u8 *closing_read_peer_msg(const tal_t *ctx,
 			wire_sync_write(REQ_FD, take(towire_custommsg_in(NULL, msg)));
 			continue;
 		}
-#endif
 		if (!handle_peer_gossip_or_error(pps, channel_id, false, msg))
 			return msg;
-	}
-}
-
-static struct pubkey get_per_commitment_point(u64 commitment_number)
-{
-	u8 *msg;
-	struct pubkey commitment_point;
-	struct secret *s;
-
-	/* Our current per-commitment point is the commitment point in the last
-	 * received signed commitment; HSM gives us that and the previous
-	 * secret (which we don't need). */
-	msg = towire_hsmd_get_per_commitment_point(NULL,
-	                                          commitment_number);
-	if (!wire_sync_write(HSM_FD, take(msg)))
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Writing get_per_commitment_point to HSM: %s",
-			      strerror(errno));
-
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!msg)
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Reading resp get_per_commitment_point reply: %s",
-			      strerror(errno));
-	if (!fromwire_hsmd_get_per_commitment_point_reply(tmpctx, msg,
-	                                                 &commitment_point,
-	                                                 &s))
-		status_failed(STATUS_FAIL_HSM_IO,
-		              "Bad per_commitment_point reply %s",
-		              tal_hex(tmpctx, msg));
-
-	return commitment_point;
-}
-
-static void do_reconnect(struct per_peer_state *pps,
-			 const struct channel_id *channel_id,
-			 const u64 next_index[NUM_SIDES],
-			 u64 revocations_received,
-			 const u8 *channel_reestablish,
-			 const u8 *final_scriptpubkey,
-			 const struct secret *last_remote_per_commit_secret,
-			 const struct bitcoin_outpoint *wrong_funding)
-{
-	u8 *msg;
-	struct channel_id their_channel_id;
-	u64 next_local_commitment_number, next_remote_revocation_number;
-	struct pubkey my_current_per_commitment_point, next_commitment_point;
-	struct secret their_secret;
-	struct tlv_shutdown_tlvs *tlvs;
-
-	my_current_per_commitment_point = get_per_commitment_point(next_index[LOCAL]-1);
-
-	/* BOLT #2:
-	 *
-	 *   - upon reconnection:
-	 *     - if a channel is in an error state:
-	 *       - SHOULD retransmit the error packet and ignore any other packets for
-	 *        that channel.
-	 *     - otherwise:
-	 *       - MUST transmit `channel_reestablish` for each channel.
-	 *       - MUST wait to receive the other node's `channel_reestablish`
-	 *         message before sending any other messages for that channel.
-	 *
-	 * The sending node:
-	 *   - MUST set `next_commitment_number` to the commitment number
-	 *     of the next `commitment_signed` it expects to receive.
-	 *   - MUST set `next_revocation_number` to the commitment number
-	 *     of the next `revoke_and_ack` message it expects to receive.
-	 */
-
-	msg = towire_channel_reestablish(NULL, channel_id,
-					 next_index[LOCAL],
-					 revocations_received,
-					 last_remote_per_commit_secret,
-					 &my_current_per_commitment_point);
-	sync_crypto_write(pps, take(msg));
-
-	/* They might have already sent reestablish, which triggered us */
-	if (!channel_reestablish) {
-		do {
-			tal_free(channel_reestablish);
-			channel_reestablish = closing_read_peer_msg(tmpctx, pps,
-								    channel_id);
-			/* They *should* send reestablish first, but lnd
-			 * sends other messages, which we can ignore since
-			 * we're closing anyway... */
-		} while (fromwire_peektype(channel_reestablish)
-			 != WIRE_CHANNEL_REESTABLISH);
-	}
-
-	if (!fromwire_channel_reestablish(channel_reestablish, &their_channel_id,
-					  &next_local_commitment_number,
-					  &next_remote_revocation_number,
-					  &their_secret,
-					  &next_commitment_point)) {
-		peer_failed_warn(pps, channel_id,
-				 "bad reestablish msg: %s %s",
-				 peer_wire_name(fromwire_peektype(channel_reestablish)),
-				 tal_hex(tmpctx, channel_reestablish));
-	}
-	status_debug("Got reestablish commit=%"PRIu64" revoke=%"PRIu64,
-		     next_local_commitment_number,
-		     next_remote_revocation_number);
-
-	/* BOLT #2:
-	 *
-	 * A node:
-	 *...
-	 *   - upon reconnection:
-	 *     - if it has sent a previous `shutdown`:
-	 *       - MUST retransmit `shutdown`.
-	 */
-	if (wrong_funding) {
-		tlvs = tlv_shutdown_tlvs_new(tmpctx);
-		tlvs->wrong_funding
-			= tal(tlvs, struct tlv_shutdown_tlvs_wrong_funding);
-		tlvs->wrong_funding->txid = wrong_funding->txid;
-		tlvs->wrong_funding->outnum = wrong_funding->n;
-	} else
-		tlvs = NULL;
-
-	msg = towire_shutdown(NULL, channel_id, final_scriptpubkey, tlvs);
-	sync_crypto_write(pps, take(msg));
-
-	/* BOLT #2:
-	 *
-	 * A node:
-	 *...
-	 *   - if `next_commitment_number` is 1 in both the `channel_reestablish` it sent and received:
-	 *     - MUST retransmit `funding_locked`.
-	 */
-	if (next_index[REMOTE] == 1 && next_index[LOCAL] == 1) {
-		status_debug("Retransmitting funding_locked for channel %s",
-		             type_to_string(tmpctx, struct channel_id, channel_id));
-		next_commitment_point = get_per_commitment_point(next_index[LOCAL]);
-		msg = towire_funding_locked(NULL, channel_id, &next_commitment_point);
-		sync_crypto_write(pps, take(msg));
 	}
 }
 
@@ -628,6 +489,84 @@ static void closing_dev_memleak(const tal_t *ctx,
 }
 #endif /* DEVELOPER */
 
+/* Figure out what weight we actually expect for this closing tx (using zero fees
+ * gives the largest possible tx: larger values might omit outputs). */
+static size_t closing_tx_weight_estimate(u8 *scriptpubkey[NUM_SIDES],
+					 const u8 *funding_wscript,
+					 const struct amount_sat *out,
+					 struct amount_sat funding,
+					 struct amount_sat dust_limit)
+{
+	/* We create a dummy close */
+	struct bitcoin_tx *tx;
+	struct bitcoin_txid dummy_txid;
+	struct bitcoin_signature dummy_sig;
+	struct privkey dummy_privkey;
+	struct pubkey dummy_pubkey;
+	u8 **witness;
+
+	memset(&dummy_txid, 0, sizeof(dummy_txid));
+	tx = create_close_tx(tmpctx, chainparams,
+			     scriptpubkey[LOCAL], scriptpubkey[REMOTE],
+			     funding_wscript,
+			     &dummy_txid, 0,
+			     funding,
+			     out[LOCAL],
+			     out[REMOTE],
+			     dust_limit);
+
+	/* Create a signature, any signature, so we can weigh fully "signed"
+	 * tx. */
+	dummy_sig.sighash_type = SIGHASH_ALL;
+	memset(&dummy_privkey, 1, sizeof(dummy_privkey));
+	sign_hash(&dummy_privkey, &dummy_txid.shad, &dummy_sig.s);
+	pubkey_from_privkey(&dummy_privkey, &dummy_pubkey);
+	witness = bitcoin_witness_2of2(NULL, &dummy_sig, &dummy_sig,
+				       &dummy_pubkey, &dummy_pubkey);
+	bitcoin_tx_input_set_witness(tx, 0, take(witness));
+
+	return bitcoin_tx_weight(tx);
+}
+
+/* Get the minimum and desired fees */
+static void calc_fee_bounds(size_t expected_weight,
+			    u32 min_feerate,
+			    u32 desired_feerate,
+			    struct amount_sat maxfee,
+			    struct amount_sat *minfee,
+			    struct amount_sat *desiredfee)
+{
+	*minfee = amount_tx_fee(min_feerate, expected_weight);
+	*desiredfee = amount_tx_fee(desired_feerate, expected_weight);
+
+	/* Can't exceed maxfee. */
+	if (amount_sat_greater(*minfee, maxfee))
+		*minfee = maxfee;
+
+	if (amount_sat_less(*desiredfee, *minfee)) {
+		status_unusual("Our ideal fee is %s (%u sats/perkw),"
+			       " but our minimum is %s: using that",
+			       type_to_string(tmpctx, struct amount_sat, desiredfee),
+			       desired_feerate,
+			       type_to_string(tmpctx, struct amount_sat, minfee));
+		*desiredfee = *minfee;
+	}
+	if (amount_sat_greater(*desiredfee, maxfee)) {
+		status_unusual("Our ideal fee is %s (%u sats/perkw),"
+			       " but our maximum is %s: using that",
+			       type_to_string(tmpctx, struct amount_sat, desiredfee),
+			       desired_feerate,
+			       type_to_string(tmpctx, struct amount_sat, &maxfee));
+		*desiredfee = maxfee;
+	}
+
+	status_debug("Expected closing weight = %zu, fee %s (min %s, max %s)",
+		     expected_weight,
+		     type_to_string(tmpctx, struct amount_sat, desiredfee),
+		     type_to_string(tmpctx, struct amount_sat, minfee),
+		     type_to_string(tmpctx, struct amount_sat, &maxfee));
+}
+
 int main(int argc, char *argv[])
 {
 	setup_locale();
@@ -641,6 +580,7 @@ int main(int argc, char *argv[])
 	struct amount_sat funding, out[NUM_SIDES];
 	struct amount_sat our_dust_limit;
 	struct amount_sat min_fee_to_accept, commitment_fee, offer[NUM_SIDES];
+	u32 min_feerate, initial_feerate;
 	struct feerange feerange;
 	enum side opener;
 	u8 *scriptpubkey[NUM_SIDES], *funding_wscript;
@@ -648,11 +588,7 @@ int main(int argc, char *argv[])
 	u8 fee_negotiation_step_unit;
 	char fee_negotiation_step_str[32]; /* fee_negotiation_step + "sat" */
 	struct channel_id channel_id;
-	bool reconnected;
-	u64 next_index[NUM_SIDES], revocations_received;
 	enum side whose_turn;
-	u8 *channel_reestablish;
-	struct secret last_remote_per_commit_secret;
 	struct bitcoin_outpoint *wrong_funding;
 
 	subdaemon_setup(argc, argv);
@@ -672,24 +608,29 @@ int main(int argc, char *argv[])
 				    &out[LOCAL],
 				    &out[REMOTE],
 				    &our_dust_limit,
-				    &min_fee_to_accept, &commitment_fee,
-				    &offer[LOCAL],
+				    &min_feerate, &initial_feerate,
+				    &commitment_fee,
 				    &scriptpubkey[LOCAL],
 				    &scriptpubkey[REMOTE],
 				    &fee_negotiation_step,
 				    &fee_negotiation_step_unit,
-				    &reconnected,
-				    &next_index[LOCAL],
-				    &next_index[REMOTE],
-				    &revocations_received,
-				    &channel_reestablish,
-				    &last_remote_per_commit_secret,
 				    &dev_fast_gossip,
 				    &wrong_funding))
 		master_badmsg(WIRE_CLOSINGD_INIT, msg);
 
 	/* stdin == requests, 3 == peer, 4 = gossip, 5 = gossip_store, 6 = hsmd */
 	per_peer_state_set_fds(notleak(pps), 3, 4, 5);
+
+	funding_wscript = bitcoin_redeem_2of2(ctx,
+					      &funding_pubkey[LOCAL],
+					      &funding_pubkey[REMOTE]);
+
+	/* Start at what we consider a reasonable feerate for this tx. */
+	calc_fee_bounds(closing_tx_weight_estimate(scriptpubkey,
+						   funding_wscript,
+						   out, funding, our_dust_limit),
+			min_feerate, initial_feerate, commitment_fee,
+			&min_fee_to_accept, &offer[LOCAL]);
 
 	snprintf(fee_negotiation_step_str, sizeof(fee_negotiation_step_str),
 		 "%" PRIu64 "%s", fee_negotiation_step,
@@ -711,17 +652,6 @@ int main(int argc, char *argv[])
 			       type_to_string(tmpctx, struct bitcoin_txid,
 					      &wrong_funding->txid),
 			       wrong_funding->n);
-
-	funding_wscript = bitcoin_redeem_2of2(ctx,
-					      &funding_pubkey[LOCAL],
-					      &funding_pubkey[REMOTE]);
-
-	if (reconnected)
-		do_reconnect(pps, &channel_id,
-			     next_index, revocations_received,
-			     channel_reestablish, scriptpubkey[LOCAL],
-			     &last_remote_per_commit_secret,
-			     wrong_funding);
 
 	peer_billboard(
 	    true,

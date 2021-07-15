@@ -28,7 +28,25 @@ the invoice.
 RETURN VALUE
 ------------
 
-On success, an invoice object is returned, as per listinvoices(7).
+(Note: the return format is the same as lightning-listinvoices(7)).
+
+[comment]: # (GENERATE-FROM-SCHEMA-START)
+On success, an object is returned, containing:
+- **label** (string): the label for the invoice
+- **payment_hash** (hex): the hash of the *payment_preimage* which will prove payment (always 64 characters)
+- **status** (string): Whether it has been paid, or can no longer be paid (one of "paid", "expired", "unpaid")
+- **description** (string): Description extracted from **bolt11** or **bolt12**
+- **expires_at** (u64): UNIX timestamp of when invoice expires (or expired)
+- **bolt11** (string, optional): the bolt11 string (always present unless **bolt12** is)
+- **bolt12** (string, optional): the bolt12 string instead of **bolt11** (**experimental-offers** only)
+- **amount_msat** (msat, optional): The amount of the invoice (if it has one)
+- **pay_index** (u64, optional): Incrementing id for when this was paid (**status** *paid* only)
+- **amount_received_msat** (msat, optional): Amount actually received (**status** *paid* only)
+- **paid_at** (u64, optional): UNIX timestamp of when invoice was paid (**status** *paid* only)
+- **payment_preimage** (hex, optional): the proof of payment: SHA256 of this **payment_hash** (always 64 characters)
+- **local_offer_id** (hex, optional): the *id* of our offer which created this invoice (**experimental-offers** only). (always 64 characters)
+- **payer_note** (string, optional): the optional *payer_note* from invoice_request which created this invoice (**experimental-offers** only).
+[comment]: # (GENERATE-FROM-SCHEMA-END)
 
 On failure, an error is returned and no invoice is created. If the
 lightning process fails before responding, the caller should use
@@ -48,10 +66,11 @@ SEE ALSO
 --------
 
 lightning-invoice(7), lightning-listinvoices(7), lightning-delinvoice(7),
-lightning-getroute(7), lightning-sendpay(7).
+lightning-getroute(7), lightning-sendpay(7), lightning-offer(7).
 
 RESOURCES
 ---------
 
 Main web site: <https://github.com/ElementsProject/lightning>
 
+[comment]: # ( SHA256STAMP:72b3b200462e9e16c72dd5e3281d35d9ec2eded62e6a7d87e9361573c85dcc32)

@@ -90,8 +90,10 @@ struct tlv_invoice_request {
 	u32 *recurrence_counter;
 	u32 *recurrence_start;
 	struct pubkey32 *payer_key;
+	utf8 *payer_note;
 	u8 *payer_info;
-	struct bip340sig *recurrence_signature;
+	struct sha256 *replace_invoice;
+	struct bip340sig *payer_signature;
 };
 struct tlv_invoice {
         /* Raw fields including unknown ones. */
@@ -106,6 +108,7 @@ struct tlv_invoice {
 	u8 *features;
 	struct blinded_path **paths;
 	struct blinded_payinfo **blindedpay;
+	struct amount_msat *blinded_capacities;
 	utf8 *vendor;
 	struct pubkey32 *node_id;
 	u64 *quantity;
@@ -115,6 +118,7 @@ struct tlv_invoice {
 	u32 *recurrence_start;
 	u64 *recurrence_basetime;
 	struct pubkey32 *payer_key;
+	utf8 *payer_note;
 	u8 *payer_info;
 	u64 *timestamp;
 	struct sha256 *payment_hash;
@@ -122,6 +126,7 @@ struct tlv_invoice {
 	u32 *cltv;
         struct tlv_invoice_fallbacks *fallbacks;
 	struct bip340sig *refund_signature;
+	struct sha256 *replace_invoice;
 	struct bip340sig *signature;
 };
 struct tlv_invoice_error {
@@ -209,7 +214,7 @@ void towire_invoice_request(u8 **pptr, const struct tlv_invoice_request *record)
 bool invoice_request_is_valid(const struct tlv_invoice_request *record,
 			  size_t *err_index);
 
-#define TLVS_ARRAY_SIZE_invoice_request 10
+#define TLVS_ARRAY_SIZE_invoice_request 12
 extern const struct tlv_record_type tlvs_invoice_request[];
 
 
@@ -223,9 +228,11 @@ enum invoice_request_types {
 	TLV_INVOICE_REQUEST_QUANTITY = 32,
 	TLV_INVOICE_REQUEST_RECURRENCE_COUNTER = 36,
 	TLV_INVOICE_REQUEST_PAYER_KEY = 38,
+	TLV_INVOICE_REQUEST_PAYER_NOTE = 39,
 	TLV_INVOICE_REQUEST_PAYER_INFO = 50,
+	TLV_INVOICE_REQUEST_REPLACE_INVOICE = 56,
 	TLV_INVOICE_REQUEST_RECURRENCE_START = 68,
-	TLV_INVOICE_REQUEST_RECURRENCE_SIGNATURE = 242,
+	TLV_INVOICE_REQUEST_PAYER_SIGNATURE = 240,
 };
 
 struct tlv_invoice *tlv_invoice_new(const tal_t *ctx);
@@ -316,4 +323,4 @@ struct fallback_address *fromwire_fallback_address(const tal_t *ctx, const u8 **
 
 
 #endif /* LIGHTNING_WIRE_BOLT12_WIREGEN_H */
-// SHA256STAMP:3c8dc54796300320573ccf24c2ec022c4f95f545576e909e55da001c1d04392d
+// SHA256STAMP:95d5be81bb0846cff337017b812800a19bf176d3182dd605bfe03086c14ef1f4

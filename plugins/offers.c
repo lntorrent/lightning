@@ -224,7 +224,8 @@ static void json_add_onionmsg_path(struct json_stream *js,
 	json_object_end(js);
 }
 
-static void json_add_blinded_paths(struct json_stream *js,
+/* Returns true if valid */
+static bool json_add_blinded_paths(struct json_stream *js,
 				   struct blinded_path **paths,
 				   struct blinded_payinfo **blindedpay)
 {
@@ -250,9 +251,13 @@ static void json_add_blinded_paths(struct json_stream *js,
 	 *   exactly as many `payinfo` as total `onionmsg_path` in
 	 *   `blinded_path`.
 	 */
-	if (blindedpay && n != tal_count(blindedpay))
+	if (blindedpay && n != tal_count(blindedpay)) {
 		json_add_string(js, "warning_invoice_invalid_blinded_payinfo",
 				"invoice does not have correct number of blinded_payinfo");
+		return false;
+	}
+
+	return true;
 }
 
 static const char *recurrence_time_unit_name(u8 time_unit)
@@ -276,6 +281,7 @@ static const char *recurrence_time_unit_name(u8 time_unit)
 static void json_add_offer(struct json_stream *js, const struct tlv_offer *offer)
 {
 	struct sha256 offer_id;
+	bool valid = true;
 
 	merkle_tlv(offer->fields, &offer_id);
 	json_add_sha256(js, "offer_id", &offer_id);
@@ -305,16 +311,18 @@ static void json_add_offer(struct json_stream *js, const struct tlv_offer *offer
 	/* BOLT-offers #12:
 	 * A reader of an offer:
 	 *...
-	 *  - if `node_id`, `description` or `signature` is not set:
+	 *  - if `node_id` or `description` is not set:
 	 *    - MUST NOT respond to the offer.
 	 */
 	if (offer->description)
 		json_add_stringn(js, "description",
 				 offer->description,
 				 tal_bytelen(offer->description));
-	else
+	else {
 		json_add_string(js, "warning_offer_missing_description",
 				"offers without a description are invalid");
+		valid = false;
+	}
 
 	if (offer->vendor)
 		json_add_stringn(js, "vendor", offer->vendor,
@@ -325,7 +333,7 @@ static void json_add_offer(struct json_stream *js, const struct tlv_offer *offer
 		json_add_u64(js, "absolute_expiry",
 			     *offer->absolute_expiry);
 	if (offer->paths)
-		json_add_blinded_paths(js, offer->paths, NULL);
+		valid &= json_add_blinded_paths(js, offer->paths, NULL);
 
 	if (offer->quantity_min)
 		json_add_u64(js, "quantity_min", *offer->quantity_min);
@@ -360,12 +368,20 @@ static void json_add_offer(struct json_stream *js, const struct tlv_offer *offer
 		json_object_end(js);
 	}
 
-	/* offer_decode fails if node_id or signature not set */
-	json_add_pubkey32(js, "node_id", offer->node_id);
-	json_add_bip340sig(js, "signature", offer->signature);
+	if (offer->node_id)
+		json_add_pubkey32(js, "node_id", offer->node_id);
+	else
+		valid = false;
+
+	/* If it's present, offer_decode checked it was valid */
+	if (offer->signature)
+		json_add_bip340sig(js, "signature", offer->signature);
+
+	json_add_bool(js, "valid", valid);
 }
 
-static void json_add_fallback_address(struct json_stream *js,
+/* Returns true if valid */
+static bool json_add_fallback_address(struct json_stream *js,
 				      const struct chainparams *chain,
 				      u8 version, const u8 *address)
 {
@@ -373,19 +389,23 @@ static void json_add_fallback_address(struct json_stream *js,
 
 	/* Does extra checks, in particular checks v0 sizes */
 	if (segwit_addr_encode(out, chain->bip173_name, version,
-			       address, tal_bytelen(address)))
+			       address, tal_bytelen(address))) {
 		json_add_string(js, "address", out);
-	else
-		json_add_string(js,
-				"warning_invoice_fallbacks_address_invalid",
-				"invalid fallback address for this version");
+		return true;
+	}
+	json_add_string(js,
+			"warning_invoice_fallbacks_address_invalid",
+			"invalid fallback address for this version");
+	return false;
 }
 
-static void json_add_fallbacks(struct json_stream *js,
+/* Returns true if valid */
+static bool json_add_fallbacks(struct json_stream *js,
 			       const struct bitcoin_blkid *chains,
 			       struct fallback_address **fallbacks)
 {
 	const struct chainparams *chain;
+	bool valid = true;
 
 	/* Present address as first chain mentioned. */
 	if (tal_count(chains) != 0)
@@ -414,23 +434,29 @@ static void json_add_fallbacks(struct json_stream *js,
 			json_add_string(js,
 					"warning_invoice_fallbacks_version_invalid",
 					"invoice fallback version > 16");
+			valid = false;
 		} else if (addrlen < 2 || addrlen > 40) {
 			json_add_string(js,
 					"warning_invoice_fallbacks_address_invalid",
 					"invoice fallback address bad length");
+			valid = false;
 		} else if (chain) {
-			json_add_fallback_address(js, chain,
-						  fallbacks[i]->version,
-						  fallbacks[i]->address);
+			valid &= json_add_fallback_address(js, chain,
+							   fallbacks[i]->version,
+							   fallbacks[i]->address);
 		}
 		json_object_end(js);
 	}
 	json_array_end(js);
+
+	return valid;
 }
 
 static void json_add_b12_invoice(struct json_stream *js,
 				 const struct tlv_invoice *invoice)
 {
+	bool valid = true;
+
 	if (invoice->chains)
 		json_add_chains(js, invoice->chains);
 	if (invoice->offer_id)
@@ -442,9 +468,11 @@ static void json_add_b12_invoice(struct json_stream *js,
 	if (invoice->amount)
 		json_add_amount_msat_only(js, "amount_msat",
 					  amount_msat(*invoice->amount));
-	else
+	else {
 		json_add_string(js, "warning_invoice_missing_amount",
 				"invoices without an amount are invalid");
+		valid = false;
+	}
 
 	/* BOLT-offers #12:
 	 *  - MUST reject the invoice if `description` is not present.
@@ -452,9 +480,12 @@ static void json_add_b12_invoice(struct json_stream *js,
 	if (invoice->description)
 		json_add_stringn(js, "description", invoice->description,
 				 tal_bytelen(invoice->description));
-	else
+	else {
 		json_add_string(js, "warning_invoice_missing_description",
 				"invoices without a description are invalid");
+		valid = false;
+	}
+
 	if (invoice->vendor)
 		json_add_stringn(js, "vendor", invoice->vendor,
 				 tal_bytelen(invoice->vendor));
@@ -469,10 +500,12 @@ static void json_add_b12_invoice(struct json_stream *js,
 		 *     contain exactly as many `payinfo` as total `onionmsg_path`
 		 *     in `blinded_path`.
 		 */
-		if (!invoice->blindedpay)
+		if (!invoice->blindedpay) {
 			json_add_string(js, "warning_invoice_missing_blinded_payinfo",
-					"invoices with blinded_path without blinded_payindo are invalid");
-		json_add_blinded_paths(js, invoice->paths, invoice->blindedpay);
+					"invoices with blinded_path without blinded_payinfo are invalid");
+			valid = false;
+		}
+		valid &= json_add_blinded_paths(js, invoice->paths, invoice->blindedpay);
 	}
 	if (invoice->quantity)
 		json_add_u64(js, "quantity", *invoice->quantity);
@@ -494,33 +527,42 @@ static void json_add_b12_invoice(struct json_stream *js,
 		if (invoice->recurrence_basetime)
 			json_add_u64(js, "recurrence_basetime",
 				     *invoice->recurrence_basetime);
-		else
+		else {
 			json_add_string(js, "warning_invoice_missing_recurrence_basetime",
 					"recurring invoices without a recurrence_basetime are invalid");
+			valid = false;
+		}
 	}
 
 	if (invoice->payer_key)
 		json_add_pubkey32(js, "payer_key", invoice->payer_key);
 	if (invoice->payer_info)
 		json_add_hex_talarr(js, "payer_info", invoice->payer_info);
+	if (invoice->payer_note)
+		json_add_stringn(js, "payer_note", invoice->payer_note,
+				 tal_bytelen(invoice->payer_note));
 
 	/* BOLT-offers #12:
 	 *   - MUST reject the invoice if `timestamp` is not present.
 	 */
 	if (invoice->timestamp)
 		json_add_u64(js, "timestamp", *invoice->timestamp);
-	else
+	else {
 		json_add_string(js, "warning_invoice_missing_timestamp",
 				"invoices without a timestamp are invalid");
+		valid = false;
+	}
 
 	/* BOLT-offers #12:
 	 *   - MUST reject the invoice if `payment_hash` is not present.
 	 */
 	if (invoice->payment_hash)
 		json_add_sha256(js, "payment_hash", invoice->payment_hash);
-	else
+	else {
 		json_add_string(js, "warning_invoice_missing_payment_hash",
 				"invoices without a payment_hash are invalid");
+		valid = false;
+	}
 
 	/* BOLT-offers #12:
 	 *
@@ -544,8 +586,8 @@ static void json_add_b12_invoice(struct json_stream *js,
 		json_add_u32(js, "min_final_cltv_expiry", 18);
 
 	if (invoice->fallbacks)
-		json_add_fallbacks(js, invoice->chains,
-				   invoice->fallbacks->fallbacks);
+		valid &= json_add_fallbacks(js, invoice->chains,
+					    invoice->fallbacks->fallbacks);
 
 	/* BOLT-offers #12:
 	 * - if the offer contained `refund_for`:
@@ -560,28 +602,37 @@ static void json_add_b12_invoice(struct json_stream *js,
 	if (invoice->refund_signature) {
 		json_add_bip340sig(js, "refund_signature",
 				   invoice->refund_signature);
-		if (!invoice->payer_key)
+		if (!invoice->payer_key) {
 			json_add_string(js, "warning_invoice_refund_signature_missing_payer_key",
 					"Can't have refund_signature without payer key");
-		else if (!bolt12_check_signature(invoice->fields,
-						 "invoice",
-						 "refund_signature",
-						 invoice->payer_key,
-						 invoice->refund_signature))
+			valid = false;
+		} else if (!bolt12_check_signature(invoice->fields,
+						   "invoice",
+						   "refund_signature",
+						   invoice->payer_key,
+						   invoice->refund_signature)) {
 			json_add_string(js, "warning_invoice_refund_signature_invalid",
 					"refund_signature does not match");
-	} else if (invoice->refund_for)
+			valid = false;
+		}
+	} else if (invoice->refund_for) {
 		json_add_string(js, "warning_invoice_refund_missing_signature",
 				"refund_for requires refund_signature");
+		valid = false;
+	}
 
 	/* invoice_decode checked these */
 	json_add_pubkey32(js, "node_id", invoice->node_id);
 	json_add_bip340sig(js, "signature", invoice->signature);
+
+	json_add_bool(js, "valid", valid);
 }
 
 static void json_add_invoice_request(struct json_stream *js,
 				     const struct tlv_invoice_request *invreq)
 {
+	bool valid = true;
+
 	if (invreq->chains)
 		json_add_chains(js, invreq->chains);
 	/* BOLT-offers #12:
@@ -592,9 +643,11 @@ static void json_add_invoice_request(struct json_stream *js,
 	 */
 	if (invreq->offer_id)
 		json_add_sha256(js, "offer_id", invreq->offer_id);
-	else
+	else {
 		json_add_string(js, "warning_invoice_request_missing_offer_id",
 				"invoice_request requires offer_id");
+		valid = false;
+	}
 	if (invreq->amount)
 		json_add_amount_msat_only(js, "amount_msat",
 					  amount_msat(*invreq->amount));
@@ -611,33 +664,39 @@ static void json_add_invoice_request(struct json_stream *js,
 			     *invreq->recurrence_start);
 	if (invreq->payer_key)
 		json_add_pubkey32(js, "payer_key", invreq->payer_key);
-	else
+	else {
 		json_add_string(js, "warning_invoice_request_missing_payer_key",
 				"invoice_request requires payer_key");
+		valid = false;
+	}
 	if (invreq->payer_info)
 		json_add_hex_talarr(js, "payer_info", invreq->payer_info);
+	if (invreq->payer_note)
+		json_add_stringn(js, "payer_note", invreq->payer_note,
+				 tal_bytelen(invreq->payer_note));
 
 	/* BOLT-offers #12:
-	 * - if the offer had a `recurrence`:
-	 *   - MUST fail the request if there is no `recurrence_counter` field.
-	 *   - MUST fail the request if there is no `recurrence_signature` field.
-	 *   - MUST fail the request if `recurrence_signature` is not correct.
+	 *  - MUST fail the request if there is no `payer_signature` field.
+	 *  - MUST fail the request if `payer_signature` is not correct.
 	 */
-	if (invreq->recurrence_signature) {
-		json_add_bip340sig(js, "recurrence_signature",
-				   invreq->recurrence_signature);
+	if (invreq->payer_signature) {
 		if (invreq->payer_key
 		    && !bolt12_check_signature(invreq->fields,
 					       "invoice_request",
-					       "recurrence_signature",
+					       "payer_signature",
 					       invreq->payer_key,
-					       invreq->recurrence_signature))
-			json_add_string(js, "warning_invoice_request_invalid_recurrence_signature",
-					"Bad recurrence_signature");
-	} else if (invreq->recurrence_counter) {
-		json_add_string(js, "warning_invoice_request_missing_recurrence_signature",
-				"invoice_request requires recurrence_signature");
+					       invreq->payer_signature)) {
+			json_add_string(js, "warning_invoice_request_invalid_payer_signature",
+					"Bad payer_signature");
+			valid = false;
+		}
+	} else {
+		json_add_string(js, "warning_invoice_request_missing_payer_signature",
+				"Missing payer_signature");
+		valid = false;
 	}
+
+	json_add_bool(js, "valid", valid);
 }
 
 static struct command_result *json_decode(struct command *cmd,
@@ -660,8 +719,11 @@ static struct command_result *json_decode(struct command *cmd,
 		json_add_invoice_request(response, decodable->invreq);
 	if (decodable->invoice)
 		json_add_b12_invoice(response, decodable->invoice);
-	if (decodable->b11)
+	if (decodable->b11) {
+		/* The bolt11 decoder simply refuses to decode bad invs. */
 		json_add_bolt11(response, decodable->b11);
+		json_add_bool(response, "valid", true);
+	}
 	return command_finished(cmd, response);
 }
 
@@ -722,5 +784,5 @@ int main(int argc, char *argv[])
 	setenv("TZ", "", 1);
 	plugin_main(argv, init, PLUGIN_RESTARTABLE, true, NULL, commands,
 		    ARRAY_SIZE(commands), NULL, 0, hooks, ARRAY_SIZE(hooks),
-		    NULL);
+		    NULL, 0, NULL);
 }

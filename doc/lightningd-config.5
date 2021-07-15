@@ -80,31 +80,31 @@ Alias for \fInetwork=testnet\fR\.
 Alias for \fInetwork=signet\fR\.
 
 
- \fBbitcoin-cli\fR=\fIPATH\fR
+ \fBbitcoin-cli\fR=\fIPATH\fR [plugin \fBbcli\fR]
 The name of \fIbitcoin-cli\fR executable to run\.
 
 
- \fBbitcoin-datadir\fR=\fIDIR\fR
+ \fBbitcoin-datadir\fR=\fIDIR\fR [plugin \fBbcli\fR]
 \fI-datadir\fR argument to supply to \fBbitcoin-cli\fR(1)\.
 
 
- \fBbitcoin-rpcuser\fR=\fIUSER\fR
+ \fBbitcoin-rpcuser\fR=\fIUSER\fR [plugin \fBbcli\fR]
 The RPC username for talking to \fBbitcoind\fR(1)\.
 
 
- \fBbitcoin-rpcpassword\fR=\fIPASSWORD\fR
+ \fBbitcoin-rpcpassword\fR=\fIPASSWORD\fR [plugin \fBbcli\fR]
 The RPC password for talking to \fBbitcoind\fR(1)\.
 
 
- \fBbitcoin-rpcconnect\fR=\fIHOST\fR
+ \fBbitcoin-rpcconnect\fR=\fIHOST\fR [plugin \fBbcli\fR]
 The \fBbitcoind\fR(1) RPC host to connect to\.
 
 
- \fBbitcoin-rpcport\fR=\fIPORT\fR
+ \fBbitcoin-rpcport\fR=\fIPORT\fR [plugin \fBbcli\fR]
 The \fBbitcoind\fR(1) RPC port to connect to\.
 
 
- \fBbitcoin-retry-timeout\fR=\fISECONDS\fR
+ \fBbitcoin-retry-timeout\fR=\fISECONDS\fR [plugin \fBbcli\fR]
 Number of seconds to keep trying a \fBbitcoin-cli\fR(1) command\. If the
 command keeps failing after this time, exit with a fatal error\.
 
@@ -195,6 +195,11 @@ with multiple daemons\.
  \fBlog-file\fR=\fIPATH\fR
 Log to this file instead of stdout\. Sending \fBlightningd\fR(8) SIGHUP will
 cause it to reopen this file (useful for log rotation)\.
+
+
+ \fBlog-timestamps\fR=\fIBOOL\fR
+Set this to false to turn off timestamp prefixes (they will still appear
+in crash log files)\.
 
 
  \fBrpc-file\fR=\fIPATH\fR
@@ -311,6 +316,21 @@ How long to wait before sending commitment messages to the peer: in
 theory increasing this would reduce load, but your node would have to be
 extremely busy node for you to even notice\.
 
+
+ \fBforce-feerates\fR==\fIVALUES\fR
+Networks like regtest and testnet have unreliable fee estimates: we
+usually treat them as the minumum (253 sats/kw) if we can't get them\.
+This allows override of one or more of our standard feerates (see
+\fBlightning-feerates\fR(7))\.  Up to 5 values, separated by '/' can be
+provided: if fewer are provided, then the final value is used for the
+remainder\.  The values are in per-kw (roughly 1/4 of bitcoind's per-kb
+values), an in order are "opening", "mutual_close",
+"unilateral_close", "delayed_to_us", "htlc_resolution", and "penalty"\.
+
+
+You would usually put this option in the per-chain config file, to avoid
+setting it on Bitcoin mainnet!  e\.g\. \fB~rusty/.lightning/regtest/config\fR\.
+
 .SH Lightning channel and HTLC options
 
  \fBlarge-channels\fR
@@ -339,7 +359,7 @@ Confirmations required for the funding transaction when the other side
 opens a channel before the channel is usable\.
 
 
- \fBcommit-fee\fR=\fIPERCENT\fR
+ \fBcommit-fee\fR=\fIPERCENT\fR [plugin \fBbcli\fR]
 The percentage of \fIestimatesmartfee 2/CONSERVATIVE\fR to use for the commitment
 transactions: default is 100\.
 
@@ -365,13 +385,13 @@ have to do that\.
 Invoice control options:
 
 
- \fBautocleaninvoice-cycle\fR=\fISECONDS\fR
+ \fBautocleaninvoice-cycle\fR=\fISECONDS\fR [plugin \fBautoclean\fR]
 Perform cleanup of expired invoices every \fISECONDS\fR seconds, or disable
 if 0\. Usually unpaid expired invoices are uninteresting, and just take
 up space in the database\.
 
 
- \fBautocleaninvoice-expired-by\fR=\fISECONDS\fR
+ \fBautocleaninvoice-expired-by\fR=\fISECONDS\fR [plugin \fBautoclean\fR]
 Control how long invoices must have been expired before they are cleaned
 (if \fIautocleaninvoice-cycle\fR is non-zero)\.
 
@@ -379,7 +399,7 @@ Control how long invoices must have been expired before they are cleaned
 Payment control options:
 
 
- \fBdisable-mpp\fR
+ \fBdisable-mpp\fR [plugin \fBpay\fR]
 Disable the multi-part payment sending support in the \fBpay\fR plugin\. By default
 the MPP support is enabled, but it can be desirable to disable in situations
 in which each payment should result in a single HTLC being forwarded in the
@@ -500,10 +520,6 @@ all DNS lookups, to avoid leaking information\.
 Disable the DNS bootstrapping mechanism to find a node by its node ID\.
 
 
- \fBenable-autotor-v2-mode\fR
-Try to get a v2 onion address from the Tor service call, default is v3\.
-
-
  \fBtor-service-password\fR=\fIPASSWORD\fR
 Set a Tor control password, which may be needed for \fIautotor:\fR to
 authenticate to the Tor control port\.
@@ -584,6 +600,13 @@ This usually requires \fBexperimental-onion-messages\fR as well\.  See
 \fBlightning-offer\fR(7) and \fBlightning-fetchinvoice\fR(7)\.
 
 
+ \fBfetchinvoice-noconnect\fR
+
+
+Specifying this prevents \fBfetchinvoice\fR and \fBsendinvoice\fR from
+trying to connect directly to the offering node as a last resort\.
+
+
  \fBexperimental-shutdown-wrong-funding\fR
 
 
@@ -592,6 +615,16 @@ remote node has opened a channel but claims it used the incorrect txid
 (and the channel hasn't been used yet at all) this allows them to
 negotiate a clean shutdown with the txid they offer\.
 
+
+ \fBexperimental-dual-fund\fR
+
+
+Specifying this enables support for the dual funding protocol,
+allowing both parties to contribute funds to a channel\. The decision
+about whether to add funds or not to a proposed channel is handled
+automatically by a plugin that implements the appropriate logic for
+your needs\. The default behavior is to not contribute funds\.
+
 .SH BUGS
 
 You should report bugs on our github issues page, and maybe submit a fix
@@ -599,7 +632,7 @@ to gain our eternal gratitude!
 
 .SH AUTHOR
 
-Rusty Russell &lt;\fIrusty@rustcorp.com.au\fR&gt; wrote this man page, and
+Rusty Russell \fI<rusty@rustcorp.com.au\fR> wrote this man page, and
 much of the configuration language, but many others did the hard work of
 actually implementing these options\.
 
@@ -617,4 +650,4 @@ Main web site: \fIhttps://github.com/ElementsProject/lightning\fR
 Note: the modules in the ccan/ directory have their own licenses, but
 the rest of the code is covered by the BSD-style MIT license\.
 
-\" SHA256STAMP:b0cdc467650b05758f90f2523ab8b45e526ac818e426cb2c2bc42cb98673e373
+\" SHA256STAMP:d456e1acd004f9528d8772231afdecff1aaa01d80161c833483f6f078f4c7d70

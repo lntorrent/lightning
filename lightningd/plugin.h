@@ -39,15 +39,22 @@ enum plugin_state {
  * A plugin, exposed as a stub so we can pass it as an argument.
  */
 struct plugin {
+	/* Must be first element in the struct otherwise we get false
+	 * positives for leaks. */
 	struct list_node list;
+
+	/* The filename that can be used to refer to the plugin. */
+	const char *shortname;
 
 	pid_t pid;
 	char *cmd;
+	u32 checksum;
 	struct io_conn *stdin_conn, *stdout_conn;
 	struct plugins *plugins;
 	const char **plugin_path;
+
 	/* If there's a json command which ordered this to start */
-	struct command *start_cmd;
+	struct plugin_command *start_cmd;
 
 	enum plugin_state plugin_state;
 
@@ -93,6 +100,10 @@ struct plugin {
 	/* Parameters for dynamically-started plugins. */
 	const char *parambuf;
 	const jsmntok_t *params;
+
+	/* Notification topics that this plugin has registered with us
+	 * and that other plugins may subscribe to. */
+	const char **notification_topics;
 };
 
 /**
@@ -113,7 +124,7 @@ struct plugins {
 	const char *default_dir;
 
 	/* If there are json commands waiting for plugin resolutions. */
-	struct command **json_cmds;
+	struct plugin_command **plugin_cmds;
 
 	/* Blacklist of plugins from --disable-plugin */
 	const char **blacklist;
@@ -213,7 +224,7 @@ void plugins_free(struct plugins *plugins);
  */
 struct plugin *plugin_register(struct plugins *plugins,
 			       const char* path TAKES,
-			       struct command *start_cmd,
+			       struct plugin_command *start_cmd,
 			       bool important,
 			       const char *parambuf STEALS,
 			       const jsmntok_t *params STEALS);
@@ -274,7 +285,7 @@ struct plugin *find_plugin_for_command(struct lightningd *ld,
  * plugin_cmd_all_complete().
  */
 struct command_result *plugin_register_all_complete(struct lightningd *ld,
-						    struct command *cmd);
+						    struct plugin_command *pcmd);
 
 /**
  * Send the configure message to all plugins.

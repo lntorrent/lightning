@@ -211,6 +211,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->listen = true;
 	ld->autolisten = true;
 	ld->reconnect = true;
+	ld->try_reexec = false;
 
 	/*~ This is from ccan/timer: it is efficient for the case where timers
 	 * are deleted before expiry (as is common with timeouts) using an
@@ -231,6 +232,9 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	/*~ This is initialized later, but the plugin loop examines this,
 	 * so set it to NULL explicitly now. */
 	ld->wallet = NULL;
+
+	/*~ Behavioral options */
+	ld->accept_extra_tlv_types = tal_arr(ld, u64, 0);
 
 	/*~ In the next step we will initialize the plugins. This will
 	 *  also populate the JSON-RPC with passthrough methods, hence
@@ -285,6 +289,11 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * This round-robin list of channels is used to ensure that
 	 * each invoice we generate has a different set of channels.  */
 	ld->rr_counter = 0;
+
+	/*~ Because fee estimates on testnet and regtest are unreliable,
+	 * we allow overriding them with --force-feerates, in which
+	 * case this is a pointer to an enum feerate-indexed array of values */
+	ld->force_feerates = NULL;
 
 	return ld;
 }
@@ -709,8 +718,13 @@ static void on_sigchild(int _ UNUSED)
 	 * there are no more children.  But glibc's overzealous use of
 	 * __attribute__((warn_unused_result)) means we have to
 	 * "catch" the return value. */
-        if (write(sigchld_wfd, "", 1) != 1)
-		assert(errno == EAGAIN || errno == EWOULDBLOCK);
+        if (write(sigchld_wfd, "", 1) != 1) {
+		if (errno != EAGAIN && errno == EWOULDBLOCK) {
+			/* Should not call this in a signal handler, but we're
+			 * already messed up! */
+			fatal("on_sigchild: write errno %s", strerror(errno));
+		}
+	}
 }
 
 /*~ We only need to handle SIGTERM and SIGINT for the case we are PID 1 of
@@ -797,14 +811,14 @@ static struct feature_set *default_features(const tal_t *ctx)
 		OPTIONAL_FEATURE(OPT_UPFRONT_SHUTDOWN_SCRIPT),
 		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES),
 		OPTIONAL_FEATURE(OPT_VAR_ONION),
-		OPTIONAL_FEATURE(OPT_PAYMENT_SECRET),
+		COMPULSORY_FEATURE(OPT_PAYMENT_SECRET),
 		OPTIONAL_FEATURE(OPT_BASIC_MPP),
 		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES_EX),
 		OPTIONAL_FEATURE(OPT_STATIC_REMOTEKEY),
+		OPTIONAL_FEATURE(OPT_SHUTDOWN_ANYSEGWIT),
 #if EXPERIMENTAL_FEATURES
 		OPTIONAL_FEATURE(OPT_ANCHOR_OUTPUTS),
 		OPTIONAL_FEATURE(OPT_ONION_MESSAGES),
-		OPTIONAL_FEATURE(OPT_SHUTDOWN_ANYSEGWIT),
 #endif
 	};
 
@@ -849,6 +863,8 @@ int main(int argc, char *argv[])
 	struct rlimit nofile = {1024, 1024};
 	int sigchld_rfd;
 	int exit_code = 0;
+	char **orig_argv;
+	bool try_reexec;
 
 	/*~ Make sure that we limit ourselves to something reasonable. Modesty
 	 *  is a virtue. */
@@ -882,6 +898,17 @@ int main(int argc, char *argv[])
 	 * variables. */
 	ld = new_lightningd(NULL);
 	ld->state = LD_STATE_RUNNING;
+
+	/*~ We store an copy of our arguments before parsing mangles them, so
+	 * we can re-exec if versions of subdaemons change.  Note the use of
+	 * notleak() since our leak-detector can't find orig_argv on the
+	 * stack. */
+	orig_argv = notleak(tal_arr(ld, char *, argc + 1));
+	for (size_t i = 1; i < argc; i++)
+		orig_argv[i] = tal_strdup(orig_argv, argv[i]);
+	/*~ Turn argv[0] into an absolute path (if not already) */
+	orig_argv[0] = path_join(orig_argv, take(path_cwd(NULL)), argv[0]);
+	orig_argv[argc] = NULL;
 
 	/* Figure out where our daemons are first. */
 	ld->daemon_dir = find_daemon_dir(ld, argv[0]);
@@ -1139,6 +1166,11 @@ int main(int argc, char *argv[])
 	 * ld->payments, so clean that up. */
 	clean_tmpctx();
 
+	/* Gather these before we free ld! */
+	try_reexec = ld->try_reexec;
+	if (try_reexec)
+		tal_steal(NULL, orig_argv);
+
 	/* Free this last: other things may clean up timers. */
 	timers = tal_steal(NULL, ld->timers);
 	tal_free(ld);
@@ -1154,6 +1186,21 @@ int main(int argc, char *argv[])
 		write_all(stop_fd, stop_response, strlen(stop_response));
 		close(stop_fd);
 		tal_free(stop_response);
+	}
+
+	/* Were we supposed to restart ourselves? */
+	if (try_reexec) {
+		long max_fd;
+
+		/* Give a reasonable chance for the install to finish. */
+		sleep(5);
+
+		/* Close all filedescriptors except stdin/stdout/stderr */
+		max_fd = sysconf(_SC_OPEN_MAX);
+		for (int i = STDERR_FILENO+1; i < max_fd; i++)
+			close(i);
+		execv(orig_argv[0], orig_argv);
+		err(1, "Failed to re-exec ourselves after version change");
 	}
 
 	/*~ Farewell.  Next stop: hsmd/hsmd.c. */

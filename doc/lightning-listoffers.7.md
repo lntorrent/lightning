@@ -29,17 +29,16 @@ EXAMPLE JSON REQUEST
 RETURN VALUE
 ------------
 
-On success, an array *offers* of objects is returned. Each object contains:
-
-* *offer_id*: the hash of the offer.
-* *active*: true
-* *single_use*: true if *single_use* was specified.
-* *bolt12*: the bolt12 offer, starting with "lno1"
-* *used*: true if an associated invoice has been paid.
-
-Optionally:
-* *label*: the user-specified label.
-
+[comment]: # (GENERATE-FROM-SCHEMA-START)
+On success, an object containing **offers** is returned.  It is an array of objects, where each object contains:
+- **offer_id** (hex): the id of this offer (merkle hash of non-signature fields) (always 64 characters)
+- **active** (boolean): whether this can still be used
+- **single_use** (boolean): whether this expires as soon as it's paid
+- **bolt12** (string): the bolt12 encoding of the offer
+- **bolt12_unsigned** (string): the bolt12 encoding of the offer, without signature
+- **used** (boolean): True if an associated invoice has been paid
+- **label** (string, optional): the (optional) user-specified label
+[comment]: # (GENERATE-FROM-SCHEMA-END)
 
 EXAMPLE JSON RESPONSE
 -----
@@ -80,3 +79,4 @@ RESOURCES
 ---------
 
 Main web site: <https://github.com/ElementsProject/lightning>
+[comment]: # ( SHA256STAMP:e2b8508c98e6161c45fca91bceb273e6c2865cec0e1761dde85f8f2dd6670491)
