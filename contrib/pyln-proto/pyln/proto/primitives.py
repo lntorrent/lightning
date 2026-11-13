@@ -61,10 +61,18 @@ class ShortChannelId(object):
         return cls(block=block, txnum=txnum, outnum=outnum)
 
     @classmethod
-    def from_str(self, s):
-        block, txnum, outnum = s.split('x')
-        return ShortChannelId(block=int(block), txnum=int(txnum),
-                              outnum=int(outnum))
+    def from_str(cls, s):
+        parts = s.split('x')
+        if len(parts) != 3:
+            raise ValueError("Malformed short_channel_id: {}".format(s))
+        block, txnum, outnum = map(int, parts)
+        # block and txnum are 3 bytes, outnum is 2: anything larger
+        # would spill into the neighbouring field in to_int().
+        if not (0 <= block <= 0xFFFFFF
+                and 0 <= txnum <= 0xFFFFFF
+                and 0 <= outnum <= 0xFFFF):
+            raise ValueError("short_channel_id {} has an element out of range".format(s))
+        return cls(block=block, txnum=txnum, outnum=outnum)
 
     def to_int(self):
         return self.block << 40 | self.txnum << 16 | self.outnum
@@ -84,6 +92,12 @@ class ShortChannelId(object):
             and self.txnum == other.txnum
             and self.outnum == other.outnum
         )
+
+    def __hash__(self):
+        return self.to_int().__hash__()
+
+    def __repr__(self):
+        return "ShortChannelId[{}]".format(str(self))
 
 
 class Secret(object):
@@ -131,7 +145,7 @@ class PublicKey(object):
                 )
 
         elif not isinstance(innerkey, coincurve.keys.PublicKey):
-            raise ValueError(
+            raise TypeError(
                 "Key must either be bytes or coincurve.keys.PublicKey"
             )
         self.key = innerkey
@@ -146,6 +160,15 @@ class PublicKey(object):
         return "PublicKey[0x{}]".format(
             self.serializeCompressed().hex()
         )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PublicKey):
+            return False
+
+        return self.key == other.key
+
+    def __hash__(self):
+        return self.to_bytes().__hash__()
 
 
 def Keypair(object):

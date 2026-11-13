@@ -4,7 +4,6 @@
 #include <assert.h>
 #include <bitcoin/privkey.h>
 #include <bitcoin/pubkey.h>
-#include <ccan/build_assert/build_assert.h>
 #include <ccan/crypto/shachain/shachain.h>
 
 struct sha256;
@@ -156,12 +155,9 @@ void fromwire_basepoints(const u8 **ptr, size_t *max,
 			 struct basepoints *b);
 
 /* For --dev-force-channel-secrets. */
-#if DEVELOPER
 extern struct secrets *dev_force_channel_secrets;
 extern struct sha256 *dev_force_channel_secrets_shaseed;
-#endif
 
-/* Note: these abort if !DEVELOPER */
 void towire_secrets(u8 **pptr, const struct secrets *s);
 void fromwire_secrets(const u8 **ptr, size_t *max, struct secrets *s);
 

@@ -7,51 +7,75 @@
  * but tal hierarchies tends to get freed at exit, so we need something
  * more sophisticated).
  *
- * Memleak detection is only active if DEVELOPER is set.  It does several
+ * Memleak detection is only active if $LIGHTNINGD_DEV_MEMLEAK is set.  It does several
  * things:
  * 1. attaches a backtrace list to every allocation, so we can tell
  *    where it came from.
- * 2. when memleak_find_allocations() is called, walks the entire tal
+ * 2. also attaches a backtrace list to evert tal_steal, so we can track
+ *    tricky cases where ownership is changed.
+ * 3. when memleak_start() is called, walks the entire tal
  *    tree and saves a pointer to all the objects it finds, with
  *    a few internal exceptions (including everything under 'tmpctx').
  *    It then calls registered helpers, which can remove opaque things
  *    and handles notleak() objects.
- * 3. provides a routine to access any remaining pointers in the
+ * 4. provides a routine to access any remaining pointers in the
  *    table: these are the leaks.
  */
 #include "config.h"
-#include <assert.h>
 #include <backtrace.h>
+#include <ccan/array_size/array_size.h>
+#include <ccan/cast/cast.h>
 #include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/htable/htable.h>
 #include <ccan/intmap/intmap.h>
-#include <common/daemon.h>
+#include <ccan/list/list.h>
+#include <ccan/tal/str/str.h>
 #include <common/memleak.h>
 #include <common/utils.h>
 
 struct backtrace_state *backtrace_state;
 
-#if DEVELOPER
 static bool memleak_track;
-
-struct memleak_notleak {
-	bool plus_children;
-};
 
 struct memleak_helper {
 	void (*cb)(struct htable *memtable, const tal_t *);
 };
 
-void *notleak_(const void *ptr, bool plus_children)
+/* For allocation efficiency, we use a fixed-size backtrace represtentation */
+struct bt_compact {
+	size_t n;
+	uintptr_t bt[23];
+};
+
+struct tal_backtrace {
+	/* Backtrace for allocation */
+	struct bt_compact alloc;
+
+	/* Backtrace for any steals that occurred */
+	struct bt_compact *steals;
+};
+
+void *notleak_(void *ptr, bool plus_children)
 {
-	struct memleak_notleak *notleak;
+	const char *name;
 
-	/* If we're not tracking, don't do anything. */
-	if (!memleak_track)
-		return cast_const(void *, ptr);
+	/* We use special tal names to mark notleak */
+	name = tal_name(ptr);
+	if (!name)
+		name = "";
 
-	notleak = tal(ptr, struct memleak_notleak);
-	notleak->plus_children = plus_children;
+	/* Don't mark more than once! */
+	if (!strstr(name, "**NOTLEAK")) {
+		/* Don't use tmpctx: it might not be set up yet! */
+		if (plus_children)
+			name = tal_fmt(NULL, "%s **NOTLEAK_IGNORE_CHILDREN**",
+				       name);
+		else
+			name = tal_fmt(NULL, "%s **NOTLEAK**", name);
+		tal_set_name(ptr, name);
+		tal_free(name);
+	}
+
 	return cast_const(void *, ptr);
 }
 
@@ -61,30 +85,25 @@ static size_t hash_ptr(const void *elem, void *unused UNNEEDED)
 	return siphash24(&seed, &elem, sizeof(elem));
 }
 
-static bool pointer_referenced(struct htable *memtable, const void *p)
+bool memleak_ptr(struct htable *memtable, const void *p)
 {
 	return htable_del(memtable, hash_ptr(p, NULL), p);
 }
 
-static void children_into_htable(const void *exclude1, const void *exclude2,
-				 struct htable *memtable, const tal_t *p)
+static void children_into_htable(struct htable *memtable, const tal_t *p)
 {
 	const tal_t *i;
 
 	for (i = tal_first(p); i; i = tal_next(i)) {
 		const char *name = tal_name(i);
 
-		if (i == exclude1 || i == exclude2)
-			return;
-
 		if (name) {
 			/* Don't add backtrace objects. */
-			if (streq(name, "backtrace"))
+			if (streq(name, "tal_backtrace"))
 				continue;
 
-			/* Don't add our own memleak_helpers or notleak() */
-			if (strends(name, "struct memleak_helper")
-			    || strends(name, "struct memleak_notleak"))
+			/* Don't add our own memleak_helpers */
+			if (strends(name, "struct memleak_helper"))
 				continue;
 
 			/* Don't add tal_link objects */
@@ -103,8 +122,12 @@ static void children_into_htable(const void *exclude1, const void *exclude2,
 			if (streq(name, "tmpctx"))
 				continue;
 		}
+		/* Don't add (resizing!) memtable table! */
+		if (i == memtable->table)
+			continue;
+
 		htable_add(memtable, hash_ptr(i, NULL), i);
-		children_into_htable(exclude1, exclude2, memtable, i);
+		children_into_htable(memtable, i);
 	}
 }
 
@@ -119,45 +142,72 @@ static void scan_for_pointers(struct htable *memtable,
 		void *ptr;
 
 		memcpy(&ptr, (char *)p + i * sizeof(void *), sizeof(ptr));
-		if (pointer_referenced(memtable, ptr))
+		if (memleak_ptr(memtable, ptr))
 			scan_for_pointers(memtable, ptr, tal_bytelen(ptr));
 	}
 }
 
-void memleak_remove_region(struct htable *memtable,
-			   const void *ptr, size_t bytelen)
+void memleak_scan_region(struct htable *memtable, const void *ptr, size_t len)
 {
-	pointer_referenced(memtable, ptr);
-	scan_for_pointers(memtable, ptr, bytelen);
+	scan_for_pointers(memtable, ptr, len);
+}
+
+void memleak_scan_obj(struct htable *memtable, const void *ptr)
+{
+	memleak_ptr(memtable, ptr);
+	scan_for_pointers(memtable, ptr, tal_bytelen(ptr));
+}
+
+void memleak_scan_list_head(struct htable *memtable, const struct list_head *l)
+{
+	scan_for_pointers(memtable, l, sizeof(*l));
 }
 
 static void remove_with_children(struct htable *memtable, const tal_t *p)
 {
 	const tal_t *i;
 
-	pointer_referenced(memtable, p);
+	memleak_ptr(memtable, p);
 	for (i = tal_first(p); i; i = tal_next(i))
 		remove_with_children(memtable, i);
 }
 
 /* memleak can't see inside hash tables, so do them manually */
-void memleak_remove_htable(struct htable *memtable, const struct htable *ht)
+void memleak_scan_htable(struct htable *memtable, const struct htable *ht)
 {
 	struct htable_iter i;
 	const void *p;
 
 	for (p = htable_first(ht, &i); p; p = htable_next(ht, &i))
-		memleak_remove_region(memtable, p, tal_bytelen(p));
+		memleak_scan_obj(memtable, p);
 }
 
 /* FIXME: If uintmap used tal, this wouldn't be necessary! */
-void memleak_remove_intmap_(struct htable *memtable, const struct intmap *m)
+void memleak_scan_intmap_(struct htable *memtable, const struct intmap *m)
 {
 	void *p;
 	intmap_index_t i;
 
 	for (p = intmap_first_(m, &i); p; p = intmap_after_(m, &i))
-		memleak_remove_region(memtable, p, tal_bytelen(p));
+		memleak_scan_obj(memtable, p);
+}
+
+static bool handle_strmap(const char *member, void *p, void *memtable_)
+{
+	struct htable *memtable = memtable_;
+
+	/* membername may *not* be a tal ptr, but it can be! */
+	memleak_ptr(memtable, member);
+	memleak_scan_obj(memtable, p);
+
+	/* Keep going */
+	return true;
+}
+
+/* FIXME: If strmap used tal, this wouldn't be necessary! */
+void memleak_scan_strmap_(struct htable *memtable, const struct strmap *m)
+{
+	strmap_iterate_(m, handle_strmap, memtable);
 }
 
 static bool ptr_match(const void *candidate, void *ptr)
@@ -165,13 +215,26 @@ static bool ptr_match(const void *candidate, void *ptr)
 	return candidate == ptr;
 }
 
-const void *memleak_get(struct htable *memtable, const uintptr_t **backtrace)
+static struct tal_backtrace *find_backtrace(const tal_t *p)
+{
+	struct tal_backtrace *tbt;
+
+	/* Does it have a child called "tal_backtrace"? */
+	for (tbt = tal_first(p); tbt; tbt = tal_next(tbt)) {
+		if (tal_name(tbt)
+		    && streq(tal_name(tbt), "tal_backtrace"))
+			return tbt;
+	}
+	return NULL;
+}
+
+static const void *memleak_get(struct htable *memtable, const struct tal_backtrace **backtrace)
 {
 	struct htable_iter it;
 	const tal_t *i, *p;
 
 	/* Remove memtable itself */
-	pointer_referenced(memtable, memtable);
+	memleak_ptr(memtable, memtable);
 
 	i = htable_first(memtable, &it);
 	if (!i)
@@ -188,43 +251,55 @@ const void *memleak_get(struct htable *memtable, const uintptr_t **backtrace)
 	/* Delete all children */
 	remove_with_children(memtable, i);
 
-	/* Does it have a child called "backtrace"? */
-	for (*backtrace = tal_first(i);
-	     *backtrace;
-	     *backtrace = tal_next(*backtrace)) {
-		if (tal_name(*backtrace)
-		    && streq(tal_name(*backtrace), "backtrace"))
-			break;
-	}
+	/* Does it have a child called "tal_backtrace"? */
+	*backtrace = find_backtrace(i);
 
 	return i;
 }
 
-static int append_bt(void *data, uintptr_t pc)
+static int record_compact_bt(void *data, uintptr_t pc)
 {
-	uintptr_t *bt = data;
+	struct bt_compact *bt = data;
 
-	if (bt[0] == 32)
+	if (bt->n == ARRAY_SIZE(bt->bt))
 		return 1;
 
-	bt[bt[0]++] = pc;
+	bt->bt[bt->n++] = pc;
 	return 0;
+}
+
+static void add_steal(tal_t *child, enum tal_notify_type type UNNEEDED,
+		      void *new_parent)
+{
+	struct tal_backtrace *tbt = find_backtrace(child);
+	struct bt_compact bt;
+
+	if (!tbt)
+		return;
+
+	bt.n = 0;
+	backtrace_simple(backtrace_state, 2, record_compact_bt, NULL, &bt);
+	if (tbt->steals == NULL)
+		tbt->steals = tal_arr(tbt, struct bt_compact, 0);
+	tal_arr_expand(&tbt->steals, bt);
 }
 
 static void add_backtrace(tal_t *parent UNUSED, enum tal_notify_type type UNNEEDED,
 			  void *child)
 {
-	uintptr_t *bt = tal_arrz_label(child, uintptr_t, 32, "backtrace");
+	struct tal_backtrace *tbt = tal_label(child, struct tal_backtrace, "tal_backtrace");
 
-	/* First serves as counter. */
-	bt[0] = 1;
-	backtrace_simple(backtrace_state, 2, append_bt, NULL, bt);
+	tbt->steals = NULL;
+	tbt->alloc.n = 0;
+	backtrace_simple(backtrace_state, 2, record_compact_bt, NULL, &tbt->alloc);
 	tal_add_notifier(child, TAL_NOTIFY_ADD_CHILD, add_backtrace);
+	tal_add_notifier(child, TAL_NOTIFY_STEAL, add_steal);
 }
 
 static void add_backtrace_notifiers(const tal_t *root)
 {
 	tal_add_notifier(root, TAL_NOTIFY_ADD_CHILD, add_backtrace);
+	tal_add_notifier(root, TAL_NOTIFY_STEAL, add_steal);
 
 	for (tal_t *i = tal_first(root); i; i = tal_next(i))
 		add_backtrace_notifiers(i);
@@ -237,6 +312,11 @@ void memleak_add_helper_(const tal_t *p,
 	mh->cb = cb;
 }
 
+void memleak_ignore_children(struct htable *memtable, const void *p)
+{
+	for (const tal_t *i = tal_first(p); i; i = tal_next(i))
+		remove_with_children(memtable, i);
+}
 
 /* Handle allocations marked with helpers or notleak() */
 static void call_memleak_helpers(struct htable *memtable, const tal_t *p)
@@ -246,53 +326,110 @@ static void call_memleak_helpers(struct htable *memtable, const tal_t *p)
 	for (i = tal_first(p); i; i = tal_next(i)) {
 		const char *name = tal_name(i);
 
-		if (name && strends(name, "struct memleak_helper")) {
-			const struct memleak_helper *mh = i;
-			mh->cb(memtable, p);
-		} else if (name && strends(name, "struct memleak_notleak")) {
-			const struct memleak_notleak *notleak = i;
-			if (notleak->plus_children)
-				remove_with_children(memtable, p);
-			else
-				pointer_referenced(memtable, p);
-			memleak_remove_region(memtable, p, tal_bytelen(p));
-		} else if (name && strends(name, "_notleak")) {
-			pointer_referenced(memtable, i);
-			call_memleak_helpers(memtable, i);
-		} else {
-			call_memleak_helpers(memtable, i);
+		if (name) {
+			if (strends(name, "struct memleak_helper")) {
+				const struct memleak_helper *mh = i;
+				mh->cb(memtable, p);
+			} else if (strends(name, " **NOTLEAK**")) {
+				memleak_ptr(memtable, i);
+				memleak_scan_obj(memtable, i);
+			} else if (strends(name,
+					   " **NOTLEAK_IGNORE_CHILDREN**")) {
+				remove_with_children(memtable, i);
+				memleak_scan_obj(memtable, i);
+			}
 		}
+
+		/* Recurse down looking for "notleak" children */
+		call_memleak_helpers(memtable, i);
 	}
 }
 
-struct htable *memleak_find_allocations(const tal_t *ctx,
-					const void *exclude1,
-					const void *exclude2)
+struct htable *memleak_start(const tal_t *ctx)
 {
 	struct htable *memtable = tal(ctx, struct htable);
 	htable_init(memtable, hash_ptr, NULL);
 
 	if (memleak_track) {
 		/* First, add all pointers off NULL to table. */
-		children_into_htable(exclude1, exclude2, memtable, NULL);
+		children_into_htable(memtable, NULL);
 
 		/* Iterate and call helpers to eliminate hard-to-get references. */
 		call_memleak_helpers(memtable, NULL);
 	}
 
-	tal_add_destructor(memtable, htable_clear);
 	return memtable;
 }
 
 void memleak_init(void)
 {
-	memleak_track = true;
-	if (backtrace_state)
-		add_backtrace_notifiers(NULL);
+	if (getenv("LIGHTNINGD_DEV_MEMLEAK")) {
+		memleak_track = true;
+		if (backtrace_state)
+			add_backtrace_notifiers(NULL);
+	}
 }
-#else /* !DEVELOPER */
-void *notleak_(const void *ptr, bool plus_children UNNEEDED)
+
+struct print_and_arg {
+	void PRINTF_FMT(2,3) (*print)(void *arg, const char *fmt, ...);
+	void *arg;
+};
+
+static int dump_syminfo(void *data, uintptr_t pc UNUSED,
+			const char *filename, int lineno,
+			const char *function)
 {
-	return cast_const(void *, ptr);
+	struct print_and_arg *pag = data;
+	/* This can happen in backtraces. */
+	if (!filename || !function)
+		return 0;
+
+	pag->print(pag->arg, "    %s:%u (%s)", filename, lineno, function);
+	return 0;
 }
-#endif /* !DEVELOPER */
+
+static void dump_leak_backtrace(const char *name,
+				const struct bt_compact *bt,
+				void (*print)(void *arg, const char *fmt, ...),
+				void *arg)
+{
+	struct print_and_arg pag;
+
+	pag.print = print;
+	pag.arg = arg;
+	print(arg, "  %s:", name);
+	for (size_t i = 0; i < bt->n; i++) {
+		backtrace_pcinfo(backtrace_state,
+				 bt->bt[i], dump_syminfo,
+				 NULL, &pag);
+	}
+}
+
+bool dump_memleak_(struct htable *memtable,
+		   void PRINTF_FMT(2,3) (*print)(void *arg, const char *fmt, ...),
+		   void *arg)
+{
+	const tal_t *i;
+	const struct tal_backtrace *backtrace;
+	bool found_leak = false;
+
+	while ((i = memleak_get(memtable, &backtrace)) != NULL) {
+		print(arg, "MEMLEAK: %p", i);
+		if (tal_name(i))
+			print(arg, "  label=%s", tal_name(i));
+
+		if (backtrace) {
+			dump_leak_backtrace("alloc", &backtrace->alloc, print, arg);
+			for (size_t j = 0; j < tal_count(backtrace->steals); j++)
+				dump_leak_backtrace("steal", &backtrace->steals[j], print, arg);
+		}
+		print(arg, "  parents:");
+		for (tal_t *p = tal_parent(i); p; p = tal_parent(p)) {
+			print(arg, "    %s", tal_name(p));
+			p = tal_parent(p);
+		}
+		found_leak = true;
+	}
+
+	return found_leak;
+}

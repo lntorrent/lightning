@@ -31,7 +31,7 @@ static bool cmp(const char *obj, const char *key)
 	return strcmp(obj, key) == 0;
 }
 
-HTABLE_DEFINE_TYPE(char, strkey, hash_str, cmp, htable_str);
+HTABLE_DEFINE_NODUPS_TYPE(char, strkey, hash_str, cmp, htable_str);
 
 /* Nanoseconds per operation */
 static size_t normalize(const struct timeabs *start,
@@ -48,7 +48,7 @@ int main(int argc, char *argv[])
 	struct htable_str ht;
 	char **words, **misswords;
 
-	words = tal_strsplit(NULL, grab_file(NULL,
+	words = tal_strsplit(NULL, grab_file_str(NULL,
 					     argv[1] ? argv[1] : "/usr/share/dict/words"), "\n",
 			     STR_NO_EMPTY);
 	htable_str_init(&ht);

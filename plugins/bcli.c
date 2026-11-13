@@ -1,37 +1,23 @@
-#include <bitcoin/base58.h>
-#include <bitcoin/block.h>
-#include <bitcoin/feerate.h>
-#include <bitcoin/script.h>
-#include <bitcoin/shadouble.h>
+#include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
-#include <ccan/io/io.h>
-#include <ccan/json_out/json_out.h>
 #include <ccan/pipecmd/pipecmd.h>
-#include <ccan/str/hex/hex.h>
-#include <ccan/take/take.h>
+#include <ccan/read_write_all/read_write_all.h>
 #include <ccan/tal/grab_file/grab_file.h>
-#include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
-#include <common/json_helpers.h>
+#include <common/json_param.h>
+#include <common/json_stream.h>
 #include <common/memleak.h>
-#include <common/utils.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <plugins/libplugin.h>
+#include <unistd.h>
 
-/* Bitcoind's web server has a default of 4 threads, with queue depth 16.
- * It will *fail* rather than queue beyond that, so we must not stress it!
- *
- * This is how many request for each priority level we have.
- */
-#define BITCOIND_MAX_PARALLEL 4
+/* Bitcoin Core RPC error code for duplicate transaction */
+#define RPC_TRANSACTION_ALREADY_IN_CHAIN -27
 
-enum bitcoind_prio {
-	BITCOIND_LOW_PRIO,
-	BITCOIND_HIGH_PRIO
-};
-#define BITCOIND_NUM_PRIO (BITCOIND_HIGH_PRIO+1)
+/* Hex-encoded SHA256 block hash length (32 bytes = 64 hex chars) */
+#define BLOCK_HASH_HEX_LEN 64
 
 struct bitcoind {
 	/* eg. "bitcoin-cli" */
@@ -43,76 +29,64 @@ struct bitcoind {
 	/* bitcoind's version, used for compatibility checks. */
 	u32 version;
 
-	/* Is bitcoind synced?  If not, we retry. */
-	bool synced;
-
-	/* How many high/low prio requests are we running (it's ratelimited) */
-	size_t num_requests[BITCOIND_NUM_PRIO];
-
-	/* Pending requests (high and low prio). */
-	struct list_head pending[BITCOIND_NUM_PRIO];
-
-	/* If non-zero, time we first hit a bitcoind error. */
-	unsigned int error_count;
-	struct timemono first_error_time;
-
 	/* How long to keep trying to contact bitcoind
 	 * before fatally exiting. */
 	u64 retry_timeout;
 
 	/* Passthrough parameters for bitcoin-cli */
 	char *rpcuser, *rpcpass, *rpcconnect, *rpcport;
-
-	/* The factor to time the urgent feerate by to get the maximum
-	 * acceptable feerate. */
-	u32 max_fee_multiplier;
-
-	/* Percent of CONSERVATIVE/2 feerate we'll use for commitment txs. */
-	u64 commit_fee_percent;
+	u64 rpcclienttimeout;
 
 	/* Whether we fake fees (regtest) */
 	bool fake_fees;
 
-#if DEVELOPER
 	/* Override in case we're developer mode for testing*/
-	bool no_fake_fees;
-#endif
+	bool dev_no_fake_fees;
+
+	/* Override initialblockdownload (using canned blocks sets this) */
+	bool dev_ignore_ibd;
 };
 
 static struct bitcoind *bitcoind;
 
-struct bitcoin_cli {
-	struct list_node list;
-	int fd;
-	int *exitstatus;
-	pid_t pid;
-	const char **args;
-	struct timeabs start;
-	enum bitcoind_prio prio;
+/* Result of a synchronous bitcoin-cli call */
+struct bcli_result {
 	char *output;
-	size_t output_bytes;
-	size_t new_output;
-	struct command_result *(*process)(struct bitcoin_cli *);
-	struct command *cmd;
-	/* Used to stash content between multiple calls */
-	void *stash;
+	size_t output_len;
+	int exitstatus;
+	/* Command args string for error messages */
+	const char *args;
 };
 
 /* Add the n'th arg to *args, incrementing n and keeping args of size n+1 */
-static void add_arg(const char ***args, const char *arg)
+static void add_arg(const char ***args, const char *arg TAKES)
 {
+	if (taken(arg))
+		tal_steal(*args, arg);
 	tal_arr_expand(args, arg);
 }
 
-static const char **gather_args(const tal_t *ctx, const char *cmd, const char **cmd_args)
+/* If stdinargs is non-NULL, that is where we put additional args */
+static const char **gather_argsv(const tal_t *ctx, const char ***stdinargs, const char *cmd, va_list ap)
 {
 	const char **args = tal_arr(ctx, const char *, 1);
+	const char *arg;
 
 	args[0] = bitcoind->cli ? bitcoind->cli : chainparams->cli;
 	if (chainparams->cli_args)
 		add_arg(&args, chainparams->cli_args);
 	if (bitcoind->datadir)
 		add_arg(&args, tal_fmt(args, "-datadir=%s", bitcoind->datadir));
+	if (bitcoind->rpcclienttimeout) {
+		/* Use the maximum value of rpcclienttimeout and retry_timeout to avoid
+		   the bitcoind backend hanging for too long. */
+		if (bitcoind->retry_timeout &&
+		    bitcoind->retry_timeout > bitcoind->rpcclienttimeout)
+			bitcoind->rpcclienttimeout = bitcoind->retry_timeout;
+
+		add_arg(&args,
+			tal_fmt(args, "-rpcclienttimeout=%"PRIu64, bitcoind->rpcclienttimeout));
+	}
 	if (bitcoind->rpcconnect)
 		add_arg(&args,
 			tal_fmt(args, "-rpcconnect=%s", bitcoind->rpcconnect));
@@ -122,38 +96,41 @@ static const char **gather_args(const tal_t *ctx, const char *cmd, const char **
 	if (bitcoind->rpcuser)
 		add_arg(&args, tal_fmt(args, "-rpcuser=%s", bitcoind->rpcuser));
 	if (bitcoind->rpcpass)
-		add_arg(&args,
-			tal_fmt(args, "-rpcpassword=%s", bitcoind->rpcpass));
+		// Always pipe the rpcpassword via stdin. Do not pass it using an
+		// `-rpcpassword` argument - secrets in arguments can leak when listing
+		// system processes.
+		add_arg(&args, "-stdinrpcpass");
+	/* To avoid giant command lines, we use -stdin (avail since bitcoin 0.13) */
+	if (stdinargs)
+		add_arg(&args, "-stdin");
 
 	add_arg(&args, cmd);
-	for (size_t i = 0; i < tal_count(cmd_args); i++)
-		add_arg(&args, cmd_args[i]);
+	while ((arg = va_arg(ap, char *)) != NULL) {
+		if (stdinargs)
+			add_arg(stdinargs, arg);
+		else
+			add_arg(&args, arg);
+	}
 	add_arg(&args, NULL);
 
 	return args;
 }
 
-static struct io_plan *read_more(struct io_conn *conn, struct bitcoin_cli *bcli)
+static LAST_ARG_NULL const char **
+gather_args(const tal_t *ctx, const char ***stdinargs, const char *cmd, ...)
 {
-	bcli->output_bytes += bcli->new_output;
-	if (bcli->output_bytes == tal_count(bcli->output))
-		tal_resize(&bcli->output, bcli->output_bytes * 2);
-	return io_read_partial(conn, bcli->output + bcli->output_bytes,
-			       tal_count(bcli->output) - bcli->output_bytes,
-			       &bcli->new_output, read_more, bcli);
-}
+	va_list ap;
+	const char **ret;
 
-static struct io_plan *output_init(struct io_conn *conn, struct bitcoin_cli *bcli)
-{
-	bcli->output_bytes = bcli->new_output = 0;
-	bcli->output = tal_arr(bcli, char, 100);
-	return read_more(conn, bcli);
-}
+	va_start(ap, cmd);
+	ret = gather_argsv(ctx, stdinargs, cmd, ap);
+	va_end(ap);
 
-static void next_bcli(enum bitcoind_prio prio);
+	return ret;
+}
 
 /* For printing: simple string of args (no secrets!) */
-static char *args_string(const tal_t *ctx, const char **args)
+static char *args_string(const tal_t *ctx, const char **args, const char **stdinargs)
 {
 	size_t i;
 	char *ret = tal_strdup(ctx, args[0]);
@@ -168,484 +145,196 @@ static char *args_string(const tal_t *ctx, const char **args)
 			ret = tal_strcat(ctx, take(ret), args[i]);
 		}
 	}
+	for (i = 0; i < tal_count(stdinargs); i++) {
+		ret = tal_strcat(ctx, take(ret), " ");
+		ret = tal_strcat(ctx, take(ret), stdinargs[i]);
+	}
 	return ret;
 }
 
-static char *bcli_args(struct bitcoin_cli *bcli)
+/* Execute bitcoin-cli with pre-built command and optional stdin args.
+ * Returns result with output and exit status. */
+static struct bcli_result *
+execute_bitcoin_cli(const tal_t *ctx,
+		    struct plugin *plugin,
+		    const char **cmd,
+		    const char **stdinargs)
 {
-    return args_string(bcli, bcli->args);
-}
+	int in, from, status;
+	pid_t child;
+	struct bcli_result *res;
 
-static void retry_bcli(void *cb_arg)
-{
-	struct bitcoin_cli *bcli = cb_arg;
-	list_add_tail(&bitcoind->pending[bcli->prio], &bcli->list);
-	next_bcli(bcli->prio);
-}
+	child = pipecmdarr(&in, &from, &from, cast_const2(char **, cmd));
+	if (child < 0)
+		plugin_err(plugin, "%s exec failed: %s", cmd[0], strerror(errno));
 
-/* We allow 60 seconds of spurious errors, eg. reorg. */
-static void bcli_failure(struct bitcoin_cli *bcli,
-                         int exitstatus)
-{
-	struct timerel t;
+	/* Send rpcpass via stdin if configured */
+	if (bitcoind->rpcpass) {
+		write_all(in, bitcoind->rpcpass, strlen(bitcoind->rpcpass));
+		write_all(in, "\n", 1);
+	}
+	/* Send any additional stdin args */
+	if (stdinargs) {
+		for (size_t i = 0; i < tal_count(stdinargs); i++) {
+			write_all(in, stdinargs[i], strlen(stdinargs[i]));
+			write_all(in, "\n", 1);
+		}
+	}
+	close(in);
 
-	if (!bitcoind->error_count)
-		bitcoind->first_error_time = time_mono();
+	/* Read all output until EOF */
+	res = tal(ctx, struct bcli_result);
+	res->output = grab_fd_str(res, from);
+	res->output_len = strlen(res->output);
+	res->args = args_string(res, cmd, stdinargs);
+	close(from);
 
-	t = timemono_between(time_mono(), bitcoind->first_error_time);
-	if (time_greater(t, time_from_sec(bitcoind->retry_timeout)))
-		plugin_err(bcli->cmd->plugin,
-		           "%s exited %u (after %u other errors) '%.*s'; "
-		           "we have been retrying command for "
-		           "--bitcoin-retry-timeout=%"PRIu64" seconds; "
-		           "bitcoind setup or our --bitcoin-* configs broken?",
-		           bcli_args(bcli),
-		           exitstatus,
-		           bitcoind->error_count,
-		           (int)bcli->output_bytes,
-		           bcli->output,
-		           bitcoind->retry_timeout);
-
-	plugin_log(bcli->cmd->plugin, LOG_UNUSUAL, "%s exited with status %u",
-		   bcli_args(bcli), exitstatus);
-	bitcoind->error_count++;
-
-	/* Retry in 1 second (not a leak!) */
-	plugin_timer(bcli->cmd->plugin, time_from_sec(1), retry_bcli, bcli);
-}
-
-static void bcli_finished(struct io_conn *conn UNUSED, struct bitcoin_cli *bcli)
-{
-	int ret, status;
-	struct command_result *res;
-	enum bitcoind_prio prio = bcli->prio;
-	u64 msec = time_to_msec(time_between(time_now(), bcli->start));
-
-	/* If it took over 10 seconds, that's rather strange. */
-	if (msec > 10000)
-		plugin_log(bcli->cmd->plugin, LOG_UNUSUAL,
-		           "bitcoin-cli: finished %s (%"PRIu64" ms)",
-		           bcli_args(bcli), msec);
-
-	assert(bitcoind->num_requests[prio] > 0);
-
-	/* FIXME: If we waited for SIGCHILD, this could never hang! */
-	while ((ret = waitpid(bcli->pid, &status, 0)) < 0 && errno == EINTR);
-	if (ret != bcli->pid)
-		plugin_err(bcli->cmd->plugin, "%s %s", bcli_args(bcli),
-		           ret == 0 ? "not exited?" : strerror(errno));
+	/* Wait for child to exit */
+	while (waitpid(child, &status, 0) < 0) {
+		if (errno == EINTR)
+			continue;
+		plugin_err(plugin, "waitpid(%s) failed: %s",
+			   res->args, strerror(errno));
+	}
 
 	if (!WIFEXITED(status))
-		plugin_err(bcli->cmd->plugin, "%s died with signal %i",
-		           bcli_args(bcli),
-		           WTERMSIG(status));
+		plugin_err(plugin, "%s died with signal %i",
+			   res->args, WTERMSIG(status));
 
-	/* Implicit nonzero_exit_ok == false */
-	if (!bcli->exitstatus) {
-		if (WEXITSTATUS(status) != 0) {
-			bcli_failure(bcli, WEXITSTATUS(status));
-			bitcoind->num_requests[prio]--;
-			goto done;
-		}
-	} else
-		*bcli->exitstatus = WEXITSTATUS(status);
+	res->exitstatus = WEXITSTATUS(status);
 
-	if (WEXITSTATUS(status) == 0)
-		bitcoind->error_count = 0;
-
-	bitcoind->num_requests[bcli->prio]--;
-
-	res = bcli->process(bcli);
-	if (!res)
-		bcli_failure(bcli, WEXITSTATUS(status));
-	else
-		tal_free(bcli);
-
-done:
-	next_bcli(prio);
+	return res;
 }
 
-static void next_bcli(enum bitcoind_prio prio)
+/* Synchronous execution of bitcoin-cli.
+ * Returns result with output and exit status. */
+static struct bcli_result *
+run_bitcoin_cliv(const tal_t *ctx,
+		 struct plugin *plugin,
+		 const char *method,
+		 va_list ap)
 {
-	struct bitcoin_cli *bcli;
-	struct io_conn *conn;
+	const char **stdinargs;
+	const char **cmd;
 
-	if (bitcoind->num_requests[prio] >= BITCOIND_MAX_PARALLEL)
-		return;
+	stdinargs = tal_arr(ctx, const char *, 0);
+	cmd = gather_argsv(ctx, &stdinargs, method, ap);
 
-	bcli = list_pop(&bitcoind->pending[prio], struct bitcoin_cli, list);
-	if (!bcli)
-		return;
-
-	bcli->pid = pipecmdarr(NULL, &bcli->fd, &bcli->fd,
-			       cast_const2(char **, bcli->args));
-	if (bcli->pid < 0)
-		plugin_err(bcli->cmd->plugin, "%s exec failed: %s",
-			   bcli->args[0], strerror(errno));
-
-	bcli->start = time_now();
-
-	bitcoind->num_requests[prio]++;
-
-	conn = io_new_conn(bcli, bcli->fd, output_init, bcli);
-	io_set_finish(conn, bcli_finished, bcli);
+	return execute_bitcoin_cli(ctx, plugin, cmd, stdinargs);
 }
 
-/* If ctx is non-NULL, and is freed before we return, we don't call process().
- * process returns false() if it's a spurious error, and we should retry. */
-static void
-start_bitcoin_cli(const tal_t *ctx,
-		  struct command *cmd,
-		  struct command_result *(*process)(struct bitcoin_cli *),
-		  bool nonzero_exit_ok,
-		  enum bitcoind_prio prio,
-		  char *method, const char **method_args,
-		  void *stash)
+static LAST_ARG_NULL struct bcli_result *
+run_bitcoin_cli(const tal_t *ctx,
+		struct plugin *plugin,
+		const char *method, ...)
 {
-	struct bitcoin_cli *bcli = tal(bitcoind, struct bitcoin_cli);
+	va_list ap;
+	struct bcli_result *res;
 
-	bcli->process = process;
-	bcli->cmd = cmd;
-	bcli->prio = prio;
+	va_start(ap, method);
+	res = run_bitcoin_cliv(ctx, plugin, method, ap);
+	va_end(ap);
 
-	if (nonzero_exit_ok)
-		bcli->exitstatus = tal(bcli, int);
-	else
-		bcli->exitstatus = NULL;
-
-	bcli->args = gather_args(bcli, method, method_args);
-	bcli->stash = stash;
-
-	list_add_tail(&bitcoind->pending[bcli->prio], &bcli->list);
-	next_bcli(bcli->prio);
+	return res;
 }
 
-static struct command_result *command_err_bcli_badjson(struct bitcoin_cli *bcli,
-						       const char *errmsg)
+static void strip_trailing_whitespace(char *str, size_t len)
 {
-	char *err = tal_fmt(bcli, "%s: bad JSON: %s (%.*s)",
-			    bcli_args(bcli), errmsg,
-			    (int)bcli->output_bytes, bcli->output);
-	return command_done_err(bcli->cmd, BCLI_ERROR, err, NULL);
+	size_t stripped_len = len;
+	while (stripped_len > 0 && cisspace(str[stripped_len-1]))
+		stripped_len--;
+
+	str[stripped_len] = 0x00;
 }
 
-static struct command_result *process_getutxout(struct bitcoin_cli *bcli)
+static struct command_result *command_err(struct command *cmd,
+					  struct bcli_result *res,
+					  const char *errmsg)
 {
-	const jsmntok_t *tokens;
-	struct json_stream *response;
-	struct bitcoin_tx_output output;
-	const char *err;
-
-	/* As of at least v0.15.1.0, bitcoind returns "success" but an empty
-	   string on a spent txout. */
-	if (*bcli->exitstatus != 0 || bcli->output_bytes == 0) {
-		response = jsonrpc_stream_success(bcli->cmd);
-		json_add_null(response, "amount");
-		json_add_null(response, "script");
-
-		return command_finished(bcli->cmd, response);
-	}
-
-	tokens = json_parse_simple(bcli->output, bcli->output,
-				   bcli->output_bytes);
-	if (!tokens) {
-		return command_err_bcli_badjson(bcli, "cannot parse");
-	}
-
-	err = json_scan(tmpctx, bcli->output, tokens,
-		       "{value:%,scriptPubKey:{hex:%}}",
-		       JSON_SCAN(json_to_bitcoin_amount,
-				 &output.amount.satoshis), /* Raw: bitcoind */
-		       JSON_SCAN_TAL(bcli, json_tok_bin_from_hex,
-				     &output.script));
-	if (err)
-		return command_err_bcli_badjson(bcli, err);
-
-	response = jsonrpc_stream_success(bcli->cmd);
-	json_add_amount_sat_only(response, "amount", output.amount);
-	json_add_string(response, "script", tal_hex(response, output.script));
-
-	return command_finished(bcli->cmd, response);
+	char *err = tal_fmt(cmd, "%s: %s (%.*s)",
+			    res->args, errmsg, (int)res->output_len, res->output);
+	return command_done_err(cmd, BCLI_ERROR, err, NULL);
 }
 
-static struct command_result *process_getblockchaininfo(struct bitcoin_cli *bcli)
+/* Don't use this in general: it's better to omit fields. */
+static void json_add_null(struct json_stream *stream, const char *fieldname)
 {
-	const jsmntok_t *tokens;
-	struct json_stream *response;
-	bool ibd;
-	u32 headers, blocks;
-	const char *chain, *err;
-
-	tokens = json_parse_simple(bcli->output,
-				   bcli->output, bcli->output_bytes);
-	if (!tokens) {
-		return command_err_bcli_badjson(bcli, "cannot parse");
-	}
-
-	err = json_scan(tmpctx, bcli->output, tokens,
-			"{chain:%,headers:%,blocks:%,initialblockdownload:%}",
-			JSON_SCAN_TAL(tmpctx, json_strdup, &chain),
-			JSON_SCAN(json_to_number, &headers),
-			JSON_SCAN(json_to_number, &blocks),
-			JSON_SCAN(json_to_bool, &ibd));
-	if (err)
-		return command_err_bcli_badjson(bcli, err);
-
-	response = jsonrpc_stream_success(bcli->cmd);
-	json_add_string(response, "chain", chain);
-	json_add_u32(response, "headercount", headers);
-	json_add_u32(response, "blockcount", blocks);
-	json_add_bool(response, "ibd", ibd);
-
-	return command_finished(bcli->cmd, response);
+	json_add_primitive(stream, fieldname, "null");
 }
 
+struct estimatefee_params {
+	u32 blocks;
+	const char *style;
+};
 
-struct estimatefees_stash {
-	/* FIXME: We use u64 but lightningd will store them as u32. */
-	u64 very_urgent, urgent, normal, slow;
+static const struct estimatefee_params estimatefee_params[] = {
+	{ 2, "CONSERVATIVE" },
+	{ 6, "ECONOMICAL" },
+	{ 12, "ECONOMICAL" },
+	{ 100, "ECONOMICAL" },
 };
 
 static struct command_result *
-estimatefees_null_response(struct bitcoin_cli *bcli)
+estimatefees_null_response(struct command *cmd)
 {
-	struct json_stream *response = jsonrpc_stream_success(bcli->cmd);
+	struct json_stream *response = jsonrpc_stream_success(cmd);
 
-	json_add_null(response, "opening");
-	json_add_null(response, "mutual_close");
-	json_add_null(response, "unilateral_close");
-	json_add_null(response, "delayed_to_us");
-	json_add_null(response, "htlc_resolution");
-	json_add_null(response, "penalty");
-	json_add_null(response, "min_acceptable");
-	json_add_null(response, "max_acceptable");
+	/* We give a floor, which is the standard minimum */
+	json_array_start(response, "feerates");
+	json_array_end(response);
+	json_add_u32(response, "feerate_floor", 1000);
 
-	return command_finished(bcli->cmd, response);
+	return command_finished(cmd, response);
 }
 
 static struct command_result *
-estimatefees_parse_feerate(struct bitcoin_cli *bcli, u64 *feerate)
-{
-	const jsmntok_t *tokens;
-
-	tokens = json_parse_simple(bcli->output,
-				   bcli->output, bcli->output_bytes);
-	if (!tokens) {
-		return command_err_bcli_badjson(bcli, "cannot parse");
-	}
-
-	if (json_scan(tmpctx, bcli->output, tokens, "{feerate:%}",
-		      JSON_SCAN(json_to_bitcoin_amount, feerate)) != NULL) {
-		/* Paranoia: if it had a feerate, but was malformed: */
-		if (json_get_member(bcli->output, tokens, "feerate"))
-			return command_err_bcli_badjson(bcli, "cannot scan");
-		/* Regtest fee estimation is generally awful: Fake it at min. */
-		if (bitcoind->fake_fees) {
-			*feerate = 1000;
-			return NULL;
-		}
-		/* We return null if estimation failed, and bitcoin-cli will
-		 * exit with 0 but no feerate field on failure. */
-		return estimatefees_null_response(bcli);
-	}
-
-	return NULL;
-}
-
-/* We got all the feerates, give them to lightningd. */
-static struct command_result *estimatefees_final_step(struct bitcoin_cli *bcli)
-{
-	struct command_result *err;
-	struct json_stream *response;
-	struct estimatefees_stash *stash = bcli->stash;
-
-	/* bitcoind could theoretically fail to estimate for a higher target. */
-	if (*bcli->exitstatus != 0)
-		return estimatefees_null_response(bcli);
-
-	err = estimatefees_parse_feerate(bcli, &stash->slow);
-	if (err)
-		return err;
-
-	response = jsonrpc_stream_success(bcli->cmd);
-	json_add_u64(response, "opening", stash->normal);
-	json_add_u64(response, "mutual_close", stash->slow);
-	json_add_u64(response, "unilateral_close",
-		     stash->very_urgent * bitcoind->commit_fee_percent / 100);
-	json_add_u64(response, "delayed_to_us", stash->normal);
-	json_add_u64(response, "htlc_resolution", stash->urgent);
-	json_add_u64(response, "penalty", stash->urgent);
-	/* We divide the slow feerate for the minimum acceptable, lightningd
-	 * will use floor if it's hit, though. */
-	json_add_u64(response, "min_acceptable", stash->slow / 2);
-	/* BOLT #2:
-	*
-	* Given the variance in fees, and the fact that the transaction may be
-	* spent in the future, it's a good idea for the fee payer to keep a good
-	* margin (say 5x the expected fee requirement)
-	*/
-	json_add_u64(response, "max_acceptable",
-		     stash->very_urgent * bitcoind->max_fee_multiplier);
-
-	return command_finished(bcli->cmd, response);
-}
-
-/* We got the response for the normal feerate, now treat the slow one. */
-static struct command_result *estimatefees_fourth_step(struct bitcoin_cli *bcli)
-{
-	struct command_result *err;
-	struct estimatefees_stash *stash = bcli->stash;
-	const char **params = tal_arr(bcli->cmd, const char *, 2);
-
-	/* bitcoind could theoretically fail to estimate for a higher target. */
-	if (*bcli->exitstatus != 0)
-		return estimatefees_null_response(bcli);
-
-	err = estimatefees_parse_feerate(bcli, &stash->normal);
-	if (err)
-		return err;
-
-	params[0] = "100";
-	params[1] = "ECONOMICAL";
-	start_bitcoin_cli(NULL, bcli->cmd, estimatefees_final_step, true,
-			  BITCOIND_LOW_PRIO, "estimatesmartfee", params, stash);
-
-	return command_still_pending(bcli->cmd);
-}
-
-/* We got the response for the urgent feerate, now treat the normal one. */
-static struct command_result *estimatefees_third_step(struct bitcoin_cli *bcli)
-{
-	struct command_result *err;
-	struct estimatefees_stash *stash = bcli->stash;
-	const char **params = tal_arr(bcli->cmd, const char *, 2);
-
-	/* If we cannot estimate fees, no need to continue bothering bitcoind. */
-	if (*bcli->exitstatus != 0)
-		return estimatefees_null_response(bcli);
-
-	err = estimatefees_parse_feerate(bcli, &stash->urgent);
-	if (err)
-		return err;
-
-	params[0] = "4";
-	params[1] = "ECONOMICAL";
-	start_bitcoin_cli(NULL, bcli->cmd, estimatefees_fourth_step, true,
-			  BITCOIND_LOW_PRIO, "estimatesmartfee", params, stash);
-
-	return command_still_pending(bcli->cmd);
-}
-
-/* We got the response for the very urgent feerate, now treat the urgent one. */
-static struct command_result *estimatefees_second_step(struct bitcoin_cli *bcli)
-{
-	struct command_result *err;
-	struct estimatefees_stash *stash = bcli->stash;
-	const char **params = tal_arr(bcli->cmd, const char *, 2);
-
-	/* If we cannot estimate fees, no need to continue bothering bitcoind. */
-	if (*bcli->exitstatus != 0)
-		return estimatefees_null_response(bcli);
-
-	err = estimatefees_parse_feerate(bcli, &stash->very_urgent);
-	if (err)
-		return err;
-
-	params[0] = "3";
-	params[1] = "CONSERVATIVE";
-	start_bitcoin_cli(NULL, bcli->cmd, estimatefees_third_step, true,
-			  BITCOIND_LOW_PRIO, "estimatesmartfee", params, stash);
-
-	return command_still_pending(bcli->cmd);
-}
-
-
-static struct command_result *process_sendrawtransaction(struct bitcoin_cli *bcli)
+getrawblockbyheight_notfound(struct command *cmd)
 {
 	struct json_stream *response;
 
-	/* This is useful for functional tests. */
-	if (bcli->exitstatus)
-		plugin_log(bcli->cmd->plugin, LOG_DBG,
-			   "sendrawtx exit %i (%s) %.*s",
-			   *bcli->exitstatus, bcli_args(bcli),
-			   *bcli->exitstatus ?
-				(u32)bcli->output_bytes-1 : 0,
-				bcli->output);
-
-	response = jsonrpc_stream_success(bcli->cmd);
-	json_add_bool(response, "success", *bcli->exitstatus == 0);
-	json_add_string(response, "errmsg",
-			*bcli->exitstatus ?
-			tal_strndup(bcli->cmd,
-				    bcli->output, bcli->output_bytes-1)
-			: "");
-
-	return command_finished(bcli->cmd, response);
-}
-
-struct getrawblock_stash {
-	const char *block_hash;
-	u32 block_height;
-	const char *block_hex;
-};
-
-static struct command_result *process_getrawblock(struct bitcoin_cli *bcli)
-{
-	struct json_stream *response;
-	struct getrawblock_stash *stash = bcli->stash;
-
-	/* -1 to strip \n and steal onto the stash. */
-	bcli->output[bcli->output_bytes-1] = 0x00;
-	stash->block_hex = tal_steal(stash, bcli->output);
-
-	response = jsonrpc_stream_success(bcli->cmd);
-	json_add_string(response, "blockhash", stash->block_hash);
-	json_add_string(response, "block", stash->block_hex);
-
-	return command_finished(bcli->cmd, response);
-}
-
-static struct command_result *
-getrawblockbyheight_notfound(struct bitcoin_cli *bcli)
-{
-	struct json_stream *response;
-
-	response = jsonrpc_stream_success(bcli->cmd);
+	response = jsonrpc_stream_success(cmd);
 	json_add_null(response, "blockhash");
 	json_add_null(response, "block");
 
-	return command_finished(bcli->cmd, response);
+	return command_finished(cmd, response);
 }
 
-static struct command_result *process_getblockhash(struct bitcoin_cli *bcli)
+/* Get peers that support NODE_NETWORK (full nodes).
+ * Returns array of peer ids, or empty array if none found. */
+static int *get_fullnode_peers(const tal_t *ctx, struct command *cmd)
 {
-	const char **params;
-	struct getrawblock_stash *stash = bcli->stash;
+	struct bcli_result *res;
+	const jsmntok_t *t, *toks;
+	int *peers = tal_arr(ctx, int, 0);
+	size_t i;
 
-	/* If it failed with error 8, give an empty response. */
-	if (bcli->exitstatus && *bcli->exitstatus != 0) {
-		/* Other error means we have to retry. */
-		if (*bcli->exitstatus != 8)
-			return NULL;
-		return getrawblockbyheight_notfound(bcli);
+	res = run_bitcoin_cli(cmd, cmd->plugin, "getpeerinfo", NULL);
+	if (res->exitstatus != 0)
+		return peers;
+
+	toks = json_parse_simple(res->output, res->output, res->output_len);
+	if (!toks)
+		return peers;
+
+	json_for_each_arr(i, t, toks) {
+		int id;
+		u8 *services;
+
+		if (json_scan(tmpctx, res->output, t, "{id:%,services:%}",
+			      JSON_SCAN(json_to_int, &id),
+			      JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &services)) == NULL) {
+			/* From bitcoin source:
+			 *  NODE_NETWORK means that the node is capable of serving the complete block chain.
+			 *  It is currently set by all Bitcoin Core non pruned nodes, and is unset by SPV
+			 *  clients or other light clients.
+			 * NODE_NETWORK = (1 << 0)
+			 */
+			if (tal_count(services) > 0 && (services[tal_count(services)-1] & (1 << 0)))
+				tal_arr_expand(&peers, id);
+		}
 	}
 
-	/* `-1` to strip the newline character. */
-	stash->block_hash = tal_strndup(stash, bcli->output,
-					bcli->output_bytes-1);
-	if (!stash->block_hash || strlen(stash->block_hash) != 64) {
-		return command_err_bcli_badjson(bcli, "bad blockhash");
-	}
-
-	params = tal_arr(bcli->cmd, const char *, 2);
-	params[0] = stash->block_hash;
-	/* Non-verbose: raw block. */
-	params[1] = "0";
-	start_bitcoin_cli(NULL, bcli->cmd, process_getrawblock, false,
-			  BITCOIND_HIGH_PRIO, "getblock", params, stash);
-
-	return command_still_pending(bcli->cmd);
+	return peers;
 }
 
 /* Get a raw block given its height.
@@ -656,25 +345,95 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
                                                   const char *buf,
                                                   const jsmntok_t *toks)
 {
-	struct getrawblock_stash *stash;
+	struct bcli_result *res;
+	struct json_stream *response;
+	const char *block_hash;
 	u32 *height;
-	const char **params;
+	struct timemono first_error_time;
+	bool first_error = true;
+	int *peers = NULL;
 
-	/* bitcoin-cli wants a string. */
 	if (!param(cmd, buf, toks,
 	           p_req("height", param_number, &height),
 	           NULL))
 		return command_param_failed();
 
-	stash = tal(cmd, struct getrawblock_stash);
-	stash->block_height = *height;
+	res = run_bitcoin_cli(cmd, cmd->plugin, "getblockhash",
+			      tal_fmt(tmpctx, "%u", *height), NULL);
 
-	params = tal_arr(cmd, const char *, 1);
-	params[0] = tal_fmt(params, "%u", *height);
-	start_bitcoin_cli(NULL, cmd, process_getblockhash, true,
-			  BITCOIND_LOW_PRIO, "getblockhash", params, stash);
+	if (res->exitstatus != 0) {
+		return getrawblockbyheight_notfound(cmd);
+	}
 
-	return command_still_pending(cmd);
+	strip_trailing_whitespace(res->output, res->output_len);
+	if (strlen(res->output) != BLOCK_HASH_HEX_LEN)
+		return command_err(cmd, res, "bad JSON: bad blockhash");
+
+	block_hash = tal_strdup(cmd, res->output);
+
+	for (;;) {
+		res = run_bitcoin_cli(cmd, cmd->plugin, "getblock",
+				      block_hash, "0", NULL);
+
+		if (res->exitstatus == 0) {
+			strip_trailing_whitespace(res->output, res->output_len);
+			response = jsonrpc_stream_success(cmd);
+			json_add_string(response, "blockhash", block_hash);
+			json_add_string(response, "block", res->output);
+			return command_finished(cmd, response);
+		}
+
+		plugin_log(cmd->plugin, LOG_DBG,
+			"failed to fetch block %s from the bitcoin backend (maybe pruned).",
+			block_hash);
+
+		if (first_error) {
+			first_error_time = time_mono();
+			first_error = false;
+		}
+
+		struct timerel elapsed = timemono_between(time_mono(), first_error_time);
+		if (time_greater(elapsed, time_from_sec(bitcoind->retry_timeout))) {
+			return command_done_err(cmd, BCLI_ERROR,
+				tal_fmt(cmd, "getblock %s timed out after %"PRIu64" seconds",
+					block_hash, bitcoind->retry_timeout), NULL);
+		}
+
+		if (!peers)
+			peers = get_fullnode_peers(cmd, cmd);
+
+		if (tal_count(peers) > 0) {
+			int peer = peers[tal_count(peers) - 1];
+			tal_resize(&peers, tal_count(peers) - 1);
+
+			res = run_bitcoin_cli(cmd, cmd->plugin,
+					      "getblockfrompeer",
+					      block_hash,
+					      tal_fmt(tmpctx, "%i", peer),
+					      NULL);
+
+			if (res->exitstatus != 0) {
+				/* We still continue with the execution if we cannot fetch the
+				 * block from peer */
+				plugin_log(cmd->plugin, LOG_DBG,
+					   "failed to fetch block %s from peer %i, skip.",
+					   block_hash, peer);
+			} else {
+				plugin_log(cmd->plugin, LOG_DBG,
+					   "try to fetch block %s from peer %i.",
+					   block_hash, peer);
+			}
+		}
+
+		if (tal_count(peers) == 0) {
+			plugin_log(cmd->plugin, LOG_DBG,
+				   "asked all known peers about block %s, retry",
+				   block_hash);
+			peers = tal_free(peers);
+		}
+
+		sleep(1);
+	}
 }
 
 /* Get infos about the block chain.
@@ -685,41 +444,192 @@ static struct command_result *getchaininfo(struct command *cmd,
                                            const char *buf UNUSED,
                                            const jsmntok_t *toks UNUSED)
 {
-	if (!param(cmd, buf, toks, NULL))
-	    return command_param_failed();
+	/* FIXME(vincenzopalazzo): Inside the JSON request,
+         * we have the current height known from Core Lightning. Therefore,
+         * we can attempt to prevent a crash if the 'getchaininfo' function returns
+         * a lower height than the one we already know, by waiting for a short period.
+         * However, I currently don't have a better idea on how to handle this situation. */
+	u32 *height UNUSED;
+	struct bcli_result *res;
+	const jsmntok_t *tokens;
+	struct json_stream *response;
+	bool ibd;
+	u32 headers, blocks;
+	const char *chain, *err;
 
-	start_bitcoin_cli(NULL, cmd, process_getblockchaininfo, false,
-			  BITCOIND_HIGH_PRIO, "getblockchaininfo", NULL, NULL);
+	if (!param(cmd, buf, toks,
+		   p_opt("last_height", param_number, &height),
+		   NULL))
+		return command_param_failed();
 
-	return command_still_pending(cmd);
+	res = run_bitcoin_cli(cmd, cmd->plugin, "getblockchaininfo", NULL);
+	if (res->exitstatus != 0)
+		return command_err(cmd, res, "command failed");
+
+	tokens = json_parse_simple(res->output, res->output, res->output_len);
+	if (!tokens)
+		return command_err(cmd, res, "bad JSON: cannot parse");
+
+	err = json_scan(tmpctx, res->output, tokens,
+			"{chain:%,headers:%,blocks:%,initialblockdownload:%}",
+			JSON_SCAN_TAL(tmpctx, json_strdup, &chain),
+			JSON_SCAN(json_to_number, &headers),
+			JSON_SCAN(json_to_number, &blocks),
+			JSON_SCAN(json_to_bool, &ibd));
+	if (err)
+		return command_err(cmd, res, tal_fmt(tmpctx, "bad JSON: %s", err));
+
+	if (bitcoind->dev_ignore_ibd)
+		ibd = false;
+
+	response = jsonrpc_stream_success(cmd);
+	json_add_string(response, "chain", chain);
+	json_add_u32(response, "headercount", headers);
+	json_add_u32(response, "blockcount", blocks);
+	json_add_bool(response, "ibd", ibd);
+
+	return command_finished(cmd, response);
+}
+
+/* Add a feerate, respecting the floor within the supported u32 range. */
+static void json_add_feerate(struct json_stream *result, const char *fieldname,
+			     struct command *cmd,
+			     u64 perkb_floor,
+			     u64 value)
+{
+	/* Anthony Towns reported signet had a 900kbtc fee block, and then
+	 * CLN got upset scanning feerate.  It expects a u32. */
+	if (value > 0xFFFFFFFF) {
+		plugin_log(cmd->plugin, LOG_UNUSUAL,
+			   "Feerate %"PRIu64" is ridiculous: trimming to 32 bits",
+			   value);
+		value = 0xFFFFFFFF;
+	}
+	/* 0 is special, it means "unknown" */
+	if (value && value < perkb_floor) {
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "Feerate %s raised from %"PRIu64
+			   " perkb to floor of %"PRIu64,
+			   fieldname, value, perkb_floor);
+		json_add_u64(result, fieldname, perkb_floor);
+	} else {
+		json_add_u64(result, fieldname, value);
+	}
+}
+
+/* Get the feerate floor from getmempoolinfo.
+ * Returns NULL on success (floor stored in *perkb_floor), or error response. */
+static struct command_result *get_feerate_floor(struct command *cmd,
+						u64 *perkb_floor)
+{
+	struct bcli_result *res;
+	const jsmntok_t *tokens;
+	const char *err;
+	u64 mempoolfee, relayfee;
+
+	res = run_bitcoin_cli(cmd, cmd->plugin, "getmempoolinfo", NULL);
+	if (res->exitstatus != 0)
+		return estimatefees_null_response(cmd);
+
+	tokens = json_parse_simple(res->output, res->output, res->output_len);
+	if (!tokens)
+		return command_err(cmd, res, "bad JSON: cannot parse");
+
+	err = json_scan(tmpctx, res->output, tokens,
+			"{mempoolminfee:%,minrelaytxfee:%}",
+			JSON_SCAN(json_to_bitcoin_amount, &mempoolfee),
+			JSON_SCAN(json_to_bitcoin_amount, &relayfee));
+	if (err)
+		return command_err(cmd, res, tal_fmt(tmpctx, "bad JSON: %s", err));
+
+	*perkb_floor = max_u64(mempoolfee, relayfee);
+	/* Bound the floor before it can also raise the per-target feerates. */
+	if (*perkb_floor > 0xFFFFFFFF) {
+		plugin_log(cmd->plugin, LOG_UNUSUAL,
+			   "Feerate floor %"PRIu64" is ridiculous: trimming to 32 bits",
+			   *perkb_floor);
+		*perkb_floor = 0xFFFFFFFF;
+	}
+	return NULL;
+}
+
+/* Get a single feerate from estimatesmartfee.
+ * Returns NULL on success (feerate stored in *perkb), or error response. */
+static struct command_result *get_feerate(struct command *cmd,
+					  u32 blocks,
+					  const char *style,
+					  u64 *perkb)
+{
+	struct bcli_result *res;
+	const jsmntok_t *tokens;
+
+	res = run_bitcoin_cli(cmd, cmd->plugin, "estimatesmartfee",
+			      tal_fmt(tmpctx, "%u", blocks), style, NULL);
+
+	if (res->exitstatus != 0)
+		return estimatefees_null_response(cmd);
+
+	tokens = json_parse_simple(res->output, res->output, res->output_len);
+	if (!tokens)
+		return command_err(cmd, res, "bad JSON: cannot parse");
+
+	if (json_scan(tmpctx, res->output, tokens, "{feerate:%}",
+		      JSON_SCAN(json_to_bitcoin_amount, perkb)) != NULL) {
+		/* Paranoia: if it had a feerate, but was malformed: */
+		if (json_get_member(res->output, tokens, "feerate"))
+			return command_err(cmd, res, "bad JSON: cannot scan");
+		/* Regtest fee estimation is generally awful: Fake it at min. */
+		if (bitcoind->fake_fees)
+			*perkb = 1000;
+		else
+			/* We return null if estimation failed, and bitcoin-cli will
+			 * exit with 0 but no feerate field on failure. */
+			return estimatefees_null_response(cmd);
+	}
+
+	return NULL;
 }
 
 /* Get the current feerates. We use an urgent feerate for unilateral_close and max,
  * a slightly less urgent feerate for htlc_resolution and penalty transactions,
  * a slow feerate for min, and a normal one for all others.
- *
- * Calls `estimatesmartfee` with targets 2/CONSERVATIVE (very urgent),
- * 3/CONSERVATIVE (urgent), 4/ECONOMICAL (normal), and 100/ECONOMICAL (slow)
- * then returns the feerates as sat/kVB.
  */
 static struct command_result *estimatefees(struct command *cmd,
 					   const char *buf UNUSED,
 					   const jsmntok_t *toks UNUSED)
 {
-	struct estimatefees_stash *stash = tal(cmd, struct estimatefees_stash);
-	const char **params = tal_arr(cmd, const char *, 2);
+	struct command_result *err;
+	u64 perkb_floor = 0;
+	u64 perkb[ARRAY_SIZE(estimatefee_params)];
+	struct json_stream *response;
 
 	if (!param(cmd, buf, toks, NULL))
-	    return command_param_failed();
+		return command_param_failed();
 
-	/* First call to estimatesmartfee, for very urgent estimation (unilateral
-	 * and max_acceptable feerates). */
-	params[0] = "2";
-	params[1] = "CONSERVATIVE";
-	start_bitcoin_cli(NULL, cmd, estimatefees_second_step, true,
-			  BITCOIND_LOW_PRIO, "estimatesmartfee", params, stash);
+	err = get_feerate_floor(cmd, &perkb_floor);
+	if (err)
+		return err;
 
-	return command_still_pending(cmd);
+	for (size_t i = 0; i < ARRAY_SIZE(estimatefee_params); i++) {
+		err = get_feerate(cmd, estimatefee_params[i].blocks,
+				  estimatefee_params[i].style, &perkb[i]);
+		if (err)
+			return err;
+	}
+
+	response = jsonrpc_stream_success(cmd);
+	json_array_start(response, "feerates");
+	for (size_t i = 0; i < ARRAY_SIZE(perkb); i++) {
+		if (!perkb[i])
+			continue;
+		json_object_start(response, NULL);
+		json_add_u32(response, "blocks", estimatefee_params[i].blocks);
+		json_add_feerate(response, "feerate", cmd, perkb_floor, perkb[i]);
+		json_object_end(response);
+	}
+	json_array_end(response);
+	json_add_u64(response, "feerate_floor", perkb_floor);
+	return command_finished(cmd, response);
 }
 
 /* Send a transaction to the Bitcoin network.
@@ -729,65 +639,104 @@ static struct command_result *sendrawtransaction(struct command *cmd,
                                                  const char *buf,
                                                  const jsmntok_t *toks)
 {
-	const char **params = tal_arr(cmd, const char *, 1);
+	const char *tx, *highfeesarg;
 	bool *allowhighfees;
+	struct bcli_result *res;
+	struct json_stream *response;
 
 	/* bitcoin-cli wants strings. */
 	if (!param(cmd, buf, toks,
-	           p_req("tx", param_string, &params[0]),
+	           p_req("tx", param_string, &tx),
 		   p_req("allowhighfees", param_bool, &allowhighfees),
 	           NULL))
 		return command_param_failed();
 
 	if (*allowhighfees) {
-		if (bitcoind->version >= 190001)
-			/* Starting in 19.0.1, second argument is
-			 * maxfeerate, which when set to 0 means
-			 * no max feerate.
-			 */
-			tal_arr_expand(&params, "0");
-		else
-			/* in older versions, second arg is allowhighfees,
-			 * set to true to allow high fees.
-			 */
-			tal_arr_expand(&params, "true");
-	}
+			highfeesarg = "0";
+	} else
+		highfeesarg = NULL;
 
-	start_bitcoin_cli(NULL, cmd, process_sendrawtransaction, true,
-			  BITCOIND_HIGH_PRIO, "sendrawtransaction", params, NULL);
+	res = run_bitcoin_cli(cmd, cmd->plugin,
+			      "sendrawtransaction", tx, highfeesarg, NULL);
 
-	return command_still_pending(cmd);
+	/* This is useful for functional tests. */
+	plugin_log(cmd->plugin, LOG_DBG,
+		   "sendrawtx exit %i (%s) %.*s",
+		   res->exitstatus, res->args,
+		   res->exitstatus ? (int)res->output_len : 0,
+		   res->output);
+
+	response = jsonrpc_stream_success(cmd);
+	json_add_bool(response, "success",
+		      res->exitstatus == 0 ||
+			  res->exitstatus == RPC_TRANSACTION_ALREADY_IN_CHAIN);
+	json_add_string(response, "errmsg",
+			res->exitstatus ?
+			tal_strndup(cmd, res->output, res->output_len)
+			: "");
+
+	return command_finished(cmd, response);
 }
 
 static struct command_result *getutxout(struct command *cmd,
                                        const char *buf,
                                        const jsmntok_t *toks)
 {
-	const char **params = tal_arr(cmd, const char *, 2);
+	const char *txid, *vout;
+	struct bcli_result *res;
+	const jsmntok_t *tokens;
+	struct json_stream *response;
+	struct bitcoin_tx_output output;
+	const char *err;
 
 	/* bitcoin-cli wants strings. */
 	if (!param(cmd, buf, toks,
-	           p_req("txid", param_string, &params[0]),
-	           p_req("vout", param_string, &params[1]),
+	           p_req("txid", param_string, &txid),
+	           p_req("vout", param_string, &vout),
 	           NULL))
 		return command_param_failed();
 
-	start_bitcoin_cli(NULL, cmd, process_getutxout, true,
-			  BITCOIND_HIGH_PRIO, "gettxout", params, NULL);
+	res = run_bitcoin_cli(cmd, cmd->plugin, "gettxout", txid, vout, NULL);
 
-	return command_still_pending(cmd);
+	/* As of at least v0.15.1.0, bitcoind returns "success" but an empty
+	   string on a spent txout. */
+	if (res->exitstatus != 0 || res->output_len == 0) {
+		response = jsonrpc_stream_success(cmd);
+		json_add_null(response, "amount");
+		json_add_null(response, "script");
+		return command_finished(cmd, response);
+	}
+
+	tokens = json_parse_simple(res->output, res->output, res->output_len);
+	if (!tokens)
+		return command_err(cmd, res, "bad JSON: cannot parse");
+
+	err = json_scan(tmpctx, res->output, tokens,
+		       "{value:%,scriptPubKey:{hex:%}}",
+		       JSON_SCAN(json_to_bitcoin_amount,
+				 &output.amount.satoshis), /* Raw: bitcoind */
+		       JSON_SCAN_TAL(cmd, json_tok_bin_from_hex,
+				     &output.script));
+	if (err)
+		return command_err(cmd, res, tal_fmt(tmpctx, "bad JSON: %s", err));
+
+	response = jsonrpc_stream_success(cmd);
+	json_add_sats(response, "amount", output.amount);
+	json_add_string(response, "script", tal_hex(response, output.script));
+
+	return command_finished(cmd, response);
 }
 
 static void bitcoind_failure(struct plugin *p, const char *error_message)
 {
-	const char **cmd = gather_args(bitcoind, "echo", NULL);
+	const char **cmd = gather_args(bitcoind, NULL, "echo", NULL);
 	plugin_err(p, "\n%s\n\n"
 		      "Make sure you have bitcoind running and that bitcoin-cli"
 		      " is able to connect to bitcoind.\n\n"
 		      "You can verify that your Bitcoin Core installation is"
 		      " ready for use by running:\n\n"
 		      "    $ %s 'hello world'\n", error_message,
-		      args_string(cmd, cmd));
+		   args_string(cmd, cmd, NULL));
 }
 
 /* Do some sanity checks on bitcoind based on the output of `getnetworkinfo`. */
@@ -795,24 +744,25 @@ static void parse_getnetworkinfo_result(struct plugin *p, const char *buf)
 {
 	const jsmntok_t *result;
 	bool tx_relay;
-	u32 min_version = 160000;
+	u32 min_version = 230000;
 	const char *err;
 
 	result = json_parse_simple(NULL, buf, strlen(buf));
 	if (!result)
 		plugin_err(p, "Invalid response to '%s': '%s'. Can not "
 			      "continue without proceeding to sanity checks.",
-			      gather_args(bitcoind, "getnetworkinfo", NULL), buf);
+			   args_string(tmpctx, gather_args(bitcoind, NULL, "getnetworkinfo", NULL), NULL),
+			   buf);
 
 	/* Check that we have a fully-featured `estimatesmartfee`. */
 	err = json_scan(tmpctx, buf, result, "{version:%,localrelay:%}",
 			JSON_SCAN(json_to_u32, &bitcoind->version),
 			JSON_SCAN(json_to_bool, &tx_relay));
 	if (err)
-		plugin_err(p, "%s.  Got '%s'. Can not"
+		plugin_err(p, "%s.  Got '%.*s'. Can not"
 			   " continue without proceeding to sanity checks.",
 			   err,
-			   gather_args(bitcoind, "getnetworkinfo", NULL), buf);
+			   json_tok_full_len(result), json_tok_full(buf, result));
 
 	if (bitcoind->version < min_version)
 		plugin_err(p, "Unsupported bitcoind version %"PRIu32", at least"
@@ -829,70 +779,59 @@ static void parse_getnetworkinfo_result(struct plugin *p, const char *buf)
 
 static void wait_and_check_bitcoind(struct plugin *p)
 {
-	int from, status, ret;
-	pid_t child;
-	const char **cmd = gather_args(bitcoind, "getnetworkinfo", NULL);
-	bool printed = false;
-	char *output = NULL;
+	struct bcli_result *res;
+	const char **cmd;
+	int i;
 
-	for (;;) {
-		tal_free(output);
-
-		child = pipecmdarr(NULL, &from, &from, cast_const2(char **,cmd));
-		if (child < 0) {
-			if (errno == ENOENT)
-				bitcoind_failure(p, "bitcoin-cli not found. Is bitcoin-cli "
-						    "(part of Bitcoin Core) available in your PATH?");
-			plugin_err(p, "%s exec failed: %s", cmd[0], strerror(errno));
-		}
-
-		output = grab_fd(cmd, from);
-
-		while ((ret = waitpid(child, &status, 0)) < 0 && errno == EINTR);
-		if (ret != child)
-			bitcoind_failure(p, tal_fmt(bitcoind, "Waiting for %s: %s",
-						    cmd[0], strerror(errno)));
-		if (!WIFEXITED(status))
-			bitcoind_failure(p, tal_fmt(bitcoind, "Death of %s: signal %i",
-						   cmd[0], WTERMSIG(status)));
-
-		if (WEXITSTATUS(status) == 0)
+	/* Special case: -rpcwait flags go on command line, not stdin */
+	/* We try 30 times one second rather than one time thirty seconds, because
+	 * we have seen cases bitcoind becomes available, but rpcwait still just hangs
+	 * needlessly.
+	 */
+	cmd = gather_args(bitcoind, NULL, "-rpcwait", "-rpcwaittimeout=1",
+			  "getnetworkinfo", NULL);
+	res = NULL;
+	for (i = 0; i < 30; i++) {
+		tal_free(res);            /* NULL-safe; frees previous attempt */
+		res = execute_bitcoin_cli(bitcoind, p, cmd, NULL);
+		if (res->exitstatus != 1)
 			break;
-
-		/* bitcoin/src/rpc/protocol.h:
-		 *	RPC_IN_WARMUP = -28, //!< Client still warming up
-		 */
-		if (WEXITSTATUS(status) != 28) {
-			if (WEXITSTATUS(status) == 1)
-				bitcoind_failure(p, "Could not connect to bitcoind using"
-						    " bitcoin-cli. Is bitcoind running?");
-			bitcoind_failure(p, tal_fmt(bitcoind, "%s exited with code %i: %s",
-						    cmd[0], WEXITSTATUS(status), output));
-		}
-
-		if (!printed) {
-			plugin_log(p, LOG_UNUSUAL,
-				   "Waiting for bitcoind to warm up...");
-			printed = true;
-		}
-		sleep(1);
 	}
 
-	parse_getnetworkinfo_result(p, output);
+	if (res->exitstatus == 1)
+		bitcoind_failure(p,
+				 "RPC connection timed out. Could "
+				 "not connect to bitcoind using "
+				 "bitcoin-cli. Is bitcoind running?");
+	if (res->exitstatus != 0)
+		bitcoind_failure(p,
+				 tal_fmt(bitcoind, "%s exited with code %i: %s",
+					 res->args, res->exitstatus, res->output));
+
+	parse_getnetworkinfo_result(p, res->output);
 
 	tal_free(cmd);
+	tal_free(res);
 }
 
-static const char *init(struct plugin *p, const char *buffer UNUSED,
+static void memleak_mark_bitcoind(struct plugin *p, struct htable *memtable)
+{
+	memleak_scan_obj(memtable, bitcoind);
+}
+
+static const char *init(struct command *init_cmd, const char *buffer UNUSED,
 			const jsmntok_t *config UNUSED)
 {
-	wait_and_check_bitcoind(p);
+	wait_and_check_bitcoind(init_cmd->plugin);
 
 	/* Usually we fake up fees in regtest */
 	if (streq(chainparams->network_name, "regtest"))
-		bitcoind->fake_fees = IFDEV(!bitcoind->no_fake_fees, true);
+		bitcoind->fake_fees = !bitcoind->dev_no_fake_fees;
+	else
+		bitcoind->fake_fees = false;
 
-	plugin_log(p, LOG_INFORM,
+	plugin_set_memleak_handler(init_cmd->plugin, memleak_mark_bitcoind);
+	plugin_log(init_cmd->plugin, LOG_INFORM,
 		   "bitcoin-cli initialized and connected to bitcoind.");
 
 	return NULL;
@@ -901,39 +840,22 @@ static const char *init(struct plugin *p, const char *buffer UNUSED,
 static const struct plugin_command commands[] = {
 	{
 		"getrawblockbyheight",
-		"bitcoin",
-		"Get the bitcoin block at a given height",
-		"",
 		getrawblockbyheight
 	},
 	{
 		"getchaininfo",
-		"bitcoin",
-		"Get the chain id, the header count, the block count,"
-		" and whether this is IBD.",
-		"",
 		getchaininfo
 	},
 	{
 		"estimatefees",
-		"bitcoin",
-		"Get the urgent, normal and slow Bitcoin feerates as"
-		" sat/kVB.",
-		"",
 		estimatefees
 	},
 	{
 		"sendrawtransaction",
-		"bitcoin",
-		"Send a raw transaction to the Bitcoin network.",
-		"",
 		sendrawtransaction
 	},
 	{
 		"getutxout",
-		"bitcoin",
-		"Get information about an output, identified by a {txid} an a {vout}",
-		"",
 		getutxout
 	},
 };
@@ -944,21 +866,16 @@ static struct bitcoind *new_bitcoind(const tal_t *ctx)
 
 	bitcoind->cli = NULL;
 	bitcoind->datadir = NULL;
-	for (size_t i = 0; i < BITCOIND_NUM_PRIO; i++) {
-		bitcoind->num_requests[i] = 0;
-		list_head_init(&bitcoind->pending[i]);
-	}
-	bitcoind->error_count = 0;
 	bitcoind->retry_timeout = 60;
 	bitcoind->rpcuser = NULL;
 	bitcoind->rpcpass = NULL;
 	bitcoind->rpcconnect = NULL;
 	bitcoind->rpcport = NULL;
-	bitcoind->max_fee_multiplier = 10;
-	bitcoind->commit_fee_percent = 100;
-#if DEVELOPER
-	bitcoind->no_fake_fees = false;
-#endif
+	/* Do not exceed retry_timeout value to avoid a bitcoind hang,
+	   although normal rpcclienttimeout default value is 900. */
+	bitcoind->rpcclienttimeout = 60;
+	bitcoind->dev_no_fake_fees = false;
+	bitcoind->dev_ignore_ibd = false;
 
 	return bitcoind;
 }
@@ -970,55 +887,49 @@ int main(int argc, char *argv[])
 	/* Initialize our global context object here to handle startup options. */
 	bitcoind = new_bitcoind(NULL);
 
-	plugin_main(argv, init, PLUGIN_STATIC, false /* Do not init RPC on startup*/,
+	plugin_main(argv, init, NULL, PLUGIN_STATIC, false /* Do not init RPC on startup*/,
 		    NULL, commands, ARRAY_SIZE(commands),
-		    NULL, 0, NULL, 0,
+		    NULL, 0, NULL, 0, NULL, 0,
 		    plugin_option("bitcoin-datadir",
 				  "string",
 				  "-datadir arg for bitcoin-cli",
-				  charp_option, &bitcoind->datadir),
+				  charp_option, NULL, &bitcoind->datadir),
 		    plugin_option("bitcoin-cli",
 				  "string",
 				  "bitcoin-cli pathname",
-				  charp_option, &bitcoind->cli),
+				  charp_option, NULL, &bitcoind->cli),
 		    plugin_option("bitcoin-rpcuser",
 				  "string",
 				  "bitcoind RPC username",
-				  charp_option, &bitcoind->rpcuser),
+				  charp_option, NULL, &bitcoind->rpcuser),
 		    plugin_option("bitcoin-rpcpassword",
-				  "string",
+				  "string-conceal",
 				  "bitcoind RPC password",
-				  charp_option, &bitcoind->rpcpass),
+				  charp_option, NULL, &bitcoind->rpcpass),
 		    plugin_option("bitcoin-rpcconnect",
 				  "string",
 				  "bitcoind RPC host to connect to",
-				  charp_option, &bitcoind->rpcconnect),
+				  charp_option, NULL, &bitcoind->rpcconnect),
 		    plugin_option("bitcoin-rpcport",
-				  "string",
+				  "int",
 				  "bitcoind RPC host's port",
-				  charp_option, &bitcoind->rpcport),
+				  charp_option, NULL, &bitcoind->rpcport),
+		    plugin_option("bitcoin-rpcclienttimeout",
+				  "int",
+				  "bitcoind RPC timeout in seconds during HTTP requests",
+				  u64_option, u64_jsonfmt, &bitcoind->rpcclienttimeout),
 		    plugin_option("bitcoin-retry-timeout",
-				  "string",
+				  "int",
 				  "how long to keep retrying to contact bitcoind"
 				  " before fatally exiting",
-				  u64_option, &bitcoind->retry_timeout),
-		    plugin_option("commit-fee",
-				  "string",
-				  "Percentage of fee to request for their commitment",
-				  u64_option, &bitcoind->commit_fee_percent),
-#if DEVELOPER
-		    plugin_option("dev-max-fee-multiplier",
-				  "string",
-				  "Allow the fee proposed by the remote end to"
-				  " be up to multiplier times higher than our "
-				  "own. Small values will cause channels to be"
-				  " closed more often due to fee fluctuations,"
-				  " large values may result in large fees.",
-				  u32_option, &bitcoind->max_fee_multiplier),
-		    plugin_option("dev-no-fake-fees",
-				  "bool",
-				  "Suppress fee faking for regtest",
-				  bool_option, &bitcoind->no_fake_fees),
-#endif /* DEVELOPER */
+				  u64_option, u64_jsonfmt, &bitcoind->retry_timeout),
+		    plugin_option_dev("dev-no-fake-fees",
+				      "bool",
+				      "Suppress fee faking for regtest",
+				      bool_option, NULL, &bitcoind->dev_no_fake_fees),
+		    plugin_option_dev("dev-ignore-ibd",
+				      "bool",
+				      "Never tell lightningd we're doing initial block download",
+				      bool_option, NULL, &bitcoind->dev_ignore_ibd),
 		    NULL);
 }

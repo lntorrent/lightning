@@ -1,19 +1,9 @@
+#include "config.h"
 #include <common/bech32.h>
-#include <common/hash_u5.h>
 #include <common/json_command.h>
-#include <common/json_helpers.h>
-#include <common/jsonrpc_errors.h>
-#include <common/param.h>
-#include <common/type_to_string.h>
-#include <common/utils.h>
-#include <errno.h>
-#include <gossipd/gossipd_wiregen.h>
 #include <hsmd/hsmd_wiregen.h>
-#include <lightningd/jsonrpc.h>
-#include <lightningd/lightningd.h>
-#include <lightningd/subd.h>
-#include <string.h>
-#include <wire/wire_sync.h>
+#include <lightningd/hsm_control.h>
+#include <lightningd/plugin.h>
 
 /* These tables copied from zbase32 src:
  * copyright 2002-2007 Zooko "Zooko" Wilcox-O'Hearn
@@ -61,8 +51,7 @@ static const u8 *from_zbase32(const tal_t *ctx, const char *msg)
 	if (!bech32_convert_bits(u8arr, &len, 8,
 				 u5arr, tal_bytelen(u5arr), 5, false))
 		return tal_free(u8arr);
-	assert(len == tal_bytelen(u8arr));
-	return u8arr;
+	return len == tal_bytelen(u8arr) ? u8arr : tal_free(u8arr);
 }
 
 static struct command_result *json_signmessage(struct command *cmd,
@@ -73,25 +62,26 @@ static struct command_result *json_signmessage(struct command *cmd,
 	const char *message;
 	secp256k1_ecdsa_recoverable_signature rsig;
 	struct json_stream *response;
-	u8 sig[65], *msg;
+	u8 sig[65];
+	const u8 *msg;
 	int recid;
 
-	if (!param(cmd, buffer, params,
-		   p_req("message", param_string, &message),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("message", param_string, &message),
+			 NULL))
 		return command_param_failed();
 
 	if (strlen(message) > 65535)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Message must be < 64k");
 
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
 	msg = towire_hsmd_sign_message(NULL,
 				      tal_dup_arr(tmpctx, u8, (u8 *)message,
 						  strlen(message), 0));
-	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
-		fatal("Could not write to HSM: %s", strerror(errno));
-
-	msg = wire_sync_read(tmpctx, cmd->ld->hsm_fd);
+	msg = hsm_sync_req(tmpctx, cmd->ld, take(msg));
 	if (!fromwire_hsmd_sign_message_reply(msg, &rsig))
 		fatal("HSM gave bad hsm_sign_message_reply %s",
 		      tal_hex(msg, msg));
@@ -118,9 +108,7 @@ static struct command_result *json_signmessage(struct command *cmd,
 
 static const struct json_command json_signmessage_cmd = {
 	"signmessage",
-	"utility",
 	json_signmessage,
-	"Create a digital signature of {message}",
 };
 AUTODATA(json_command, &json_signmessage_cmd);
 
@@ -129,24 +117,31 @@ struct command_and_node {
 	struct node_id id;
 };
 
-/* Gossipd tells us if it's a known node by returning details. */
-static void getnode_reply(struct subd *gossip UNUSED, const u8 *reply,
-			  const int *fds UNUSED,
-			  struct command_and_node *can)
+/* topology tells us if it's a known node by returning details. */
+static void listnodes_done(const char *buffer,
+			   const jsmntok_t *toks,
+			   const jsmntok_t *idtok UNUSED,
+			   struct command_and_node *can)
 {
-	struct gossip_getnodes_entry **nodes;
 	struct json_stream *response;
+	const jsmntok_t *t;
 
-	if (!fromwire_gossipd_getnodes_reply(reply, reply, &nodes)) {
-		log_broken(can->cmd->ld->log,
-			   "Malformed gossip_getnodes response %s",
-			   tal_hex(tmpctx, reply));
-		nodes = NULL;
+	t = json_get_member(buffer, toks, "result");
+	if (t)
+		t = json_get_member(buffer, t, "nodes");
+
+	if (!t || t->size == 0) {
+		response = json_stream_fail(can->cmd,
+					    SIGNMESSAGE_PUBKEY_NOT_FOUND,
+					    "pubkey not found in the graph");
+		json_add_node_id(response, "claimed_key", &can->id);
+		json_object_end(response);
+		was_pending(command_failed(can->cmd, response));
+		return;
 	}
-
 	response = json_stream_success(can->cmd);
 	json_add_node_id(response, "pubkey", &can->id);
-	json_add_bool(response, "verified", tal_count(nodes) > 0);
+	json_add_bool(response, "verified", t && t->size == 1);
 	was_pending(command_success(can->cmd, response));
 }
 
@@ -163,10 +158,10 @@ static struct command_result *json_checkmessage(struct command *cmd,
 	struct sha256_double shad;
 	struct json_stream *response;
 
-	if (!param(cmd, buffer, params,
-		   p_req("message", param_string, &message),
-		   p_req("zbase", param_string, &zb),
-		   p_opt("pubkey", param_pubkey, &pubkey),
+	if (!param_check(cmd, buffer, params,
+			 p_req("message", param_string, &message),
+			 p_req("zbase", param_string, &zb),
+			 p_opt("pubkey", param_pubkey, &pubkey),
 		   NULL))
 		return command_param_failed();
 
@@ -186,6 +181,9 @@ static struct command_result *json_checkmessage(struct command *cmd,
 								 u8sig[0] - 31))
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "cannot parse zbase signature");
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
 
 	sha256_update(&sctx, "Lightning Signed Message:",
 		      strlen("Lightning Signed Message:"));
@@ -207,27 +205,37 @@ static struct command_result *json_checkmessage(struct command *cmd,
 	 * make two (different) signed messages with the same recovered key
 	 * unless you know the secret key */
 	if (!pubkey) {
-		u8 *req;
+		struct jsonrpc_request *req;
+		struct plugin *plugin;
 		struct command_and_node *can = tal(cmd, struct command_and_node);
 
 		node_id_from_pubkey(&can->id, &reckey);
 		can->cmd = cmd;
-		req = towire_gossipd_getnodes_request(cmd, &can->id);
-		subd_req(cmd, cmd->ld->gossip, req, -1, 0, getnode_reply, can);
-		return command_still_pending(cmd);
+
+		/* Only works if we have listnodes! */
+		plugin = find_plugin_for_command(cmd->ld, "listnodes");
+		if (plugin) {
+			req = jsonrpc_request_start(cmd, "listnodes",
+						    cmd->id,
+						    command_logger(cmd),
+						    NULL, listnodes_done,
+						    can);
+			json_add_node_id(req->stream, "id", &can->id);
+			jsonrpc_request_end(req);
+			plugin_request_send(plugin, req);
+			return command_still_pending(cmd);
+		}
 	}
 
 	response = json_stream_success(cmd);
 	json_add_pubkey(response, "pubkey", &reckey);
-	json_add_bool(response, "verified", pubkey_eq(pubkey, &reckey));
+	json_add_bool(response, "verified",
+		      pubkey && pubkey_eq(pubkey, &reckey));
 	return command_success(cmd, response);
 }
 
 static const struct json_command json_checkmessage_cmd = {
 	"checkmessage",
-	"utility",
 	json_checkmessage,
-	"Verify a digital signature {zbase} of {message} signed with {pubkey}",
 };
 AUTODATA(json_command, &json_checkmessage_cmd);
-

@@ -1,30 +1,29 @@
 #ifndef LIGHTNING_LIGHTNINGD_LIGHTNINGD_H
 #define LIGHTNING_LIGHTNINGD_LIGHTNINGD_H
 #include "config.h"
-#include <bitcoin/chainparams.h>
-#include <bitcoin/privkey.h>
-#include <ccan/container_of/container_of.h>
-#include <ccan/strmap/strmap.h>
-#include <ccan/time/time.h>
-#include <ccan/timer/timer.h>
+#include <ccan/ccan/opt/opt.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/htlc_set.h>
-#include <lightningd/plugin.h>
-#include <stdio.h>
+#include <lightningd/options.h>
+#include <lightningd/peer_control.h>
+#include <lightningd/wait.h>
+#include <signal.h>
 #include <sys/stat.h>
-#include <wallet/txfilter.h>
 #include <wallet/wallet.h>
+
+struct amount_msat;
+struct watchman;
 
 /* Various adjustable things. */
 struct config {
 	/* How long do we want them to lock up their funds? (blocks) */
 	u32 locktime_blocks;
 
-	/* How long do we let them lock up our funds? (blocks) */
-	u32 locktime_max;
+	/* How long do we let them lock up our funds? (blocks: 2016 by spec) */
+	u32 max_htlc_cltv;
 
-	/* How many confirms until we consider an anchor "settled". */
-	u32 anchor_confirms;
+	/* How many confirms until we consider a funding tx "settled". */
+	u32 funding_confirms;
 
 	/* Minimum CLTV to subtract from incoming HTLCs to outgoing */
 	u32 cltv_expiry_delta;
@@ -38,6 +37,13 @@ struct config {
 
 	/* htlcs per channel */
 	u32 max_concurrent_htlcs;
+
+	/* htlc min/max values */
+	struct amount_msat htlc_minimum_msat;
+	struct amount_msat htlc_maximum_msat;
+
+	/* Max amount of dust allowed per channel */
+	struct amount_msat max_dust_htlc_exposure_msat;
 
 	/* How long between changing commit and sending COMMIT message. */
 	u32 commit_time_ms;
@@ -55,32 +61,57 @@ struct config {
 	/* Are we allowed to use DNS lookup for peers. */
 	bool use_dns;
 
+	/* Excplicitly turns 'on' or 'off' IP discovery feature. */
+	enum opt_autobool ip_discovery;
+
+	/* Public TCP port assumed for IP discovery. Defaults to chainparams. */
+	u32 ip_discovery_port;
+
 	/* Minimal amount of effective funding_satoshis for accepting channels */
 	u64 min_capacity_sat;
-
-	/* Allow to define the default behavior of tor services calls*/
-	bool use_v3_autotor;
-
-	/* This is the key we use to encrypt `hsm_secret`. */
-	struct secret *keypass;
 
 	/* How long before we give up waiting for INIT msg */
 	u32 connection_timeout_secs;
 
-	/* EXPERIMENTAL: offers support */
-	bool exp_offers;
+	/* Allow dust reserves (including 0) when being called via
+	 * `fundchannel` or in the `openchannel` hook. This is a
+	 * slight spec incompatibility, but implementations do this
+	 * already. */
+	bool allowdustreserve;
+
+	/* Require peer to send confirmed inputs */
+	bool require_confirmed_inputs;
+
+	/* The factor to time the urgent feerate by to get the maximum
+	 * acceptable feerate.  (10, but can be overridden by dev-max-fee-multiplier) */
+	u32 max_fee_multiplier;
+
+	/* Percent of CONSERVATIVE/2 feerate we'll use for commitment txs. */
+	u64 commit_fee_percent;
+
+	/* Commit feerate offset above min_feerate to use as a channel opener */
+	u32 feerate_offset;
 };
 
 typedef STRMAP(const char *) alt_subdaemon_map;
 
 enum lightningd_state {
+	/* Starting up */
+	LD_STATE_INITIALIZING,
+	/* Normal */
 	LD_STATE_RUNNING,
+	/* Waiting for graceful shutdown */
+	LD_STATE_GRACE,
+	/* Shutting down */
 	LD_STATE_SHUTDOWN,
 };
 
 struct lightningd {
 	/* The directory to find all the subdaemons. */
-	const char *daemon_dir;
+	const char *subdaemon_dir;
+
+	/* Are deprecated APIs enabled? */
+	bool deprecated_ok;
 
 	/* If we told to run in the background, this is our parent fd, otherwise
 	 * -1. */
@@ -88,6 +119,9 @@ struct lightningd {
 
 	/* Our config basedir, network directory, and rpc file */
 	char *config_basedir, *config_netdir;
+
+	/* Where setconfig() should write to (or NULL if not set up yet) */
+	char *setconfig_file;
 
 	/* Location of the RPC socket. */
 	char *rpc_filename;
@@ -100,22 +134,31 @@ struct lightningd {
 	 * transaction. */
 	struct jsonrpc *jsonrpc;
 
+	/* --developer? */
+	bool developer;
+
 	/* Configuration file name */
 	char *config_filename;
 	/* Configuration settings. */
 	struct config config;
+	/* Where each configuration setting came from */
+	struct configvar **configvars;
 
-	/* This log_book is owned by all the struct logs */
+	/* This log_book is owned by all the struct loggers */
 	struct log_book *log_book;
 	/* Log for general stuff. */
-	struct log *log;
-	const char *logfile;
+	struct logger *log;
+	const char **logfiles;
 
-	/* This is us. */
-	struct node_id id;
+	/* This is us, in both node_id and pubkey form */
+	struct node_id our_nodeid;
+	struct pubkey our_pubkey;
 
-	/* The public base for our payer_id keys */
-	struct pubkey32 bolt12_base;
+	/* Secret base for our invoices. */
+	struct secret invoicesecret_base;
+
+	/* Secret base for node aliases  */
+	struct secret nodealias_base;
 
 	/* Feature set we offer. */
 	struct feature_set *our_features;
@@ -133,6 +176,9 @@ struct lightningd {
 	/* Do we want to reconnect to other peers? */
 	bool reconnect;
 
+	/* Do we want to reconnect to other peers having only unannouced channels with us? */
+	bool reconnect_private;
+
 	/* Do we want to listen for other peers? */
 	bool listen;
 
@@ -144,9 +190,19 @@ struct lightningd {
 	/* Setup: And the bitset for each, whether to listen, announce or both */
 	enum addr_listen_announce *proposed_listen_announce;
 
-	/* Actual bindings and announcables from gossipd */
+	/* Actual bindings and announceables from connectd */
 	struct wireaddr_internal *binding;
-	struct wireaddr *announcable;
+	struct wireaddr *announceable;
+
+	/* Current node announcement (if any) */
+	const u8 *node_announcement;
+
+	/* Lease rates to advertize, set by json_setleaserates */
+	struct lease_rates *lease_rates;
+
+	/* Popular discovered IPs to be used for announcement */
+	const struct wireaddr *discovered_ip_v4;
+	const struct wireaddr *discovered_ip_v6;
 
 	/* Bearer of all my secrets. */
 	int hsm_fd;
@@ -158,8 +214,15 @@ struct lightningd {
 	/* Daemon looking after peers during init / before channel. */
 	struct subd *connectd;
 
-	/* All peers we're tracking. */
-	struct list_head peers;
+	/* All peers we're tracking (by node_id) */
+	struct peer_node_id_map *peers;
+	/* And those in database by dbid */
+	struct peer_dbid_map *peers_by_dbid;
+	/* Here are all our channels and their aliases */
+	struct channel_scid_map *channels_by_scid;
+
+	/* Open channels by dbid */
+	struct channel_dbid_map *channels_by_dbid;
 
 	/* Outstanding connect commands. */
 	struct list_head connects;
@@ -167,29 +230,40 @@ struct lightningd {
 	/* Our chain topology. */
 	struct chain_topology *topology;
 
+	/* Blockheight (as acknowledged by gossipd) */
+	u32 gossip_blockheight;
+
 	/* HTLCs in flight. */
-	struct htlc_in_map htlcs_in;
-	struct htlc_out_map htlcs_out;
+	struct htlc_in_map *htlcs_in;
+	struct htlc_out_map *htlcs_out;
 
 	/* Sets of HTLCs we are holding onto for MPP. */
-	struct htlc_set_map htlc_sets;
+	struct htlc_set_map *htlc_sets;
 
+	/* Derive all our keys from here (see bip32_pubkey) */
+	struct ext_key *bip32_base;
+	/* Derive all our BIP86 keys from here */
+	struct ext_key *bip86_base;
 	struct wallet *wallet;
+	struct watchman *watchman;
 
 	/* Outstanding waitsendpay commands. */
 	struct list_head waitsendpay_commands;
-	/* Outstanding sendpay commands. */
-	struct list_head sendpay_commands;
 	/* Outstanding close commands. */
 	struct list_head close_commands;
 	/* Outstanding ping commands. */
 	struct list_head ping_commands;
+	/* Outstanding disconnect commands. */
+	struct list_head disconnect_commands;
+	/* Outstanding wait commands */
+	struct list_head wait_commands;
+	/* Outstanding graceful commands */
+	struct list_head graceful_commands;
+	/* Outstanding splice commands. */
+	struct list_head splice_commands;
 
 	/* Maintained by invoices.c */
 	struct invoices *invoices;
-
-	/* Transaction filter matching what we're interested in */
-	struct txfilter *owned_txfilter;
 
 	/* PID file */
 	char *pidfile;
@@ -199,9 +273,33 @@ struct lightningd {
 	/* RPC response to send once we've shut down. */
 	const char *stop_response;
 
-#if DEVELOPER
+	/* All the subdaemons. */
+	struct list_head subds;
+
+	/* Used these feerates instead of whatever bcli returns (up to
+	 * FEERATE_PENALTY). */
+	u32 *force_feerates;
+
+	/* If they force db upgrade on or off this is set. */
+	bool *db_upgrade_ok;
+
+	/* Indexes used by all the wait infra */
+	struct indexes indexes[NUM_WAIT_SUBSYSTEM];
+
+	/* Contains the codex32 string used with --recover flag */
+	char *recover;
+
+	/* Any channels which are already closed */
+	struct closed_channel_map *closed_channels;
+
+	/* 2, unless overridden by --dev-fd-limit-multiplier */
+	u32 fd_limit_multiplier;
+
 	/* If we want to debug a subdaemon/plugin. */
-	const char *dev_debug_subprocess;
+	char *dev_debug_subprocess;
+
+	/* If we have --dev-no-plugin-checksum */
+	bool dev_no_plugin_checksum;
 
 	/* If we have a --dev-disconnect file */
 	int dev_disconnect_fd;
@@ -212,15 +310,21 @@ struct lightningd {
 	/* Allow and accept localhost node_announcement addresses */
 	bool dev_allow_localhost;
 
-	/* Timestamp to use for gossipd, iff non-zero */
-	u32 dev_gossip_time;
-
 	/* Speedup gossip propagation, for testing. */
 	bool dev_fast_gossip;
 	bool dev_fast_gossip_prune;
+	bool dev_throttle_gossip;
+	u32 dev_gossip_cpu_budget;
+	bool dev_suppress_gossip;
 
-	/* Things we've marked as not leaking. */
-	const void **notleaks;
+	/* How long to aim for low-priority commitment closes */
+	u32 dev_low_prio_anchor_blocks;
+
+	/* Speedup reconnect delay, for testing. */
+	bool dev_fast_reconnect;
+
+	/* Reject every closing fee the peer offers. */
+	bool dev_reject_closing_fee;
 
 	/* This is the forced private key for the node. */
 	struct privkey *dev_force_privkey;
@@ -243,11 +347,47 @@ struct lightningd {
 	/* Number of blocks we wait for a channel to get funded
 	 * if we are the fundee. */
 	u32 dev_max_funding_unconfirmed;
-#endif /* DEVELOPER */
+
+	/* Seconds a peer's dual-funded open (or RBF) has to reach
+	 * commitment_signed. */
+	u32 dev_max_dualopen_negotiation_secs;
+
+	/* Special switches to test onion compatibility */
+	bool dev_ignore_modern_onion;
+
+	/* Tell channeld to disable commits after this many. */
+	int dev_disable_commit;
+
+	/* Tell channeld not to worry about pings. */
+	bool dev_no_ping_timer;
+
+	/* Tell openingd/dualopend to accept all, allow sending any. */
+	bool dev_any_channel_type;
+
+	/* Allow changing of shutdown output point even if dangerous */
+	bool dev_allow_shutdown_destination_change;
+
+	/* hsmd characteristic tweaks */
+	bool dev_hsmd_no_preapprove_check;
+	bool dev_hsmd_fail_preapprove;
+	bool dev_hsmd_warn_on_overgrind;
+
+	/* Tell connectd not to talk after handshake */
+	bool dev_handshake_no_reply;
+
+	/* Remove the freedom to choose select between parallel channels to
+	 * forward a payment. */
+	bool dev_strict_forwarding;
+
+	/* Tell connectd to block more than 1 simultanous connection attempt */
+	bool dev_limit_connections_inflight;
+
+	/* Tell connectd we don't want TCP_NODELAY */
+	bool dev_keep_nagle;
 
 	/* tor support */
 	struct wireaddr *proxyaddr;
-	bool use_proxy_always;
+	bool always_use_proxy;
 	char *tor_service_password;
 	bool pure_tor_setup;
 
@@ -255,7 +395,15 @@ struct lightningd {
 
 	char *wallet_dsn;
 
-	bool encrypted_hsm;
+	/* For migration from old accounts.db */
+	char *old_bookkeeper_dir;
+	char *old_bookkeeper_db;
+
+	/* HSM passphrase for any format that needs it */
+	char *hsm_passphrase;
+
+	/* What (additional) messages the HSM accepts */
+	u32 *hsm_capabilities;
 
 	mode_t initial_umask;
 
@@ -275,6 +423,36 @@ struct lightningd {
 
 	/* The round-robin list of channels, for use when doing MPP.  */
 	u64 rr_counter;
+
+	/* Should we re-exec ourselves instead of just exiting? */
+	bool try_reexec;
+	/* If set, we are to restart and recover with this secret */
+	const char *recover_secret;
+
+	/* Array of (even) TLV types that we should allow. This is required
+	 * since we otherwise would outright reject them. */
+	u64 *accept_extra_tlv_types;
+
+	/* --invoices-onchain-fallback */
+	bool unified_invoices;
+
+	/* For anchors: how much do we keep for spending close txs? */
+	struct amount_sat emergency_sat;
+
+	/* runes! */
+	struct runes *runes;
+
+	/* Explicitly re-enabled deprecated APIs. */
+	const char **api_begs;
+
+	/* Minimum number of peers seeker should maintain. */
+	u32 autoconnect_seeker_peers;
+
+	/* Nodes to use for invoices / offers */
+	struct node_id *fronting_nodes;
+
+	/* Whether connectd should pad messages to make them equal length */
+	bool message_padding;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.
@@ -291,7 +469,7 @@ const char *subdaemon_path(const tal_t *ctx, const struct lightningd *ld, const 
 void test_subdaemons(const struct lightningd *ld);
 
 /* Notify lightningd about new blocks. */
-void notify_new_block(struct lightningd *ld, u32 block_height);
+void notify_new_block(struct lightningd *ld);
 
 /* Signal a clean exit from lightningd.
  * NOTE! This function **returns**.
@@ -299,5 +477,24 @@ void notify_new_block(struct lightningd *ld, u32 block_height);
  * all the way to the main loop for `lightningd` to exit.
  */
 void lightningd_exit(struct lightningd *ld, int exit_code);
+
+/* Should we accept them using this deprecated API?  (add details to
+ * log msg if non-NULL) */
+bool lightningd_deprecated_in_ok(struct lightningd *ld,
+				 struct logger *log,
+				 bool deprecated_apis,
+				 const char *subsys,
+				 const char *api,
+				 const char *start,
+				 const char *end,
+				 const char *details);
+
+/* Should we output this deprecated field? */
+bool lightningd_deprecated_out_ok(struct lightningd *ld,
+				  bool deprecated_apis,
+				  const char *subsys,
+				  const char *api,
+				  const char *start,
+				  const char *end);
 
 #endif /* LIGHTNING_LIGHTNINGD_LIGHTNINGD_H */

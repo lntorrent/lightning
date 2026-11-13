@@ -2,12 +2,15 @@
 #define LIGHTNING_LIGHTNINGD_CHANNEL_STATE_H
 #include "config.h"
 
-#include <ccan/time/time.h>
 
 /* These are in the database, so don't renumber them! */
 enum channel_state {
+	/* For dual-funded channels: goes to DUALOPEND_OPEN_COMMITTED
+	 * after sigs have been exchanged */
+	DUALOPEND_OPEN_INIT = 1,
+
 	/* In channeld, still waiting for lockin. */
-	CHANNELD_AWAITING_LOCKIN = 2,
+	CHANNELD_AWAITING_LOCKIN,
 
 	/* Normal operating state. */
 	CHANNELD_NORMAL,
@@ -33,16 +36,22 @@ enum channel_state {
 	/* Final state after we have fully settled on-chain */
 	CLOSED,
 
-	/* For dual-funded channels, we start at a different state.
-	 * We transition to 'awaiting lockin' after sigs have
-	 * been exchanged */
-	DUALOPEND_OPEN_INIT,
+	/* Dual-funded initialized and committed. */
+	DUALOPEND_OPEN_COMMITTED,
 
 	/* Dual-funded channel, waiting for lock-in */
 	DUALOPEND_AWAITING_LOCKIN,
-};
-#define CHANNEL_STATE_MAX DUALOPEND_AWAITING_LOCKIN
 
+	/* Channel has started splice and is awaiting lock-in */
+	CHANNELD_AWAITING_SPLICE,
+
+	/* Dual-funded channel initial commitment ready */
+	DUALOPEND_OPEN_COMMIT_READY,
+
+};
+#define CHANNEL_STATE_MAX DUALOPEND_OPEN_COMMIT_READY
+
+/* These are in the database, so don't renumber them! */
 enum state_change {
 	/* Anything other than the reasons below. Should not happen. */
 	REASON_UNKNOWN,
@@ -63,13 +72,4 @@ enum state_change {
 	/* Note: This is very likely a conscious remote decision. */
 	REASON_ONCHAIN
 };
-
-struct state_change_entry {
-	struct timeabs timestamp;
-	enum channel_state old_state;
-	enum channel_state new_state;
-	enum state_change cause;
-	char *message;
-};
-
 #endif /* LIGHTNING_LIGHTNINGD_CHANNEL_STATE_H */

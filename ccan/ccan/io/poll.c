@@ -121,7 +121,9 @@ bool add_listener(struct io_listener *l)
 
 static int find_always(const struct io_plan *plan)
 {
-	for (size_t i = 0; i < num_always; i++)
+	size_t i = 0;
+
+	for (i = 0; i < num_always; i++)
 		if (always[i] == plan)
 			return i;
 	return -1;
@@ -268,10 +270,12 @@ static void accept_conn(struct io_listener *l)
 {
 	int fd = accept(l->fd.fd, NULL, NULL);
 
-	/* FIXME: What to do here? */
-	if (fd < 0)
+	if (fd < 0) {
+		/* If they've enabled it, this is how we tell them */
+		if (io_get_extended_errors())
+			l->init(NULL, l->arg);
 		return;
-
+	}
 	io_new_conn(l->ctx, fd, l->init, l->arg);
 }
 
@@ -287,8 +291,10 @@ static bool *exclusive(struct io_plan *plan)
 /* For simplicity, we do one always at a time */
 static bool handle_always(void)
 {
+	int i;
+
 	/* Backwards is simple easier to remove entries */
-	for (int i = num_always - 1; i >= 0; i--) {
+	for (i = num_always - 1; i >= 0; i--) {
 		struct io_plan *plan = always[i];
 
 		if (num_exclusive && !*exclusive(plan))
@@ -301,6 +307,18 @@ static bool handle_always(void)
 		return true;
 	}
 
+	return false;
+}
+
+/* Is there an always plan we can actually run right now? */
+static bool always_runnable(void)
+{
+	size_t i;
+
+	for (i = 0; i < num_always; i++) {
+		if (!num_exclusive || *exclusive(always[i]))
+			return true;
+	}
 	return false;
 }
 
@@ -323,10 +341,12 @@ bool backend_set_exclusive(struct io_plan *plan, bool excl)
  * else that we manipulate events. */
 static void exclude_pollfds(void)
 {
+	size_t i;
+
 	if (num_exclusive == 0)
 		return;
 
-	for (size_t i = 0; i < num_fds; i++) {
+	for (i = 0; i < num_fds; i++) {
 		struct pollfd *pfd = &pollfds[fds[i]->backend_info];
 
 		if (!fds[i]->exclusive[IO_IN])
@@ -343,10 +363,12 @@ static void exclude_pollfds(void)
 
 static void restore_pollfds(void)
 {
+	size_t i;
+
 	if (num_exclusive == 0)
 		return;
 
-	for (size_t i = 0; i < num_fds; i++) {
+	for (i = 0; i < num_fds; i++) {
 		struct pollfd *pfd = &pollfds[fds[i]->backend_info];
 
 		if (fds[i]->listener) {
@@ -363,6 +385,8 @@ static void restore_pollfds(void)
 void *io_loop(struct timers *timers, struct timer **expired)
 {
 	void *ret;
+	/* This ensures we don't always service lower fds first */
+	static size_t fairness_counter;
 
 	/* if timers is NULL, expired must be.  If not, not. */
 	assert(!timers == !expired);
@@ -374,17 +398,12 @@ void *io_loop(struct timers *timers, struct timer **expired)
 	while (!io_loop_return) {
 		int i, r, ms_timeout = -1;
 
-		if (handle_always()) {
-			/* Could have started/finished more. */
-			continue;
-		}
-
 		/* Everything closed? */
 		if (num_fds == 0)
 			break;
 
 		/* You can't tell them all to go to sleep! */
-		assert(num_waiting);
+		assert(num_waiting || num_always);
 
 		if (timers) {
 			struct timemono now, first;
@@ -407,6 +426,10 @@ void *io_loop(struct timers *timers, struct timer **expired)
 			}
 		}
 
+		/* Don't wait if we have always requests pending! */
+		if (always_runnable())
+			ms_timeout = 0;
+
 		/* We do this temporarily, assuming exclusive is unusual */
 		exclude_pollfds();
 		r = pollfn(pollfds, num_fds, ms_timeout);
@@ -420,22 +443,49 @@ void *io_loop(struct timers *timers, struct timer **expired)
 			break;
 		}
 
-		for (i = 0; i < num_fds && !io_loop_return; i++) {
-			struct io_conn *c = (void *)fds[i];
-			int events = pollfds[i].revents;
+		fairness_counter++;
+		for (size_t rotation = 0; rotation < num_fds && !io_loop_return; rotation++) {
+			socklen_t errno_len = sizeof(errno);
+			struct io_conn *c;
+			int events;
+
+			i = (rotation + fairness_counter) % num_fds;
+			c = (void *)fds[i];
 
 			/* Clear so we don't get confused if exclusive next time */
+			events = pollfds[i].revents;
 			pollfds[i].revents = 0;
 
-			if (r == 0)
+			/* Timeout? */
+			if (r == 0) {
+				handle_always();
 				break;
+			}
+
+			/* We interleave always before the first fd */
+			if (i == 0 && handle_always()) {
+				/* Could have started/finished more. */
+				break;
+			}
 
 			if (fds[i]->listener) {
 				struct io_listener *l = (void *)fds[i];
 				if (events & POLLIN) {
 					accept_conn(l);
 					r--;
-				} else if (events & (POLLHUP|POLLNVAL|POLLERR)) {
+				} else if (events) {
+					/* We only ever ask for POLLIN here.
+					 * POLLHUP/POLLNVAL/POLLERR cover
+					 * Linux's hangup-on-shutdown case
+					 * (see run-22-POLLHUP-on-listening-
+					 * socket.c), but as with the
+					 * non-listener case below, macOS's
+					 * exact revents combination for
+					 * socket errors/shutdown is known to
+					 * differ from Linux's; don't risk
+					 * falling through both branches (and
+					 * thus never closing the listener) on
+					 * a combination we didn't predict. */
 					r--;
 					errno = EBADF;
 					io_close_listener(l);
@@ -444,9 +494,50 @@ void *io_loop(struct timers *timers, struct timer **expired)
 				r--;
 				io_ready(c, events);
 			} else if (events & (POLLHUP|POLLNVAL|POLLERR)) {
+				/* On `connect` failure, Linux typically
+				 * returns POLLIN|POLLERR. MacOS returns either
+				 * POLLHUP|POLLERR or POLLOUT|POLLHUP depending
+				 * on version, setting the socket error to
+				 * ECONNREFUSED. */
 				r--;
-				errno = EBADF;
+				/* Get fd's specific error to find Mac's
+				 * ECONNREFUSED, among others.  getsockopt()
+				 * doubles as its own error-value buffer here:
+				 * on success &errno receives the socket's
+				 * SO_ERROR; on failure, errno gets set as
+				 * usual by the failed call itself. */
+				if (getsockopt(fds[i]->fd, SOL_SOCKET, SO_ERROR,
+					      &errno, &errno_len) == -1) {
+					if (errno == ENOTSOCK) {
+						/* Not a socket at all (e.g. a
+						 * plain fd or /dev/null added
+						 * via io_new_conn()): there's
+						 * no SO_ERROR to learn here.
+						 * Give the connection's own
+						 * read/write a normal chance
+						 * to run and discover the real
+						 * outcome itself (EOF, a real
+						 * error, or nothing), instead
+						 * of inventing a misleading
+						 * EBADF and closing blind.
+						 *
+						 * events here is only the
+						 * error bits we matched this
+						 * branch on (by construction,
+						 * neither POLLIN nor POLLOUT);
+						 * io_ready() only acts on
+						 * those two bits, so pass what
+						 * we actually asked poll() for
+						 * instead, or it's a same-state
+						 * no-op that spins forever. */
+						io_ready(c, pollfds[i].events);
+						goto next_fd;
+					}
+					errno = EBADF;
+				}
 				io_close(c);
+			next_fd:
+				;
 			}
 		}
 	}
@@ -455,4 +546,16 @@ void *io_loop(struct timers *timers, struct timer **expired)
 	io_loop_return = NULL;
 
 	return ret;
+}
+
+const void *io_have_fd(int fd, bool *listener)
+{
+	for (size_t i = 0; i < num_fds; i++) {
+		if (fds[i]->fd != fd)
+			continue;
+		if (listener)
+			*listener = fds[i]->listener;
+		return fds[i];
+	}
+	return NULL;
 }

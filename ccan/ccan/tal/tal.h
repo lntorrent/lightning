@@ -11,6 +11,14 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
+/* Define this for better optimization if you never override errfn
+ * to something tat returns */
+#ifdef CCAN_TAL_NEVER_RETURN_NULL
+#define TAL_RETURN_PTR RETURNS_NONNULL
+#else
+#define TAL_RETURN_PTR
+#endif /* CCAN_TAL_NEVER_RETURN_NULL */
+
 /**
  * tal_t - convenient alias for void to mark tal pointers.
  *
@@ -135,7 +143,16 @@ void *tal_free(const tal_t *p);
  *
  * This may need to perform an allocation, in which case it may fail; thus
  * it can return NULL, otherwise returns @ptr.  If @ptr is NULL, this function does
- * nothing.
+ * nothing.  It also fails (returning NULL) if @ctx is currently being
+ * destroyed.
+ *
+ * A destructor or TAL_NOTIFY_FREE notifier may use this to rescue @ptr
+ * from destruction by moving it to a new parent; the free is then
+ * aborted.  The rescue is only noticed once every notifier and
+ * destructor registered for this pass has run, so later ones still
+ * fire (and all of them fire again when the object is finally
+ * destroyed).  If the rescue fails (allocation failure), the free
+ * proceeds.
  */
 #if HAVE_STATEMENT_EXPR
 /* Weird macro avoids gcc's 'warning: value computed is not used'. */
@@ -166,7 +183,8 @@ void *tal_free(const tal_t *p);
  *
  * If @function has not been successfully added as a destructor, this returns
  * false.  Note that if we're inside the destructor call itself, this will
- * return false.
+ * return false, and the destructor remains registered: it is restored when
+ * the call returns, in case the object was rescued from destruction.
  */
 #define tal_del_destructor(ptr, function)				      \
 	tal_del_destructor_((ptr), typesafe_cb(void, void *, (function), (ptr)))
@@ -198,7 +216,8 @@ void *tal_free(const tal_t *p);
  *
  * If @function has not been successfully added as a destructor, this returns
  * false.  Note that if we're inside the destructor call itself, this will
- * return false.
+ * return false, and the destructor remains registered: it is restored when
+ * the call returns, in case the object was rescued from destruction.
  */
 #define tal_del_destructor(ptr, function)				      \
 	tal_del_destructor_((ptr), typesafe_cb(void, void *, (function), (ptr)))
@@ -263,6 +282,17 @@ enum tal_notify_type {
  * tal_free()d: @info is the child.  Note that TAL_NOTIFY_DEL_CHILD is
  * not called when this context is tal_free()d: TAL_NOTIFY_FREE is
  * considered sufficient for that case.
+ *
+ * For TAL_NOTIFY_ADD_CHILD, the callback must not tal_free() or
+ * tal_steal() the child: the allocating call will still return it to
+ * the caller, so this will crash or corrupt.
+ *
+ * For TAL_NOTIFY_DEL_CHILD, the child is already unlinked and marked
+ * destroying: calling tal_free() on it from the callback is a no-op,
+ * and tal_steal()ing it rescues it from destruction (aborting the
+ * free).
+ *
+ * In all cases, the callback must not tal_free() @ptr itself.
  *
  * TAL_NOTIFY_ADD_NOTIFIER/TAL_NOTIFIER_DEL_NOTIFIER are called when a
  * notifier is added or removed (not for this notifier): @info is the
@@ -352,10 +382,21 @@ tal_t *tal_parent(const tal_t *ctx);
  * tal_dup - duplicate an object.
  * @ctx: The tal allocated object to be parent of the result (may be NULL).
  * @type: the type (should match type of @p!)
- * @p: the object to copy (or reparented if take())
+ * @p: the object to copy (or reparented if take()).  Must not be NULL.
  */
 #define tal_dup(ctx, type, p)					\
-	tal_dup_label(ctx, type, p, TAL_LABEL(type, ""))
+	tal_dup_label(ctx, type, p, TAL_LABEL(type, ""), false)
+
+/**
+ * tal_dup_or_null - duplicate an object, or just pass NULL.
+ * @ctx: The tal allocated object to be parent of the result (may be NULL).
+ * @type: the type (should match type of @p!)
+ * @p: the object to copy (or reparented if take())
+ *
+ * if @p is NULL, just return NULL, otherwise to tal_dup().
+ */
+#define tal_dup_or_null(ctx, type, p)					\
+	tal_dup_label(ctx, type, p, TAL_LABEL(type, ""), true)
 
 /**
  * tal_dup_arr - duplicate an array.
@@ -369,7 +410,17 @@ tal_t *tal_parent(const tal_t *ctx);
 	tal_dup_arr_label(ctx, type, p, n, extra, TAL_LABEL(type, "[]"))
 
 
-
+/**
+ * tal_dup_arr - duplicate a tal array.
+ * @ctx: The tal allocated object to be parent of the result (may be NULL).
+ * @type: the type (should match type of @p!)
+ * @p: the tal array to copy (or resized & reparented if take())
+ *
+ * The comon case of duplicating an entire tal array.
+ */
+#define tal_dup_talarr(ctx, type, p)					\
+	((type *)tal_dup_talarr_((ctx), tal_typechk_(p, type *),	\
+				 TAL_LABEL(type, "[]")))
 /* Lower-level interfaces, where you want to supply your own label string. */
 #define tal_label(ctx, type, label)						\
 	((type *)tal_alloc_((ctx), sizeof(type), false, label))
@@ -379,13 +430,13 @@ tal_t *tal_parent(const tal_t *ctx);
 	((type *)tal_alloc_arr_((ctx), sizeof(type), (count), false, label))
 #define tal_arrz_label(ctx, type, count, label)					\
 	((type *)tal_alloc_arr_((ctx), sizeof(type), (count), true, label))
-#define tal_dup_label(ctx, type, p, label)			\
+#define tal_dup_label(ctx, type, p, label, nullok)			\
 	((type *)tal_dup_((ctx), tal_typechk_(p, type *),	\
-			  sizeof(type), 1, 0,			\
+			  sizeof(type), 1, 0, nullok,		\
 			  label))
 #define tal_dup_arr_label(ctx, type, p, n, extra, label)	\
 	((type *)tal_dup_((ctx), tal_typechk_(p, type *),	\
-			  sizeof(type), (n), (extra),		\
+			  sizeof(type), (n), (extra), false,	\
 			  label))
 
 /**
@@ -396,7 +447,8 @@ tal_t *tal_parent(const tal_t *ctx);
  * @error_fn: called on errors or NULL (default is abort)
  *
  * The defaults are set up so tal functions never return NULL, but you
- * can override erorr_fn to change that.  error_fn can return, and is
+ * can override error_fn to change that.  error_fn can return (only if
+ * you haven't defined CCAN_TAL_NEVER_RETURN_NULL!), and is
  * called if alloc_fn or resize_fn fail.
  *
  * If any parameter is NULL, that function is unchanged.
@@ -456,7 +508,7 @@ bool tal_check(const tal_t *ctx, const char *errorstr);
 
 #ifdef CCAN_TAL_DEBUG
 /**
- * tal_dump - dump entire tal tree.
+ * tal_dump - dump entire tal tree to stderr.
  *
  * This is a helper for debugging tal itself, which dumps all the tal internal
  * state.
@@ -500,12 +552,16 @@ bool tal_set_name_(tal_t *ctx, const char *name, bool literal);
 #define tal_typechk_(ptr, ptype) (ptr)
 #endif
 
-void *tal_alloc_(const tal_t *ctx, size_t bytes, bool clear, const char *label);
+void *tal_alloc_(const tal_t *ctx, size_t bytes, bool clear, const char *label)
+	TAL_RETURN_PTR;
 void *tal_alloc_arr_(const tal_t *ctx, size_t bytes, size_t count, bool clear,
-		     const char *label);
+		     const char *label)
+	TAL_RETURN_PTR;
 
 void *tal_dup_(const tal_t *ctx, const void *p TAKES, size_t size,
-	       size_t n, size_t extra, const char *label);
+	       size_t n, size_t extra, bool nullok, const char *label);
+void *tal_dup_talarr_(const tal_t *ctx, const tal_t *src TAKES,
+		      const char *label);
 
 tal_t *tal_steal_(const tal_t *new_parent, const tal_t *t);
 

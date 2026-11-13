@@ -1,3 +1,4 @@
+#include "config.h"
 #include <common/derive_basepoints.h>
 #include <common/key_derive.h>
 #include <common/keyset.h>
@@ -16,12 +17,11 @@ bool derive_keyset(const struct pubkey *per_commitment_point,
 	 *
 	 *	pubkey = basepoint + SHA256(per_commitment_point || basepoint) * G
 	 *
-	 * The `localpubkey` uses the local node's `payment_basepoint`;
- * The `remotepubkey` uses the remote node's `payment_basepoint`;
-	 * the `local_htlcpubkey` uses the local node's `htlc_basepoint`;
-	 * the `remote_htlcpubkey` uses the remote node's `htlc_basepoint`;
-	 * the `local_delayedpubkey` uses the local node's `delayed_payment_basepoint`;
-	 * and the `remote_delayedpubkey` uses the remote node's `delayed_payment_basepoint`.
+	 * - The `localpubkey` uses the local node's `payment_basepoint`;
+	 * - The `local_htlcpubkey` uses the local node's `htlc_basepoint`;
+	 * - The `remote_htlcpubkey` uses the remote node's `htlc_basepoint`;
+	 * - The `local_delayedpubkey` uses the local node's `delayed_payment_basepoint`;
+	 * - The `remote_delayedpubkey` uses the remote node's `delayed_payment_basepoint`.
 	 */
 	if (!derive_simple_key(&self->payment,
 			       per_commitment_point,
@@ -32,7 +32,12 @@ bool derive_keyset(const struct pubkey *per_commitment_point,
 	 *
 	 * ### `remotepubkey` Derivation
 	 *
-	 * If `option_static_remotekey` or `option_anchor_outputs` is
+	 * The `remotepubkey` is simply the remote node's `payment_basepoint`.
+	 */
+	/* The old BOLT defined what happened prior to option_static_remotekey,
+	 * which we still support for existing channels:
+	 *
+	 * If `option_static_remotekey` or `option_anchors` is
 	 * negotiated, the `remotepubkey` is simply the remote node's
 	 * `payment_basepoint`, otherwise it is calculated as above using the
 	 * remote node's `payment_basepoint`.

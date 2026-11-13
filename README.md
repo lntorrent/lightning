@@ -1,6 +1,6 @@
-# c-lightning: A specification compliant Lightning Network implementation in C
+# Core Lightning (CLN): A specification compliant Lightning Network implementation in C
 
-c-lightning is a lightweight, highly customizable and [standard compliant][std] implementation of the Lightning Network protocol.
+Core Lightning (previously c-lightning) is a lightweight, highly customizable and [standard compliant][std] implementation of the Lightning Network protocol, developed and maintained by [Blockstream][blockstream]. Learn more about Blockstream's Lightning Network updates at [blockstream.com/lightning][blockstream-lightning].
 
 * [Getting Started](#getting-started)
     * [Installation](#installation)
@@ -11,47 +11,41 @@ c-lightning is a lightweight, highly customizable and [standard compliant][std] 
 	* [Sending and Receiving Payments](#sending-and-receiving-payments)
 	* [Configuration File](#configuration-file)
 * [Further Information](#further-information)
-    * [FAQ](doc/FAQ.md)
+    * [FAQ](doc/node-operators-guide/faq.md)
     * [Pruning](#pruning)
     * [HD wallet encryption](#hd-wallet-encryption)
 	* [Developers](#developers)
-* [Documentation](https://lightning.readthedocs.io/)
+* [Documentation](https://docs.corelightning.org/docs)
 
 ## Project Status
 
-[![Continuous Integration](https://github.com/ElementsProject/lightning/workflows/Continuous%20Integration/badge.svg)][actions]
-[![Pull Requests Welcome][prs]][prs-link]
-[![Irc][IRC]][IRC-link]
-[![Documentation Status](https://readthedocs.org/projects/lightning/badge/?version=docs)][docs]
+[![Continuous Integration][actions-badge]][actions]
+[![Pull Requests Welcome][prs-badge]][prs]
+[![Documentation Status][docs-badge]][docs]
+[![Blockstream][blockstream-badge]][blockstream]
+[![Telegram][telegram-badge]][telegram]
+[![Discord][discord-badge]][discord]
 
 This implementation has been in production use on the Bitcoin mainnet since early 2018, with the launch of the [Blockstream Store][blockstream-store-blog].
-We recommend getting started by experimenting on `testnet` (or `regtest`), but the implementation is considered stable and can be safely used on mainnet.
+We recommend getting started by experimenting on `testnet` (`testnet4` or `regtest`), but the implementation is considered stable and can be safely used on mainnet.
+
+## Reach Out to Us
 
 Any help testing the implementation, reporting bugs, or helping with outstanding issues is very welcome.
-Don't hesitate to reach out to us on IRC at [#lightning-dev @ freenode.net][irc1], [#c-lightning @ freenode.net][irc2], or on the implementation-specific mailing list [c-lightning@lists.ozlabs.org][ml1], or on the Lightning Network-wide mailing list [lightning-dev@lists.linuxfoundation.org][ml2].
+Don't hesitate to reach out to us on [CLN Discord][discord], or on [CLN Telegram][telegram].
 
 ## Getting Started
 
-c-lightning only works on Linux and Mac OS, and requires a locally (or remotely) running `bitcoind` (version 0.16 or above) that is fully caught up with the network you're running on, and relays transactions (ie with `blocksonly=0`).
+Core Lightning only works on Linux and macOS, and requires a locally (or remotely) running `bitcoind` (version 25.0 or above) that is fully caught up with the network you're running on, and relays transactions (ie with `blocksonly=0`).
 Pruning (`prune=n` option in `bitcoin.conf`) is partially supported, see [here](#pruning) for more details.
 
 ### Installation
 
-There are 4 supported installation options:
+There are 3 supported installation options:
 
- - Installation from the [Ubuntu PPA][ppa].
- - Installation of a pre-compiled binary from the [release page][releases] on Github.
+ - Installation of a pre-compiled binary from the [release page][releases] on GitHub.
  - Using one of the [provided docker images][dockerhub] on the Docker Hub.
- - Compiling the source code yourself as described in the [installation documentation](doc/INSTALL.md).
-
-For the impatient here's the gist of it for Ubuntu:
-
-```bash
-sudo apt-get install -y software-properties-common
-sudo add-apt-repository -u ppa:bitcoin/bitcoin
-sudo add-apt-repository -u ppa:lightningnetwork/ppa
-sudo apt-get install bitcoind lightningd
-```
+ - Compiling the source code yourself as described in the [installation documentation](doc/getting-started/getting-started/installation.md).
 
 ### Starting `lightningd`
 
@@ -63,13 +57,6 @@ of the `startup_regtest.sh` file for details on how to use it.
 
 ```bash
 . contrib/startup_regtest.sh
-```
-
-Note that your local nodeset will be much faster/more responsive if
-you've configured your node to expose the developer options, e.g.
-
-```bash
-./configure --enable-developer
 ```
 
 #### Mainnet Option
@@ -90,24 +77,24 @@ You can start `lightningd` with the following command:
 lightningd --network=bitcoin --log-level=debug
 ```
 
-This creates a `.lightning/` subdirectory in your home directory: see `man -l doc/lightningd.8` (or https://lightning.readthedocs.io/) for more runtime options.
+This creates a `.lightning/` subdirectory in your home directory: see `man -l doc/lightningd.8` (or https://docs.corelightning.org/docs) for more runtime options.
 
 ### Using The JSON-RPC Interface
 
-c-lightning exposes a [JSON-RPC 2.0][jsonrpcspec] interface over a Unix Domain socket; the `lightning-cli` tool can be used to access it, or there is a [python client library](contrib/pylightning).
+Core Lightning exposes a [JSON-RPC 2.0][jsonrpcspec] interface over a Unix Domain socket; the `lightning-cli` tool can be used to access it, or there is a [python client library](contrib/pyln-client).
 
 You can use `lightning-cli help` to print a table of RPC methods; `lightning-cli help <command>`
 will offer specific information on that command.
 
 Useful commands:
 
-* [newaddr](doc/lightning-newaddr.7.md): get a bitcoin address to deposit funds into your lightning node.
-* [listfunds](doc/lightning-listfunds.7.md): see where your funds are.
-* [connect](doc/lightning-connect.7.md): connect to another lightning node.
-* [fundchannel](doc/lightning-fundchannel.7.md): create a channel to another connected node.
-* [invoice](doc/lightning-invoice.7.md): create an invoice to get paid by another node.
-* [pay](doc/lightning-pay.7.md): pay someone else's invoice.
-* [plugin](doc/lightning-plugin.7.md): commands to control extensions.
+* [newaddr](https://docs.corelightning.org/reference/newaddr): get a bitcoin address to deposit funds into your lightning node.
+* [listfunds](https://docs.corelightning.org/reference/listfunds): see where your funds are.
+* [connect](https://docs.corelightning.org/reference/connect): connect to another lightning node.
+* [fundchannel](https://docs.corelightning.org/reference/fundchannel): create a channel to another connected node.
+* [invoice](https://docs.corelightning.org/reference/invoice): create an invoice to get paid by another node.
+* [xpay](https://docs.corelightning.org/reference/xpay): pay someone else's invoice.
+* [plugin](https://docs.corelightning.org/reference/plugin): commands to control extensions.
 
 ### Care And Feeding Of Your New Lightning Node
 
@@ -115,18 +102,13 @@ Once you've started for the first time, there's a script called
 `contrib/bootstrap-node.sh` which will connect you to other nodes on
 the lightning network.
 
-There are also numerous plugins available for c-lightning which add
-capabilities: in particular there's a collection at:
-
-	https://github.com/lightningd/plugins
-
-Including [helpme][helpme-github] which guides you through setting up
-your first channels and customizing your node.
+There are also numerous plugins available for Core Lightning which add
+capabilities: in particular there's a collection at: https://github.com/lightningd/plugins
 
 For a less reckless experience, you can encrypt the HD wallet seed:
  see [HD wallet encryption](#hd-wallet-encryption).
 
-You can also chat to other users at [#c-lightning @ freenode.net][irc2];
+You can also chat to other users at Discord [core-lightning][discord];
 we are always happy to help you get started!
 
 
@@ -142,11 +124,11 @@ lightning-cli newaddr
 
 `lightningd` will register the funds once the transaction is confirmed.
 
-You may need to generate a p2sh-segwit address if the faucet does not support bech32:
+Alternatively you can generate a taproot address should your source of funds support it:
 
 ```bash
-# Return a p2sh-segwit address
-lightning-cli newaddr p2sh-segwit
+# Return a taproot address
+lightning-cli newaddr p2tr
 ```
 
 Confirm `lightningd` got funds by:
@@ -182,12 +164,12 @@ lightning-cli invoice <amount> <label> <description>
 
 This returns some internal details, and a standard invoice string called `bolt11` (named after the [BOLT #11 lightning spec][BOLT11]).
 
-[BOLT11]: https://github.com/lightningnetwork/lightning-rfc/blob/master/11-payment-encoding.md
+[BOLT11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
-The sender can feed this `bolt11` string to the `decodepay` command to see what it is, and pay it simply using the `pay` command:
+The sender can feed this `bolt11` string to the `decode` command to see what it is, and pay it simply using the `xpay` command:
 
 ```bash
-lightning-cli pay <bolt11>
+lightning-cli xpay <bolt11>
 ```
 
 Note that there are lower-level interfaces (and more options to these
@@ -201,44 +183,44 @@ Command line options will always override the values in the configuration file.
 To use a configuration file, create a file named `config` within your top-level lightning directory or network subdirectory
 (eg. `~/.lightning/config` or `~/.lightning/bitcoin/config`).  See `man -l doc/lightningd-config.5`.
 
+A sample configuration file is available at `contrib/config-example`.
+
 ## Further information
 
 ### Pruning
 
-c-lightning requires JSON-RPC access to a fully synchronized `bitcoind` in order to synchronize with the Bitcoin network.
+Core Lightning requires JSON-RPC access to a fully synchronized `bitcoind` in order to synchronize with the Bitcoin network.
 Access to ZeroMQ is not required and `bitcoind` does not need to be run with `txindex` like other implementations.
 The lightning daemon will poll `bitcoind` for new blocks that it hasn't processed yet, thus synchronizing itself with `bitcoind`.
-If `bitcoind` prunes a block that c-lightning has not processed yet, e.g., c-lightning was not running for a prolonged period, then `bitcoind` will not be able to serve the missing blocks, hence c-lightning will not be able to synchronize anymore and will be stuck.
-In order to avoid this situation you should be monitoring the gap between c-lightning's blockheight using `lightning-cli getinfo` and `bitcoind`'s blockheight using `bitcoin-cli getblockchaininfo`.
+If `bitcoind` prunes a block that Core Lightning has not processed yet, e.g., Core Lightning was not running for a prolonged period, then `bitcoind` will not be able to serve the missing blocks, hence Core Lightning will not be able to synchronize anymore and will be stuck.
+In order to avoid this situation you should be monitoring the gap between Core Lightning's blockheight using `lightning-cli getinfo` and `bitcoind`'s blockheight using `bitcoin-cli getblockchaininfo`.
 If the two blockheights drift apart it might be necessary to intervene.
 
 ### HD wallet encryption
 
-You can encrypt the `hsm_secret` content (which is used to derive the HD wallet's master key) by passing the `--encrypted-hsm` startup argument, or by using the `hsmtool` (which you can find in the `tool/` directory at the root of this repo) with the `encrypt` method. You can unencrypt an encrypted `hsm_secret` using the `hsmtool` with the `decrypt` method.
+You can encrypt the `hsm_secret` content (which is used to derive the HD wallet's master key) by passing the `--encrypted-hsm` startup argument, or by using the `lightning-hsmtool` (which you can find in the `tool/` directory at the root of this repo) with the `encrypt` method. You can unencrypt an encrypted `hsm_secret` using the `lightning-hsmtool` with the `decrypt` method.
 
-If you encrypt your `hsm_secret`, you will have to pass the `--encrypted-hsm` startup option to `lightningd`. Once your `hsm_secret` is encrypted, you __will not__ be able to access your funds without your password, so please beware with your password management. Also beware of not feeling too safe with an encrypted `hsm_secret`: unlike for `bitcoind` where the wallet encryption can restrict the usage of some RPC command, `lightningd` always need to access keys from the wallet which is thus __not locked__ (yet), even with an encrypted BIP32 master seed.
+If you encrypt your `hsm_secret`, you will have to pass the `--encrypted-hsm` startup option to `lightningd`. Once your `hsm_secret` is encrypted, you __will not__ be able to access your funds without your password, so please beware with your password management. Also, beware of not feeling too safe with an encrypted `hsm_secret`: unlike for `bitcoind` where the wallet encryption can restrict the usage of some RPC command, `lightningd` always needs to access keys from the wallet which is thus __not locked__ (yet), even with an encrypted BIP32 master seed.
 
 ### Developers
 
-Developers wishing to contribute should start with the developer guide [here](doc/HACKING.md).
-You should also configure with `--enable-developer` to get additional checks and options.
+Developers wishing to contribute should start with the developer guide [here](doc/contribute-to-core-lightning/coding-style-guidelines.md).
 
+[blockstream]: https://blockstream.com/
+[blockstream-lightning]: https://blockstream.com/lightning/
+[blockstream-badge]: https://img.shields.io/badge/Blockstream-Company-blue
 [blockstream-store-blog]: https://blockstream.com/2018/01/16/en-lightning-charge/
-[std]: https://github.com/lightningnetwork/lightning-rfc
-[travis-ci]: https://travis-ci.org/ElementsProject/lightning.svg?branch=master
-[travis-ci-link]: https://travis-ci.org/ElementsProject/lightning
-[prs]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat
-[prs-link]: http://makeapullrequest.com
-[IRC]: https://img.shields.io/badge/chat-on%20freenode-brightgreen.svg
-[IRC-link]: https://webchat.freenode.net/?channels=c-lightning
-[irc1]: http://webchat.freenode.net/?channels=%23lightning-dev
-[irc2]: http://webchat.freenode.net/?channels=%23c-lightning
-[ml1]: https://lists.ozlabs.org/listinfo/c-lightning
-[ml2]: https://lists.linuxfoundation.org/mailman/listinfo/lightning-dev
-[docs]: https://lightning.readthedocs.org
-[ppa]: https://launchpad.net/~lightningnetwork/+archive/ubuntu/ppa
+[std]: https://github.com/lightning/bolts
+[prs-badge]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat
+[prs]: http://makeapullrequest.com
+[discord-badge]: https://badgen.net/badge/Discord/chat/blue
+[discord]: https://discord.gg/mE9s4rc5un
+[telegram-badge]: https://badgen.net/badge/Telegram/chat/blue
+[telegram]: https://t.me/lightningd
+[docs-badge]: https://readthedocs.org/projects/lightning/badge/?version=docs
+[docs]: https://docs.corelightning.org/docs
 [releases]: https://github.com/ElementsProject/lightning/releases
 [dockerhub]: https://hub.docker.com/r/elementsproject/lightningd/
 [jsonrpcspec]: https://www.jsonrpc.org/specification
-[helpme-github]: https://github.com/lightningd/plugins/tree/master/helpme
+[actions-badge]: https://github.com/ElementsProject/lightning/workflows/Continuous%20Integration/badge.svg
 [actions]: https://github.com/ElementsProject/lightning/actions

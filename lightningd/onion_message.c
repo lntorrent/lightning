@@ -1,44 +1,58 @@
-#include <common/json_helpers.h>
-#include <gossipd/gossipd_wiregen.h>
-#include <lightningd/lightningd.h>
+#include "config.h"
+#include <common/blindedpath.h>
+#include <common/blinding.h>
+#include <common/ecdh.h>
+#include <common/json_command.h>
+#include <connectd/connectd_wiregen.h>
 #include <lightningd/onion_message.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
 
 struct onion_message_hook_payload {
 	/* Optional */
-	struct pubkey *blinding_in;
-	struct pubkey *reply_blinding;
-	struct onionmsg_path **reply_path;
-
-	struct tlv_onionmsg_payload *om;
+	struct blinded_path *reply_path;
+	struct secret *pathsecret;
+	struct tlv_onionmsg_tlv *om;
 };
 
-static void
-onion_message_serialize(struct onion_message_hook_payload *payload,
-			   struct json_stream *stream)
+static void json_add_blindedpath(struct plugin *plugin,
+				 struct json_stream *stream,
+				 const char *fieldname,
+				 const struct blinded_path *path)
+{
+	json_object_start(stream, fieldname);
+	if (path->first_node_id.is_pubkey) {
+		json_add_pubkey(stream, "first_node_id", &path->first_node_id.pubkey);
+	} else {
+		json_add_short_channel_id(stream, "first_scid", path->first_node_id.scidd.scid);
+		json_add_u32(stream, "first_scid_dir", path->first_node_id.scidd.dir);
+	}
+	json_add_pubkey(stream, "first_path_key", &path->first_path_key);
+	json_array_start(stream, "hops");
+	for (size_t i = 0; i < tal_count(path->path); i++) {
+		json_object_start(stream, NULL);
+		json_add_pubkey(stream, "blinded_node_id",
+				&path->path[i]->blinded_node_id);
+		json_add_hex_talarr(stream, "encrypted_recipient_data",
+				    path->path[i]->encrypted_recipient_data);
+		json_object_end(stream);
+	};
+	json_array_end(stream);
+	json_object_end(stream);
+}
+
+static void onion_message_serialize(struct onion_message_hook_payload *payload,
+				    struct json_stream *stream,
+				    struct plugin *plugin)
 {
 	json_object_start(stream, "onion_message");
-	if (payload->blinding_in)
-		json_add_pubkey(stream, "blinding_in", payload->blinding_in);
-	if (payload->reply_path) {
-		json_array_start(stream, "reply_path");
-		for (size_t i = 0; i < tal_count(payload->reply_path); i++) {
-			json_object_start(stream, NULL);
-			json_add_pubkey(stream, "id",
-					&payload->reply_path[i]->node_id);
-			if (payload->reply_path[i]->enctlv)
-				json_add_hex_talarr(stream, "enctlv",
-						    payload->reply_path[i]->enctlv);
-			if (i == 0)
-				json_add_pubkey(stream, "blinding",
-						payload->reply_blinding);
-			json_object_end(stream);
-		}
-		json_array_end(stream);
-	}
-	/* Common convenience fields */
+	if (payload->pathsecret)
+		json_add_secret(stream, "pathsecret", payload->pathsecret);
+
+	if (payload->reply_path)
+		json_add_blindedpath(plugin, stream, "reply_blindedpath",
+				     payload->reply_path);
+
 	if (payload->om->invoice_request)
 		json_add_hex_talarr(stream, "invoice_request",
 				    payload->om->invoice_request);
@@ -61,6 +75,7 @@ onion_message_serialize(struct onion_message_hook_payload *payload,
 		json_object_end(stream);
 	}
 	json_array_end(stream);
+
 	json_object_end(stream);
 }
 
@@ -72,19 +87,21 @@ onion_message_hook_cb(struct onion_message_hook_payload *payload STEALS)
 	tal_free(payload);
 }
 
-/* Two hooks, because it's critical we only accept blinding if we expect that
- * exact blinding key.  Otherwise, we can be probed using old blinded paths. */
-REGISTER_PLUGIN_HOOK(onion_message,
+/* This is for unsolicted messages */
+REGISTER_PLUGIN_HOOK(onion_message_recv,
 		     plugin_hook_continue,
 		     onion_message_hook_cb,
 		     onion_message_serialize,
 		     struct onion_message_hook_payload *);
 
-REGISTER_PLUGIN_HOOK(onion_message_blinded,
+/* This is for messages claiming to be using our paths: caller must
+ * check pathsecret! */
+ REGISTER_PLUGIN_HOOK(onion_message_recv_secret,
 		     plugin_hook_continue,
 		     onion_message_hook_cb,
 		     onion_message_serialize,
 		     struct onion_message_hook_payload *);
+
 
 void handle_onionmsg_to_us(struct lightningd *ld, const u8 *msg)
 {
@@ -93,316 +110,79 @@ void handle_onionmsg_to_us(struct lightningd *ld, const u8 *msg)
 	size_t submsglen;
 	const u8 *subptr;
 
-	payload = tal(ld, struct onion_message_hook_payload);
-	payload->om = tlv_onionmsg_payload_new(payload);
-
-	if (!fromwire_gossipd_got_onionmsg_to_us(payload, msg,
-						 &payload->blinding_in,
-						 &payload->reply_blinding,
-						 &payload->reply_path,
-						 &submsg)) {
+	payload = tal(tmpctx, struct onion_message_hook_payload);
+	if (!fromwire_connectd_got_onionmsg_to_us(payload, msg,
+						  &payload->pathsecret,
+						  &payload->reply_path,
+						  &submsg)) {
 		log_broken(ld->log, "bad got_onionmsg_tous: %s",
 			   tal_hex(tmpctx, msg));
 		return;
 	}
+
+	if (ld->dev_ignore_modern_onion)
+		return;
+
 	submsglen = tal_bytelen(submsg);
 	subptr = submsg;
-	if (!fromwire_onionmsg_payload(&subptr,
-				       &submsglen, payload->om)) {
-		tal_free(payload);
+	payload->om = fromwire_tlv_onionmsg_tlv(payload, &subptr, &submsglen);
+	if (!payload->om) {
 		log_broken(ld->log, "bad got_onionmsg_tous om: %s",
 			   tal_hex(tmpctx, msg));
 		return;
 	}
 	tal_free(submsg);
 
-	if (payload->reply_path && !payload->reply_blinding) {
-		log_broken(ld->log,
-			   "No reply blinding, ignoring reply path");
+	/* A reply path with no hops is unusable: treat it as absent. */
+	if (payload->reply_path && tal_count(payload->reply_path->path) == 0) {
+		log_debug(ld->log, "Ignoring reply path with no hops");
 		payload->reply_path = tal_free(payload->reply_path);
 	}
 
+	/* Make sure connectd gets this right. */
 	log_debug(ld->log, "Got onionmsg%s%s",
-		  payload->reply_blinding ? " reply_blinding": "",
+		  payload->pathsecret ? " with pathsecret": "",
 		  payload->reply_path ? " reply_path": "");
 
-	if (payload->blinding_in)
-		plugin_hook_call_onion_message_blinded(ld, payload);
+	/* We'll free this on return */
+	tal_steal(ld, payload);
+	if (payload->pathsecret)
+		plugin_hook_call_onion_message_recv_secret(ld, NULL, payload);
 	else
-		plugin_hook_call_onion_message(ld, payload);
+		plugin_hook_call_onion_message_recv(ld, NULL, payload);
 }
 
-void handle_onionmsg_forward(struct lightningd *ld, const u8 *msg)
+static void inject_onionmsg_reply(struct subd *connectd,
+				  const u8 *reply,
+				  const int *fds UNUSED,
+				  struct command *cmd)
 {
-	struct short_channel_id *next_scid;
-	struct node_id *next_node;
-	struct pubkey *next_blinding;
-	u8 *onion;
+	char *err;
 
-	if (!fromwire_gossipd_got_onionmsg_forward(msg, msg, &next_scid,
-						   &next_node,
-						   &next_blinding, &onion)) {
-		log_broken(ld->log, "bad got_onionmsg_forward: %s",
-			   tal_hex(tmpctx, msg));
+	if (!fromwire_connectd_inject_onionmsg_reply(cmd, reply, &err)) {
+		log_broken(connectd->ld->log, "bad onionmsg_reply: %s",
+			   tal_hex(tmpctx, reply));
 		return;
 	}
 
-	if (next_scid) {
-		struct channel *outchan = any_channel_by_scid(ld, next_scid);
-		if (outchan)
-			next_node = &outchan->peer->id;
-	}
-
-	if (!next_node) {
-		log_debug(ld->log, "Cannot forward onionmsg to %s",
-			  next_scid ? type_to_string(tmpctx,
-						     struct short_channel_id,
-						     next_scid)
-			  : "unspecified dest");
-	} else {
-		subd_send_msg(ld->gossip,
-			      take(towire_gossipd_send_onionmsg(NULL,
-								next_node,
-								onion,
-								next_blinding)));
-	}
+	if (strlen(err) == 0)
+		was_pending(command_success(cmd, json_stream_success(cmd)));
+	else
+		was_pending(command_fail(cmd, LIGHTNINGD, "%s", err));
 }
 
-struct hop {
-	struct pubkey id;
-	struct short_channel_id *scid;
-	struct pubkey *blinding;
-	u8 *enctlv;
-	u8 *invoice;
-	u8 *invoice_req;
-	u8 *invoice_err;
-	u8 *rawtlv;
-};
-
-static struct command_result *param_hops(struct command *cmd,
-					 const char *name,
-					 const char *buffer,
-					 const jsmntok_t *tok,
-					 struct hop **hops)
-{
-	size_t i;
-	const jsmntok_t *t;
-
-	if (tok->type != JSMN_ARRAY || tok->size == 0)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "%s must be an (non-empty) array", name);
-
-	*hops = tal_arr(cmd, struct hop, tok->size);
-	json_for_each_arr(i, t, tok) {
-		const jsmntok_t *tid, *tscid, *tblinding, *tenctlv, *trawtlv,
-			*tinvoice, *tinvoicereq, *tinvoiceerr;
-
-		tid = json_get_member(buffer, t, "id");
-		if (!tid)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s[%zu] does not have 'id'",
-					    name, i);
-		tscid = json_get_member(buffer, t, "short_channel_id");
-		tblinding = json_get_member(buffer, t, "blinding");
-		tenctlv = json_get_member(buffer, t, "enctlv");
-		tinvoice = json_get_member(buffer, t, "invoice");
-		tinvoicereq = json_get_member(buffer, t, "invoice_request");
-		tinvoiceerr = json_get_member(buffer, t, "invoice_error");
-		trawtlv = json_get_member(buffer, t, "rawtlv");
-
-		if (trawtlv && (tscid || tblinding || tenctlv || tinvoice || tinvoicereq))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s[%zu] has 'rawtlv' with other fields",
-					    name, i);
-
-		if (tblinding) {
-			(*hops)[i].blinding = tal(*hops, struct pubkey);
-			if (!json_to_pubkey(buffer, tblinding,
-					    (*hops)[i].blinding))
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "%s[%zu] 'blinding' is invalid", name, i);
-		} else
-			(*hops)[i].blinding = NULL;
-
-		if (!json_to_pubkey(buffer, tid, &(*hops)[i].id))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s[%zu] 'id' is invalid", name, i);
-		if (tscid) {
-			(*hops)[i].scid = tal(*hops, struct short_channel_id);
-			if (!json_to_short_channel_id(buffer, tscid,
-						      (*hops)[i].scid))
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "%s[%zu] 'short_channel_id' is invalid", name, i);
-		} else
-			(*hops)[i].scid = NULL;
-
-		if (tenctlv) {
-			(*hops)[i].enctlv =
-				json_tok_bin_from_hex(*hops, buffer, tenctlv);
-			if (!(*hops)[i].enctlv)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "%s[%zu] 'enctlv' is invalid", name, i);
-		} else
-			(*hops)[i].enctlv = NULL;
-
-		if (tinvoice) {
-			(*hops)[i].invoice =
-				json_tok_bin_from_hex(*hops, buffer, tinvoice);
-			if (!(*hops)[i].invoice)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "%s[%zu] 'invoice' is invalid", name, i);
-		} else
-			(*hops)[i].invoice = NULL;
-
-		if (tinvoicereq) {
-			(*hops)[i].invoice_req =
-				json_tok_bin_from_hex(*hops, buffer, tinvoicereq);
-			if (!(*hops)[i].invoice_req)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "%s[%zu] 'invoice_request' is invalid", name, i);
-		} else
-			(*hops)[i].invoice_req = NULL;
-
-		if (tinvoiceerr) {
-			(*hops)[i].invoice_err =
-				json_tok_bin_from_hex(*hops, buffer, tinvoiceerr);
-			if (!(*hops)[i].invoice_err)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "%s[%zu] 'invoice_request' is invalid", name, i);
-		} else
-			(*hops)[i].invoice_err = NULL;
-
-		if (trawtlv) {
-			(*hops)[i].rawtlv =
-				json_tok_bin_from_hex(*hops, buffer, trawtlv);
-			if (!(*hops)[i].rawtlv)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "%s[%zu] 'rawtlv' is invalid", name, i);
-		} else
-			(*hops)[i].rawtlv = NULL;
-	}
-	return NULL;
-}
-
-static struct command_result *param_reply_path(struct command *cmd,
-					       const char *name,
-					       const char *buffer,
-					       const jsmntok_t *tok,
-					       struct tlv_onionmsg_payload_reply_path **reply_path)
-{
-	const jsmntok_t *tblinding, *tpath, *t;
-	size_t i;
-
-	*reply_path = tal(cmd, struct tlv_onionmsg_payload_reply_path);
-	tblinding = json_get_member(buffer, tok, "blinding");
-	if (!tblinding)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "%s has no 'blinding'", name);
-	if (!json_to_pubkey(buffer, tblinding, &(*reply_path)->blinding))
-		return command_fail_badparam(cmd, name, buffer, tblinding,
-					     "'blinding' should be valid pubkey");
-
-	tpath = json_get_member(buffer, tok, "path");
-	if (!tpath || tpath->type != JSMN_ARRAY)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "%s has no 'path' array", name);
-
-	(*reply_path)->path = tal_arr(*reply_path, struct onionmsg_path *,
-				      tpath->size);
-	json_for_each_arr(i, t, tpath) {
-		const jsmntok_t *tid, *tenctlv;
-		struct onionmsg_path *path;
-
-		path = (*reply_path)->path[i] = tal((*reply_path)->path,
-						    struct onionmsg_path);
-		tid = json_get_member(buffer, t, "id");
-		if (!tid)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s path[%zu] 'id' is missing",
-					    name, i);
-		if (!json_to_pubkey(buffer, tid, &path->node_id))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s path[%zu] 'id' is invalid",
-					    name, i);
-
-		tenctlv = json_get_member(buffer, t, "enctlv");
-		if (!tenctlv) {
-			/* Optional for final destination */
-			if (i != tpath->size - 1)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s path[%zu] 'enctlv' is missing",
-					    name, i);
-			path->enctlv = NULL;
-		} else {
-			path->enctlv = json_tok_bin_from_hex(path,
-							     buffer, tenctlv);
-			if (!path->enctlv)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "%s path[%zu] 'enctlv' is invalid",
-					    name, i);
-		}
-	}
-
-	return NULL;
-}
-
-/* Generate ->rawtlv if not already supplied. */
-static void populate_tlvs(struct hop *hops,
-			  struct tlv_onionmsg_payload_reply_path *reply_path)
-{
-	for (size_t i = 0; i < tal_count(hops); i++) {
-		struct tlv_onionmsg_payload *tlv;
-
-		if (hops[i].rawtlv)
-			continue;
-
-		tlv = tlv_onionmsg_payload_new(tmpctx);
-		/* If they don't give scid, use next node id */
-		if (hops[i].scid) {
-			tlv->next_short_channel_id
-				= tal_dup(tlv, struct short_channel_id,
-					  hops[i].scid);
-		} else if (i != tal_count(hops)-1) {
-			tlv->next_node_id = tal_dup(tlv, struct pubkey,
-						    &hops[i+1].id);
-		}
-		if (hops[i].blinding) {
-			tlv->blinding = tal_dup(tlv, struct pubkey,
-						hops[i].blinding);
-		}
-		/* Note: tal_dup_talarr returns NULL for NULL */
-		tlv->enctlv = tal_dup_talarr(tlv, u8, hops[i].enctlv);
-		tlv->invoice = tal_dup_talarr(tlv, u8, hops[i].invoice);
-		tlv->invoice_request = tal_dup_talarr(tlv, u8,
-						      hops[i].invoice_req);
-		tlv->invoice_error = tal_dup_talarr(tlv, u8,
-						    hops[i].invoice_err);
-
-		if (i == tal_count(hops)-1 && reply_path)
-			tlv->reply_path = reply_path;
-
-		hops[i].rawtlv = tal_arr(hops, u8, 0);
-		towire_onionmsg_payload(&hops[i].rawtlv, tlv);
-	}
-}
-
-static struct command_result *json_send_onion_message(struct command *cmd,
+static struct command_result *json_injectonionmessage(struct command *cmd,
 						      const char *buffer,
 						      const jsmntok_t *obj UNNEEDED,
 						      const jsmntok_t *params)
 {
-	struct hop *hops;
-	struct tlv_onionmsg_payload_reply_path *reply_path;
-	struct sphinx_path *sphinx_path;
-	struct onionpacket *op;
-	struct secret *path_secrets;
-	struct node_id first_id;
-	size_t onion_size;
+	struct pubkey *path_key;
+	u8 *msg;
 
-	if (!param(cmd, buffer, params,
-		   p_req("hops", param_hops, &hops),
-		   p_opt("reply_path", param_reply_path, &reply_path),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("path_key", param_pubkey, &path_key),
+			 p_req("message", param_bin_from_hex, &msg),
+			 NULL))
 		return command_param_failed();
 
 	if (!feature_offered(cmd->ld->our_features->bits[NODE_ANNOUNCE_FEATURE],
@@ -410,58 +190,78 @@ static struct command_result *json_send_onion_message(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD,
 				    "experimental-onion-messages not enabled");
 
-	node_id_from_pubkey(&first_id, &hops[0].id);
-
-	/* Sanity check first; gossipd doesn't bother telling us if peer
-	 * can't be reached. */
-	if (!peer_by_id(cmd->ld, &first_id)) {
-		/* Nasty hack: maybe we didn't know y-parity? */
-		first_id.k[0] = SECP256K1_TAG_PUBKEY_ODD;
-		if (!peer_by_id(cmd->ld, &first_id))
-			return command_fail(cmd, LIGHTNINGD,
-					    "Unknown first peer");
-		/* Fixup first hop parity. */
-		if (!pubkey_from_node_id(&hops[0].id, &first_id))
-			return command_fail(cmd, LIGHTNINGD,
-					    "Could not convert parity!");
-	}
-
-	/* Create an onion which encodes this. */
-	populate_tlvs(hops, reply_path);
-	sphinx_path = sphinx_path_new(cmd, NULL);
-	for (size_t i = 0; i < tal_count(hops); i++) {
-		/* FIXME: Remove legacy, then length prefix can be removed! */
-		u8 *tlv_with_len = tal_arr(NULL, u8, 0);
-		towire_bigsize(&tlv_with_len, tal_bytelen(hops[i].rawtlv));
-		towire_u8_array(&tlv_with_len,
-				hops[i].rawtlv, tal_bytelen(hops[i].rawtlv));
-		sphinx_add_hop(sphinx_path, &hops[i].id, take(tlv_with_len));
-	}
-	/* BOLT-offers #4:
-	 * - SHOULD set `len` to 1366 or 32834.
-	 */
-	if (sphinx_path_payloads_size(sphinx_path) <= ROUTING_INFO_SIZE)
-		onion_size = ROUTING_INFO_SIZE;
-	else
-		onion_size = 32768;
-
-	op = create_onionpacket(tmpctx, sphinx_path, onion_size, &path_secrets);
-	if (!op)
+	if (tal_count(msg) > 65535) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Creating onion failed (tlvs too long?)");
+				    "onion message too long");
+	}
 
-	subd_send_msg(cmd->ld->gossip,
-		      take(towire_gossipd_send_onionmsg(NULL, &first_id,
-					serialize_onionpacket(tmpctx, op),
-					NULL)));
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
 
-	return command_success(cmd, json_stream_success(cmd));
+	subd_req(cmd, cmd->ld->connectd,
+		 take(towire_connectd_inject_onionmsg(NULL, path_key, msg)),
+		 -1, 0, inject_onionmsg_reply, cmd);
+	return command_still_pending(cmd);
 }
 
-static const struct json_command send_onion_message_command = {
-	"sendonionmessage",
-	"utility",
-	json_send_onion_message,
-	"Send message over {hops} (id, [short_channel_id], [blinding], [enctlv], [invoice], [invoice_request], [invoice_error], [rawtlv]) with optional {reply_path} (blinding, path[id, enctlv])"
+static const struct json_command injectonionmessage_command = {
+	"injectonionmessage",
+	json_injectonionmessage,
 };
-AUTODATA(json_command, &send_onion_message_command);
+AUTODATA(json_command, &injectonionmessage_command);
+
+static struct command_result *json_decryptencrypteddata(struct command *cmd,
+							const char *buffer,
+							const jsmntok_t *obj UNNEEDED,
+							const jsmntok_t *params)
+{
+	u8 *encdata, *decrypted;
+	struct pubkey *path_key, next_path_key;
+	struct secret ss;
+	struct sha256 h;
+	struct json_stream *response;
+
+	if (!param_check(cmd, buffer, params,
+			 p_req("encrypted_data", param_bin_from_hex, &encdata),
+			 p_req("path_key", param_pubkey, &path_key),
+			 NULL))
+		return command_param_failed();
+
+	/* BOLT #4:
+	 *
+	 * - MUST compute:
+	 *   - $`ss_i = SHA256(k_i * E_i)`$ (standard ECDH)
+	 *...
+	 *   - $`rho_i = HMAC256(\text{"rho"}, ss_i)`$
+	 * - MUST decrypt the `encrypted_recipient_data` field using $`rho_i`$
+	 */
+	ecdh(path_key, &ss);
+
+	decrypted = decrypt_encmsg_raw(cmd, &ss, encdata);
+	if (!decrypted)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Decryption failed!");
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	/* BOLT #4:
+	 *
+	 *   - $`E_{i+1} = SHA256(E_i || ss_i) * E_i`$
+	 */
+	blinding_hash_e_and_ss(path_key, &ss, &h);
+	blinding_next_path_key(path_key, &h, &next_path_key);
+
+	response = json_stream_success(cmd);
+	json_object_start(response, "decryptencrypteddata");
+	json_add_hex_talarr(response, "decrypted", decrypted);
+	json_add_pubkey(response, "next_path_key", &next_path_key);
+	json_object_end(response);
+	return command_success(cmd, response);
+}
+
+static const struct json_command decryptencrypteddata_command = {
+	"decryptencrypteddata",
+	json_decryptencrypteddata,
+};
+AUTODATA(json_command, &decryptencrypteddata_command);

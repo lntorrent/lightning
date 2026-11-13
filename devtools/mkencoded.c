@@ -1,12 +1,11 @@
 /* Simple wrapper to create zlib or raw encodings of hex. */
+#include "config.h"
 #include <bitcoin/short_channel_id.h>
 #include <ccan/err/err.h>
 #include <ccan/str/hex/hex.h>
 #include <common/decode_array.h>
 #include <common/utils.h>
 #include <stdio.h>
-#include <wire/wire.h>
-#include <zlib.h>
 
 static NORETURN void usage(void)
 {
@@ -31,7 +30,7 @@ int main(int argc, char *argv[])
 			if (!short_channel_id_from_str(argv[i], strlen(argv[i]),
 						       &scid))
 				errx(1, "Invalid short_channel_id %s", argv[i]);
-			towire_short_channel_id(&data, &scid);
+			towire_short_channel_id(&data, scid);
 		}
 	} else {
 		data = tal_hexdata(NULL, argv[2], strlen(argv[2]));
@@ -43,21 +42,8 @@ int main(int argc, char *argv[])
 
 	if (encoding == ARR_UNCOMPRESSED)
 		printf("%02x%s\n", encoding, tal_hex(NULL, data));
-	else if (encoding == ARR_ZLIB) {
-		/* https://www.zlib.net/zlib_tech.html:
-		 *   the only expansion is an overhead of five bytes per 16 KB
-		 *   block (about 0.03%), plus a one-time overhead of six bytes
-		 *   for the entire stream.
-		 */
-		unsigned long compressed_len = tal_bytelen(data)
-			+ 6 + 5*(tal_bytelen(data) + 16384)/16384;
-		u8 *z = tal_arr(NULL, u8, compressed_len);
-		if (compress2(z, &compressed_len, data, tal_bytelen(data),
-			      Z_DEFAULT_COMPRESSION) != Z_OK)
-			errx(1, "Error compressing stream?");
-
-		printf("%02x%s\n", encoding,
-		       tal_hexstr(NULL, z, compressed_len));
+	else if (encoding == ARR_ZLIB_DEPRECATED) {
+		errx(1, "ZLIB compression deprecated");
 	} else {
 		errx(1, "Unknown encoding %u", encoding);
 	}

@@ -1,18 +1,18 @@
-#include <bitcoin/chainparams.h>
+#include "config.h"
 #include <ccan/io/io.h>
 #include <common/cryptomsg.h>
 #include <common/dev_disconnect.h>
-#include <common/features.h>
-#include <common/per_peer_state.h>
 #include <common/status.h>
+#include <common/utils.h>
 #include <common/wire_error.h>
 #include <connectd/connectd.h>
 #include <connectd/connectd_wiregen.h>
+#include <connectd/netaddress.h>
 #include <connectd/peer_exchange_initmsg.h>
 #include <wire/peer_wire.h>
 
 /* Temporary structure for us to read peer message in */
-struct peer {
+struct early_peer {
 	struct daemon *daemon;
 
 	/* The ID of the peer */
@@ -27,7 +27,16 @@ struct peer {
 	/* Buffer for reading/writing message. */
 	u8 *msg;
 
+	/* Are we connected via a websocket? */
+	enum is_websocket is_websocket;
+
 	bool incoming;
+
+	/* Timeout in case it takes too long */
+	struct oneshot *timeout;
+
+	/* We record time when we first accepted socket */
+	struct timemono starttime;
 };
 
 static bool contains_common_chain(struct bitcoin_blkid *chains)
@@ -40,19 +49,27 @@ static bool contains_common_chain(struct bitcoin_blkid *chains)
 }
 
 /* Here in case we need to read another message. */
-static struct io_plan *read_init(struct io_conn *conn, struct peer *peer);
+static struct io_plan *read_init(struct io_conn *conn, struct early_peer *peer);
 
 static struct io_plan *peer_init_received(struct io_conn *conn,
-					  struct peer *peer)
+					  struct early_peer *peer)
 {
 	u8 *msg = cryptomsg_decrypt_body(tmpctx, &peer->cs, peer->msg);
 	u8 *globalfeatures, *features;
-	struct tlv_init_tlvs *tlvs = tlv_init_tlvs_new(msg);
+	struct tlv_init_tlvs *tlvs;
+	struct wireaddr *remote_addr;
 
 	if (!msg)
 		return io_close(conn);
 
 	status_peer_io(LOG_IO_IN, &peer->id, msg);
+
+	switch (dev_disconnect_in(&peer->id, fromwire_peektype(msg))) {
+	case DEV_DISCONNECT_IN_NORMAL:
+		break;
+	case DEV_DISCONNECT_IN_AFTER_RECV:
+		return io_close(conn);
+	}
 
 	/* BOLT #1:
 	 *
@@ -63,7 +80,7 @@ static struct io_plan *peer_init_received(struct io_conn *conn,
 	if (unlikely(is_unknown_msg_discardable(msg)))
 		return read_init(conn, peer);
 
-	if (!fromwire_init(tmpctx, msg, &globalfeatures, &features, tlvs)) {
+	if (!fromwire_init(tmpctx, msg, &globalfeatures, &features, &tlvs)) {
 		status_peer_debug(&peer->id,
 				  "bad fromwire_init '%s', closing",
 				  tal_hex(tmpctx, msg));
@@ -74,7 +91,7 @@ static struct io_plan *peer_init_received(struct io_conn *conn,
 	 * The receiving node:
 	 * ...
 	 *  - upon receiving `networks` containing no common chains
-	 *    - MAY fail the connection.
+	 *    - MAY close the connection.
 	 */
 	if (tlvs->networks) {
 		if (!contains_common_chain(tlvs->networks)) {
@@ -87,20 +104,63 @@ static struct io_plan *peer_init_received(struct io_conn *conn,
 		}
 	}
 
+	/* fetch optional tlv `remote_addr` */
+	remote_addr = NULL;
+
+	/* BOLT #1:
+	 * The receiving node:
+	 * ...
+	 *  - MAY use the `remote_addr` to update its `node_announcement`
+	 */
+	if (tlvs->remote_addr) {
+		const u8 *cursor = tlvs->remote_addr;
+		size_t len = tal_bytelen(tlvs->remote_addr);
+
+		remote_addr = tal(peer, struct wireaddr);
+		if (fromwire_wireaddr(&cursor, &len, remote_addr) == FROMWIREADDR_OK) {
+			switch (remote_addr->type) {
+			case ADDR_TYPE_IPV4:
+			case ADDR_TYPE_IPV6:
+				/* Drop non-public addresses when not testing */
+				if (!address_routable(remote_addr,
+						      peer->daemon->dev_allow_localhost))
+					remote_addr = tal_free(remote_addr);
+				break;
+			/* We are only interested in IP addresses */
+			case ADDR_TYPE_TOR_V2_REMOVED:
+			case ADDR_TYPE_TOR_V3:
+			case ADDR_TYPE_DNS:
+				remote_addr = tal_free(remote_addr);
+				break;
+			}
+		} else
+			remote_addr = tal_free(remote_addr);
+	}
+
 	/* The globalfeatures field is now unused, but there was a
 	 * window where it was: combine the two. */
 	features = featurebits_or(tmpctx, take(features), globalfeatures);
 
+	/* No longer timing out! */
+	tal_free(peer->timeout);
+
+	/* We can dispose of peer after next call. */
+	tal_steal(tmpctx, peer);
+
 	/* Usually return io_close_taken_fd, but may wait for old peer to
 	 * be disconnected if it's a reconnect. */
 	return peer_connected(conn, peer->daemon, &peer->id,
-			      &peer->addr, &peer->cs,
+			      &peer->addr,
+			      remote_addr,
+			      &peer->cs,
 			      take(features),
+			      peer->is_websocket,
+			      peer->starttime,
 			      peer->incoming);
 }
 
 static struct io_plan *peer_init_hdr_received(struct io_conn *conn,
-					      struct peer *peer)
+					      struct early_peer *peer)
 {
 	u16 len;
 
@@ -113,7 +173,7 @@ static struct io_plan *peer_init_hdr_received(struct io_conn *conn,
 		       peer_init_received, peer);
 }
 
-static struct io_plan *read_init(struct io_conn *conn, struct peer *peer)
+static struct io_plan *read_init(struct io_conn *conn, struct early_peer *peer)
 {
 	/* Free our sent init msg. */
 	tal_free(peer->msg);
@@ -128,14 +188,19 @@ static struct io_plan *read_init(struct io_conn *conn, struct peer *peer)
 		       peer_init_hdr_received, peer);
 }
 
-#if DEVELOPER
-static struct io_plan *peer_write_postclose(struct io_conn *conn,
-					    struct peer *peer)
+static struct io_plan *dev_peer_write_postclose(struct io_conn *conn,
+						struct early_peer *peer)
 {
-	dev_sabotage_fd(io_conn_fd(conn));
+	dev_sabotage_fd(io_conn_fd(conn), true);
 	return read_init(conn, peer);
 }
-#endif
+
+static struct io_plan *dev_peer_write_post_sabotage(struct io_conn *conn,
+						    struct early_peer *peer)
+{
+	dev_sabotage_fd(io_conn_fd(conn), false);
+	return read_init(conn, peer);
+}
 
 struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 				      struct daemon *daemon,
@@ -143,11 +208,14 @@ struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 				      const struct crypto_state *cs,
 				      const struct node_id *id,
 				      const struct wireaddr_internal *addr,
+				      struct oneshot *timeout,
+				      enum is_websocket is_websocket,
+				      struct timemono starttime,
 				      bool incoming)
 {
 	/* If conn is closed, forget peer */
-	struct peer *peer = tal(conn, struct peer);
-	struct io_plan *(*next)(struct io_conn *, struct peer *);
+	struct early_peer *peer = tal(conn, struct early_peer);
+	struct io_plan *(*next)(struct io_conn *, struct early_peer *);
 	struct tlv_init_tlvs *tlvs;
 
 	peer->daemon = daemon;
@@ -155,6 +223,9 @@ struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 	peer->addr = *addr;
 	peer->cs = *cs;
 	peer->incoming = incoming;
+	peer->is_websocket = is_websocket;
+	peer->timeout = timeout;
+	peer->starttime = starttime;
 
 	/* BOLT #1:
 	 *
@@ -168,6 +239,34 @@ struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 	tlvs = tlv_init_tlvs_new(tmpctx);
 	tlvs->networks = tal_dup_arr(tlvs, struct bitcoin_blkid,
 				     &chainparams->genesis_blockhash, 1, 0);
+
+	/* set optional tlv `remote_addr` on incoming IP connections */
+	tlvs->remote_addr = NULL;
+
+	/* BOLT #1:
+	 * The sending node:
+	 * ...
+	 *  - SHOULD set `remote_addr` to reflect the remote IP address (and port) of an
+	 *    incoming connection, if the node is the receiver and the connection was done
+	 *    via IP.
+	 */
+	if (incoming
+	    && addr->itype == ADDR_INTERNAL_WIREADDR
+	    && !addr->u.wireaddr.is_websocket
+	    && address_routable(&addr->u.wireaddr.wireaddr, true)) {
+		switch (addr->u.wireaddr.wireaddr.type) {
+		case ADDR_TYPE_IPV4:
+		case ADDR_TYPE_IPV6:
+			tlvs->remote_addr = tal_arr(tlvs, u8, 0);
+			towire_wireaddr(&tlvs->remote_addr, &addr->u.wireaddr.wireaddr);
+			break;
+		/* Only report IP addresses back for now */
+		case ADDR_TYPE_TOR_V2_REMOVED:
+		case ADDR_TYPE_TOR_V3:
+		case ADDR_TYPE_DNS:
+			break;
+		}
+	}
 
 	/* Initially, there were two sets of feature bits: global and local.
 	 * Local affected peer nodes only, global affected everyone.  Both were
@@ -194,23 +293,28 @@ struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 	peer->msg = cryptomsg_encrypt_msg(peer, &peer->cs, take(peer->msg));
 
 	next = read_init;
-#if DEVELOPER
-	switch (dev_disconnect(WIRE_INIT)) {
-	case DEV_DISCONNECT_BEFORE:
-		dev_sabotage_fd(io_conn_fd(conn));
+	switch (dev_disconnect_out(&peer->id, WIRE_INIT)) {
+	case DEV_DISCONNECT_OUT_BEFORE:
+		dev_sabotage_fd(io_conn_fd(conn), true);
 		break;
-	case DEV_DISCONNECT_DROPPKT:
-		peer->msg = tal_free(peer->msg); /* FALL THRU */
-	case DEV_DISCONNECT_AFTER:
-		next = peer_write_postclose;
+	case DEV_DISCONNECT_OUT_AFTER:
+		next = dev_peer_write_postclose;
 		break;
-	case DEV_DISCONNECT_BLACKHOLE:
-		dev_blackhole_fd(io_conn_fd(conn));
+	case DEV_DISCONNECT_OUT_BLACKHOLE:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Blackhole not supported during handshake");
 		break;
-	case DEV_DISCONNECT_NORMAL:
+	case DEV_DISCONNECT_OUT_NORMAL:
+	case DEV_DISCONNECT_OUT_DROP:
+		break;
+	case DEV_DISCONNECT_OUT_DISABLE_AFTER:
+		next = dev_peer_write_post_sabotage;
 		break;
 	}
-#endif /* DEVELOPER */
+
+	/* Don't converse if we said "no reply" */
+	if (daemon->dev_handshake_no_reply)
+		return io_wait(conn, peer->msg, io_never, NULL);
 
 	return io_write(conn, peer->msg, tal_bytelen(peer->msg), next, peer);
 }

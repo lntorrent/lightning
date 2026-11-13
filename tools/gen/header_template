@@ -37,28 +37,6 @@ const char *${enum_set['name']}_name(int e);
 bool ${enum_set['name']}_is_defined(u16 type);
 % endfor
 
-## Structs for subtypes + tlv messages
-% for struct in structs:
-struct ${struct.struct_name()} {
-        % for f in struct.fields.values():
-            % for c in f.field_comments:
-        /* ${c} */
-            % endfor
-        % if bool(f.len_field_of):
-<% continue %>
-        % endif
-            % if f.is_varlen() and f.type_obj.is_varsize():
-        ${f.type_obj.type_name()} **${f.name};
-            % elif f.is_varlen() or f.type_obj.is_varsize():
-        ${f.type_obj.type_name()} *${f.name};
-            % elif f.is_array():
-        ${f.type_obj.type_name()} ${f.name}[${f.count}];
-            % else:
-        ${f.type_obj.type_name()} ${f.name};
-            % endif
-        % endfor
-};
-% endfor
 ## Structs for TLVs
 % for tlv in tlvs.values():
 struct ${tlv.struct_name()} {
@@ -82,6 +60,29 @@ struct ${tlv.struct_name()} {
 };
 % endfor
 
+## Structs for subtypes + tlv messages
+% for struct in structs:
+struct ${struct.struct_name()} {
+        % for f in struct.fields.values():
+            % for c in f.field_comments:
+        /* ${c} */
+            % endfor
+        % if bool(f.len_field_of):
+<% continue %>
+        % endif
+            % if not f.type_obj.is_tlv() and f.is_varlen() and f.type_obj.is_varsize():
+        ${f.type_obj.type_name()} **${f.name};
+            % elif f.is_varlen() or f.type_obj.is_varsize():
+        ${f.type_obj.type_name()} *${f.name};
+            % elif f.is_array():
+        ${f.type_obj.type_name()} ${f.name}[${f.count}];
+            % else:
+        ${f.type_obj.type_name()} ${f.name};
+            % endif
+        % endfor
+};
+% endfor
+
 % for tlv in tlvs.values():
 struct ${tlv.struct_name()} *${tlv.struct_name()}_new(const tal_t *ctx);
 
@@ -93,8 +94,8 @@ struct ${tlv.struct_name()} *${tlv.struct_name()}_new(const tal_t *ctx);
  * current namespace are stored in the `fields` member. Validity can be
  * checked using ${tlv.name}_is_valid.
  */
-bool fromwire_${tlv.name}(const u8 **cursor, size_t *max,
-			  struct ${tlv.struct_name()} * record);
+struct ${tlv.struct_name()} *fromwire_${tlv.name}(const tal_t *ctx,
+						  const u8 **cursor, size_t *max);
 
 /**
  * Serialize a TLV stream for the ${tlv.name} namespace.
@@ -148,7 +149,7 @@ void towire_${subtype.name}(u8 **p, const ${subtype.type_name()} *${subtype.name
 % if subtype.is_varsize():
 ${subtype.type_name()} *fromwire_${subtype.name}(const tal_t *ctx, const u8 **cursor, size_t *plen);
 % else:
-void fromwire_${subtype.name}(const u8 **cursor, size_t *plen, ${subtype.type_name()} *${subtype.name});
+bool fromwire_${subtype.name}(const u8 **cursor, size_t *plen, ${subtype.type_name()} *${subtype.name});
 % endif
 
 % endfor

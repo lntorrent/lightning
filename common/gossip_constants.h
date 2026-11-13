@@ -1,13 +1,9 @@
 #ifndef LIGHTNING_COMMON_GOSSIP_CONSTANTS_H
 #define LIGHTNING_COMMON_GOSSIP_CONSTANTS_H
 #include "config.h"
-#include <common/utils.h>
 
-/* BOLT #4:
- *
- * - a 1300-byte `hop_payloads` consisting of multiple, variable length,
- *   `hop_payload` payloads or up to 20 fixed sized legacy `hop_data` payloads.
- */
+/* FIXME: This is a legacy concept, which should be eliminated now we have
+ * only onion tlv payloads. */
 #define ROUTING_MAX_HOPS 20
 
 /* BOLT #7:
@@ -22,30 +18,50 @@
 
 /* BOLT #7:
  *
- * The `message_flags` bitfield is used to indicate the presence of optional
- * fields in the `channel_update` message:
- * | Bit Position  | Name                      | Field                |
- * | ------------- | ------------------------- | ----------------...- |
- * | 0             | `option_channel_htlc_max` | `htlc_maximum_msat`  |
+ * The `message_flags` bitfield is used to provide additional details about the message:
+ * | Bit Position  | Name           |
+ * | ------------- | ---------------|
+ * | 0             | `must_be_one`  |
+ * | 1             | `dont_forward` |
  */
+/* FIXME: This is the old name */
 #define ROUTING_OPT_HTLC_MAX_MSAT (1 << 0)
+#define ROUTING_OPT_DONT_FORWARD (1 << 1)
 
 /* BOLT #7:
  *
- * - MUST NOT send `announcement_signatures` messages until `funding_locked`
- *   has been sent and received AND the funding transaction has at least six
- *   confirmations.
+ * - If the funding transaction has less than 6 confirmations:
+ *   - MUST NOT send `channel_announcement`.
  */
 #define ANNOUNCE_MIN_DEPTH 6
 
-/* Gossip timing constants.  These can be overridden in --enable-developer
- * configurations with --dev-fast-gossip, otherwise the argument is ignored */
+/* BOLT #7:
+ *
+ * `query_option_flags` is a bitfield represented as a minimally-encoded bigsize.
+ * Bits have the following meaning:
+ *
+ * | Bit Position  | Meaning                 |
+ * | ------------- | ----------------------- |
+ * | 0             | Sender wants timestamps |
+ * | 1             | Sender wants checksums  |
+ */
+enum query_option_flags {
+	QUERY_ADD_TIMESTAMPS = 0x1,
+	QUERY_ADD_CHECKSUMS = 0x2,
+};
+
+/* Gossip timing constants.  These can be overridden using --developer
+ * with --dev-fast-gossip */
 #define DEV_FAST_GOSSIP(dev_fast_gossip_flag, fast, normal)	\
-	IFDEV((dev_fast_gossip_flag) ? (fast) : (normal), (normal))
+	((dev_fast_gossip_flag) ? (fast) : (normal))
 
 /* How close we can generate gossip msgs (5 minutes) */
 #define GOSSIP_MIN_INTERVAL(dev_fast_gossip_flag) \
 	DEV_FAST_GOSSIP(dev_fast_gossip_flag, 5, 300)
+
+/* How long to wait at start for the plugin to callback with liquidity ad */
+#define GOSSIP_NANN_STARTUP_DELAY(dev_fast_gossip_flag) \
+	DEV_FAST_GOSSIP(dev_fast_gossip_flag, 8, 60)
 
 /* BOLT #7:
  *
@@ -58,13 +74,16 @@
 /* BOLT #7:
  *
  * A node:
- *   - if a channel's oldest `channel_update`s `timestamp` is older than two weeks
- *   (1209600 seconds):
+ * - if the `timestamp` of the latest `channel_update` in
+ *   either direction is older than two weeks (1209600 seconds):
  *     - MAY prune the channel.
  *     - MAY ignore the channel.
+ *     - Note: this is an individual node policy and MUST NOT be enforced by
+ *     forwarding peers, e.g. by closing channels when receiving outdated
+ *     gossip messages.
  */
 #define GOSSIP_PRUNE_INTERVAL(dev_fast_gossip_prune_flag) \
-	DEV_FAST_GOSSIP(dev_fast_gossip_prune_flag, 60, 1209600)
+	DEV_FAST_GOSSIP(dev_fast_gossip_prune_flag, 120, 1209600)
 
 /* How long after seeing lockin until we announce the channel. */
 #define GOSSIP_ANNOUNCE_DELAY(dev_fast_gossip_flag) \
@@ -77,6 +96,10 @@
 /* How many seconds per token?  Normally 1 hour. */
 #define GOSSIP_TOKEN_TIME(dev_fast_gossip_flag) \
 	DEV_FAST_GOSSIP(dev_fast_gossip_flag, 1, 3600)
+
+/* How often we save a peer's channel_update for our channel to the db. */
+#define PEER_UPDATE_SAVE_INTERVAL(dev_fast_gossip_flag) \
+	DEV_FAST_GOSSIP(dev_fast_gossip_flag, 5, 60)
 
 /* This is where we keep our gossip */
 #define GOSSIP_STORE_FILENAME "gossip_store"

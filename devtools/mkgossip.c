@@ -8,17 +8,12 @@
  */
 #include "config.h"
 #include <assert.h>
-#include <bitcoin/address.h>
-#include <bitcoin/script.h>
-#include <bitcoin/short_channel_id.h>
-#include <bitcoin/tx.h>
+#include <bitcoin/signature.h>
 #include <ccan/crc32c/crc32c.h>
 #include <ccan/err/err.h>
 #include <ccan/opt/opt.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
-#include <common/gossip_constants.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -29,10 +24,9 @@ static bool verbose = false;
 struct update_opts {
 	u32 timestamp;
 	u32 cltv_expiry_delta;
-	struct amount_msat min;
+	struct amount_msat min, max;
 	struct amount_msat feebase;
 	u32 fee_proportional_millionths;
-	struct amount_msat *max;
 	u8 *addresses;
 };
 
@@ -58,14 +52,9 @@ static int parse_options(char *argv[], struct update_opts *opts,
 	if (!opts->fee_proportional_millionths)
 		errx(1, "Bad %s.fee_proportional_millionths", desc);
 
-	if (streq(argv[argnum], ""))
-		opts->max = NULL;
-	else {
-		opts->max = tal(NULL, struct amount_msat);
-		if (!parse_amount_msat(opts->max,
-				       argv[argnum], strlen(argv[argnum])))
-			errx(1, "Bad %s.max", desc);
-	}
+	if (!parse_amount_msat(&opts->max,
+			       argv[argnum], strlen(argv[argnum])))
+		errx(1, "Bad %s.max", desc);
 	argnum++;
 	opts->addresses = tal_hexdata(NULL, argv[argnum], strlen(argv[argnum]));
 	if (!opts->addresses)
@@ -90,8 +79,7 @@ static char *sig_notation(const struct privkey *privkey,
 {
 	const char *pstr = tal_hexstr(NULL, privkey->secret.data,
 				      sizeof(privkey->secret.data));
-	const char *hstr =
-		type_to_string(NULL, struct sha256_double, hash);
+	const char *hstr = fmt_sha256_double(NULL, hash);
 
 	if (verbose)
 		return tal_fmt(NULL,
@@ -133,7 +121,7 @@ static u32 crc32_of_update(const u8 *channel_update)
 }
 
 static void print_update(const struct bitcoin_blkid *chainhash,
-			 const struct short_channel_id *scid,
+			 struct short_channel_id scid,
 			 const struct update_opts *opts,
 			 bool is_lesser_key,
 			 const struct privkey *privkey)
@@ -145,8 +133,7 @@ static void print_update(const struct bitcoin_blkid *chainhash,
 	u8 *cupdate;
 
 	memset(&sig, 0, sizeof(sig));
-	if (opts->max) {
-		cupdate = towire_channel_update_option_channel_htlc_max
+	cupdate = towire_channel_update
 			(NULL, &sig, chainhash, scid, opts->timestamp,
 			 ROUTING_OPT_HTLC_MAX_MSAT,
 			 is_lesser_key ? 0 : ROUTING_FLAGS_DIRECTION,
@@ -154,17 +141,7 @@ static void print_update(const struct bitcoin_blkid *chainhash,
 			 opts->min,
 			 opts->feebase.millisatoshis, /* Raw: devtools code */
 			 opts->fee_proportional_millionths,
-			 *opts->max);
-	} else {
-		cupdate = towire_channel_update
-			(NULL, &sig, chainhash, scid, opts->timestamp,
-			 0,
-			 is_lesser_key ? 0 : ROUTING_FLAGS_DIRECTION,
-			 opts->cltv_expiry_delta,
-			 opts->min,
-			 opts->feebase.millisatoshis, /* Raw: devtools code */
-			 opts->fee_proportional_millionths);
-	}
+			 opts->max);
 	sha256_double(&hash, cupdate + channel_update_offset,
 		      tal_count(cupdate) - channel_update_offset);
 	sign_hash(privkey, &hash, &sig);
@@ -172,10 +149,10 @@ static void print_update(const struct bitcoin_blkid *chainhash,
 	printf("type=channel_update\n");
 	printf("   signature=%s\n", sig_notation(privkey, &hash, &sig));
 	printf("   chain_hash=%s\n", tal_hexstr(NULL, chainhash, sizeof(*chainhash)));
-	printf("   short_channel_id=%s\n", short_channel_id_to_str(NULL, scid));
+	printf("   short_channel_id=%s\n", fmt_short_channel_id(NULL, scid));
 	printf("   timestamp=%u\n", opts->timestamp);
 	printf("   message_flags=%u\n",
-	       opts->max ? ROUTING_OPT_HTLC_MAX_MSAT : 0);
+	       ROUTING_OPT_HTLC_MAX_MSAT);
 	printf("   channel_flags=%u\n",
 	       is_lesser_key ? 0 : ROUTING_FLAGS_DIRECTION);
 	printf("   cltv_expiry_delta=%u\n",
@@ -186,9 +163,8 @@ static void print_update(const struct bitcoin_blkid *chainhash,
 	       opts->feebase.millisatoshis);  /* Raw: devtools code */
 	printf("   fee_proportional_millionths=%u\n",
 	       opts->fee_proportional_millionths);
-	if (opts->max)
-		printf("   htlc_maximum_msat=%"PRIu64"\n",
-		       opts->max->millisatoshis);  /* Raw: devtools code */
+	printf("   htlc_maximum_msat=%"PRIu64"\n",
+	       opts->max.millisatoshis);  /* Raw: devtools code */
 	printf("# crc32c checksum: %08x\n", crc32_of_update(cupdate));
 }
 
@@ -201,14 +177,17 @@ static void print_nannounce(const struct node_id *nodeid,
 	struct sha256_double hash;
 	secp256k1_ecdsa_signature sig;
 	char alias[33];
+	struct tlv_node_ann_tlvs *tlvs;
 	u8 *nannounce;
 
 	memset(&sig, 0, sizeof(sig));
 	assert(hex_str_size(sizeof(*nodeid)) >= sizeof(alias));
 	hex_encode(nodeid, hex_data_size(sizeof(alias)), alias, sizeof(alias));
+	tlvs = tlv_node_ann_tlvs_new(NULL);
 	nannounce = towire_node_announcement(NULL, &sig, NULL, opts->timestamp,
 					     nodeid, nodeid->k, (u8 *)alias,
-					     opts->addresses);
+					     opts->addresses,
+					     tlvs);
 	sha256_double(&hash, nannounce + node_announcement_offset,
 		      tal_count(nannounce) - node_announcement_offset);
 	sign_hash(privkey, &hash, &sig);
@@ -217,10 +196,26 @@ static void print_nannounce(const struct node_id *nodeid,
 	printf("   signature=%s\n", sig_notation(privkey, &hash, &sig));
 	printf("   features=%s\n", tal_hex(NULL, NULL));
 	printf("   timestamp=%u\n", opts->timestamp);
-	printf("   node_id=%s\n", node_id_to_hexstr(NULL, nodeid));
+	printf("   node_id=%s\n", fmt_node_id(NULL, nodeid));
 	printf("   rgb_color=%s\n", tal_hexstr(NULL, nodeid->k, 3));
 	printf("   alias=%s\n", tal_hexstr(NULL, alias, 32));
 	printf("   addresses=%s\n", tal_hex(NULL, opts->addresses));
+
+	if (tlvs->option_will_fund) {
+		struct lease_rates *rates = tlvs->option_will_fund;
+		printf("	TLV option_will_fund\n");
+		printf("	lease_fee_basis=%d\n",
+		       rates->lease_fee_basis);
+		printf("	lease_fee_base_sat=%d\n",
+		       rates->lease_fee_base_sat);
+		printf("	funding_weight=%d\n",
+		       rates->funding_weight);
+		printf("	channel_fee_max_proportional_thousandths=%d\n",
+		       rates->channel_fee_max_proportional_thousandths);
+		printf("	channel_fee_max_base_msat=%d\n",
+		       rates->channel_fee_max_base_msat);
+	}
+	tal_free(tlvs);
 }
 
 int main(int argc, char *argv[])
@@ -314,7 +309,7 @@ int main(int argc, char *argv[])
 						&bitcoinsig[lesser_key],
 						&bitcoinsig[!lesser_key],
 						features, &chainhash,
-						&scid,
+						scid,
 						&nodeid[lesser_key],
 						&nodeid[!lesser_key],
 						&bitcoin[lesser_key],
@@ -337,23 +332,23 @@ int main(int argc, char *argv[])
 	       sig_notation(&funding_privkey[!lesser_key], &hash, &bitcoinsig[!lesser_key]));
 	printf("   features=%s\n", tal_hex(NULL, features));
 	printf("   chain_hash=%s\n", tal_hexstr(NULL, &chainhash, sizeof(chainhash)));
-	printf("   short_channel_id=%s\n", short_channel_id_to_str(NULL, &scid));
+	printf("   short_channel_id=%s\n", fmt_short_channel_id(NULL, scid));
 	printf("   node_id_1=%s\n",
-	       node_id_to_hexstr(NULL, &nodeid[lesser_key]));
+	       fmt_node_id(NULL, &nodeid[lesser_key]));
 	printf("   node_id_2=%s\n",
-	       node_id_to_hexstr(NULL, &nodeid[!lesser_key]));
+	       fmt_node_id(NULL, &nodeid[!lesser_key]));
 	printf("   bitcoin_key_1=%s\n",
-	       pubkey_to_hexstr(NULL, &bitcoin[lesser_key]));
+	       fmt_pubkey(NULL, &bitcoin[lesser_key]));
 	printf("   bitcoin_key_2=%s\n",
-	       pubkey_to_hexstr(NULL, &bitcoin[!lesser_key]));
+	       fmt_pubkey(NULL, &bitcoin[!lesser_key]));
 
 	printf("\n#Node 1:\n");
-	print_update(&chainhash, &scid, &opts[0], lesser_key == 0,
+	print_update(&chainhash, scid, &opts[0], lesser_key == 0,
 		     &node_privkey[0]);
 	print_nannounce(&nodeid[0], &opts[0], &node_privkey[0]);
 
 	printf("\n#Node 2:\n");
-	print_update(&chainhash, &scid, &opts[1], lesser_key == 1,
+	print_update(&chainhash, scid, &opts[1], lesser_key == 1,
 		     &node_privkey[1]);
 
 	print_nannounce(&nodeid[1], &opts[1], &node_privkey[1]);

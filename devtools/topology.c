@@ -3,14 +3,10 @@
 #include <ccan/err/err.h>
 #include <ccan/opt/opt.h>
 #include <ccan/time/time.h>
-#include <common/amount.h>
 #include <common/dijkstra.h>
 #include <common/gossmap.h>
-#include <common/node_id.h>
-#include <common/pseudorand.h>
-#include <common/random_select.h>
 #include <common/route.h>
-#include <common/type_to_string.h>
+#include <common/utils.h>
 #include <devtools/clean_topo.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -149,15 +145,6 @@ static size_t count_possible_destinations(const struct gossmap *map,
 	     n = gossmap_next_node(map, n)) {
 		if (dijkstra_distance(dij, gossmap_node_idx(map, n)) <= distance_budget)
 			num++;
-#if 0
-		else
-			printf("Can't reach %s (%u) if we exclude %s\n",
-			       type_to_string(tmpctx, struct node_id,
-					      gossmap_node_get_id(map, n)),
-			       dijkstra_distance(dij, gossmap_node_idx(map, n)),
-			       type_to_string(tmpctx, struct node_id,
-					      gossmap_node_get_id(map, exclude)));
-#endif
 	}
 
 	/* Now double-check with flood-fill. */
@@ -180,13 +167,13 @@ static bool measure_least_cost(struct gossmap *map,
 	/* Max distance is 20 */
 	const u32 distance_budget = ROUTING_MAX_HOPS;
 	struct amount_msat maxcost, fee;
-	struct route **path;
+	struct route_hop *path;
 	struct timemono tstart, tstop;
 	struct node_id srcid;
 
 	gossmap_node_get_id(map, src, &srcid);
 	printf("# src %s (%u channels)\n",
-	       type_to_string(tmpctx, struct node_id, &srcid),
+	       fmt_node_id(tmpctx, &srcid),
 	       src->num_chans);
 
 	tstart = time_mono();
@@ -205,25 +192,27 @@ static bool measure_least_cost(struct gossmap *map,
 	}
 	if (!amount_msat_add(&maxcost, sent, budget))
 		abort();
-	if (amount_msat_greater(dijkstra_amount(dij, srcidx), maxcost)) {
+
+	path = route_from_dijkstra(map, map, dij, src, sent, 0);
+
+	if (amount_msat_greater(path[0].amount, maxcost)) {
 		printf("failed (too expensive)\n");
 		return false;
 	}
-
-	path = route_from_dijkstra(map, map, dij, src);
 	printf("# path length %zu\n", tal_count(path));
-	if (!amount_msat_sub(&fee, dijkstra_amount(dij, srcidx), sent))
+	if (!amount_msat_sub(&fee, path[0].amount, sent))
 		abort();
 	printf("# path fee %s\n",
-	       type_to_string(tmpctx, struct amount_msat, &fee));
+	       fmt_amount_msat(tmpctx, fee));
 
 	/* Count possible sources */
 	for (size_t i = 0; i < tal_count(path); i++) {
 		struct gossmap_node *prev, *cur;
+		struct gossmap_chan *c = gossmap_find_chan(map, &path[i].scid);
 
 		/* N+1th node is at end of Nth hop */
-		prev = gossmap_nth_node(map, path[i]->c, path[i]->dir);
-		cur = gossmap_nth_node(map, path[i]->c, !path[i]->dir);
+		prev = gossmap_nth_node(map, c, path[i].direction);
+		cur = gossmap_nth_node(map, c, !path[i].direction);
 
 		printf("source set size node %zu/%zu: %zu\n",
 		       i+1, tal_count(path),
@@ -233,10 +222,11 @@ static bool measure_least_cost(struct gossmap *map,
 	/* Count possible destinations. */
 	for (size_t i = 0; i < tal_count(path); i++) {
 		struct gossmap_node *cur, *next;
+		struct gossmap_chan *c = gossmap_find_chan(map, &path[i].scid);
 
 		/* N+1th node is at end of Nth hop */
-		cur = gossmap_nth_node(map, path[i]->c, path[i]->dir);
-		next = gossmap_nth_node(map, path[i]->c, !path[i]->dir);
+		cur = gossmap_nth_node(map, c, path[i].direction);
+		next = gossmap_nth_node(map, c, !path[i].direction);
 
 		printf("destination set size node %zu/%zu: %zu\n",
 		       i, tal_count(path),
@@ -267,7 +257,7 @@ int main(int argc, char *argv[])
 		opt_usage_exit_fail("Expect 3 arguments");
 
 	tstart = time_mono();
-	map = gossmap_load(NULL, argv[1]);
+	map = gossmap_load(NULL, argv[1], NULL, NULL);
 	if (!map)
 		err(1, "Loading gossip store %s", argv[1]);
 	tstop = time_mono();

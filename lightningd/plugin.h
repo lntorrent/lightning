@@ -2,24 +2,9 @@
 #define LIGHTNING_LIGHTNINGD_PLUGIN_H
 #include "config.h"
 #include <ccan/intmap/intmap.h>
-#include <ccan/io/io.h>
-#include <ccan/pipecmd/pipecmd.h>
-#include <ccan/take/take.h>
-#include <ccan/tal/path/path.h>
-#include <ccan/tal/tal.h>
-#include <common/json_command.h>
-#include <common/jsonrpc_errors.h>
-#include <common/memleak.h>
-#include <common/param.h>
-#include <common/timeout.h>
-#include <dirent.h>
-#include <errno.h>
-#include <lightningd/io_loop_with_timers.h>
+#include <common/hash_str.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/log.h>
-#include <stdarg.h>
-#include <unistd.h>
 
 
 enum plugin_state {
@@ -35,19 +20,48 @@ enum plugin_state {
 	INIT_COMPLETE
 };
 
+struct plugin_subscription {
+	struct plugin *owner;
+	const char *topic;
+};
+
+static inline const char *plugin_subscription_key(const struct plugin_subscription *ps)
+{
+	return ps->topic;
+}
+
+static inline bool plugin_subscription_eq_topic(const struct plugin_subscription *ps,
+						const char *topic)
+{
+	return streq(ps->topic, topic);
+}
+
+HTABLE_DEFINE_DUPS_TYPE(struct plugin_subscription,
+			plugin_subscription_key,
+			hash_str,
+			plugin_subscription_eq_topic,
+			plugin_subscription_htable);
+
 /**
  * A plugin, exposed as a stub so we can pass it as an argument.
  */
 struct plugin {
+	/* Must be first element in the struct otherwise we get false
+	 * positives for leaks. */
 	struct list_node list;
+
+	/* The filename that can be used to refer to the plugin. */
+	const char *shortname;
 
 	pid_t pid;
 	char *cmd;
+	u32 checksum;
 	struct io_conn *stdin_conn, *stdout_conn;
 	struct plugins *plugins;
 	const char **plugin_path;
+
 	/* If there's a json command which ordered this to start */
-	struct command *start_cmd;
+	struct plugin_command *start_cmd;
 
 	enum plugin_state plugin_state;
 
@@ -58,17 +72,13 @@ struct plugin {
 	bool dynamic;
 
 	/* Stuff we read */
-	char *buffer;
-	size_t used, len_read;
-	jsmn_parser parser;
-	jsmntok_t *toks;
+	struct jsonrpc_io *json_in;
 
-	/* Our json_streams. Since multiple streams could start
-	 * returning data at once, we always service these in order,
-	 * freeing once empty. */
-	struct json_stream **js_arr;
+	/* Our plugin_jstream_out list. Since multiple streams could start
+	 * returning data at once, we always service these in order. */
+	struct list_head jsouts;
 
-	struct log *log;
+	struct logger *log;
 
 	/* List of options that this plugin registered */
 	struct list_head plugin_opts;
@@ -80,11 +90,10 @@ struct plugin {
 	const struct oneshot *timeout_timer;
 
 	/* An array of subscribed topics */
-	char **subscriptions;
+	struct plugin_subscription *subscriptions;
 
-	/* An array of currently pending RPC method calls, to be killed if the
-	 * plugin exits. */
-	struct list_head pending_rpccalls;
+	/* Our pending requests by their request ID */
+	STRMAP(struct jsonrpc_request *) pending_requests;
 
 	/* If set, the plugin is so important that if it terminates early,
 	 * C-lightning should terminate as well.  */
@@ -93,6 +102,19 @@ struct plugin {
 	/* Parameters for dynamically-started plugins. */
 	const char *parambuf;
 	const jsmntok_t *params;
+
+	/* Notification topics that this plugin has registered with us
+	 * and that other plugins may subscribe to. */
+	const char **notification_topics;
+
+	/* Custom message types we want to allow incoming */
+	u16 *custom_msgs;
+
+	/* Can this handle check commands? */
+	bool can_check;
+
+	/* custom feature-bits */
+	struct feature_set *fset;
 };
 
 /**
@@ -104,40 +126,32 @@ struct plugins {
 	struct list_head plugins;
 	bool startup;
 
-	/* Currently pending requests by their request ID */
-	UINTMAP(struct jsonrpc_request *) pending_requests;
-	struct log *log;
-	struct log_book *log_book;
+	/* Normally we want to wrap callbacks in a db transaction, but
+	 * not for the db hook servicing */
+	bool want_db_transaction;
+
+	struct logger *log;
 
 	struct lightningd *ld;
 	const char *default_dir;
 
 	/* If there are json commands waiting for plugin resolutions. */
-	struct command **json_cmds;
+	struct plugin_command **plugin_cmds;
 
 	/* Blacklist of plugins from --disable-plugin */
 	const char **blacklist;
 
-	/* Whether we are shutting down (`plugins_free` is called) */
-	bool shutdown;
-
 	/* Index to show what order they were added in */
 	u64 plugin_idx;
 
-#if DEVELOPER
+	/* Table of who subscribed to what hooks/notifications */
+	struct plugin_subscription_htable *subscriptions;
+
 	/* Whether builtin plugins should be overridden as unimportant.  */
 	bool dev_builtin_plugins_unimportant;
-#endif /* DEVELOPER */
-};
 
-/* The value of a plugin option, which can have different types.
- * The presence of the integer and boolean values will depend of
- * the option type, but the string value will always be filled.
- */
-struct plugin_opt_value {
-	char *as_str;
-	s64 as_int;
-	bool as_bool;
+	/* Whether to save all IO to a file */
+	char *dev_save_io;
 };
 
 /**
@@ -145,15 +159,16 @@ struct plugin_opt_value {
  * command line and passing them off to the plugin
  */
 struct plugin_opt {
+	struct plugin *plugin;
+	/* off plugin->plugin_opts */
 	struct list_node list;
+	/* includes -- prefix! */
 	const char *name;
-	const char *type;
 	const char *description;
-	struct plugin_opt_value **values;
-	/* Might be NULL if no default */
-	struct plugin_opt_value *def;
-	bool multi;
-	bool deprecated;
+	/* NULL if no default */
+	const char *def;
+	/* NULL if not deprecated */
+	const char *depr_start, *depr_end;
 };
 
 /**
@@ -179,26 +194,6 @@ void plugins_add_default_dir(struct plugins *plugins);
 void plugins_init(struct plugins *plugins);
 
 /**
- * Free all resources that are held by plugins in the correct order.
- *
- * This function ensures that the resources dangling off of the plugins struct
- * are freed in the correct order. This is necessary since the struct manages
- * two orthogonal sets of resources:
- *
- *  - Plugins
- *  - Hook calls and notifications
- *
- * The tal hierarchy is organized in a plugin centric way, i.e., the plugins
- * may exit in an arbitrary order and they'll unregister pointers in the other
- * resources. However this will fail if `tal_free` decides to free one of the
- * non-plugin resources (technically a sibling in the allocation tree) before
- * the plugins we will get a use-after-free. This function fixes this by
- * freeing in the correct order without adding additional child-relationships
- * in the allocation structure and without adding destructors.
- */
-void plugins_free(struct plugins *plugins);
-
-/**
  * Register a plugin for initialization and execution.
  *
  * @param plugins: Plugin context
@@ -213,7 +208,7 @@ void plugins_free(struct plugins *plugins);
  */
 struct plugin *plugin_register(struct plugins *plugins,
 			       const char* path TAKES,
-			       struct command *start_cmd,
+			       struct plugin_command *start_cmd,
 			       bool important,
 			       const char *parambuf STEALS,
 			       const jsmntok_t *params STEALS);
@@ -242,23 +237,30 @@ bool plugin_blacklisted(struct plugins *plugins, const char *name);
 
 /**
  * Kick off initialization of a plugin.
+ * @p: plugin
+ * @cmd_id: optional JSON cmd_id which caused this.
  *
  * Returns error string, or NULL.
  */
-const char *plugin_send_getmanifest(struct plugin *p);
+const char *plugin_send_getmanifest(struct plugin *p, const char *cmd_id);
 
 /**
  * Kick of initialization of all plugins which need it/
  *
  * Return true if any were started.
  */
-bool plugins_send_getmanifest(struct plugins *plugins);
+bool plugins_send_getmanifest(struct plugins *plugins, const char *cmd_id);
 
 /**
  * Kill a plugin process and free @plugin, with an error message.
  */
 void plugin_kill(struct plugin *plugin, enum log_level loglevel,
 		 const char *fmt, ...);
+
+/**
+ * Tell all the plugins we're shutting down, and free them.
+ */
+void shutdown_plugins(struct lightningd *ld);
 
 /**
  * Returns the plugin which registers the command with name {cmd_name}
@@ -274,7 +276,7 @@ struct plugin *find_plugin_for_command(struct lightningd *ld,
  * plugin_cmd_all_complete().
  */
 struct command_result *plugin_register_all_complete(struct lightningd *ld,
-						    struct command *cmd);
+						    struct plugin_command *pcmd);
 
 /**
  * Send the configure message to all plugins.
@@ -283,18 +285,11 @@ struct command_result *plugin_register_all_complete(struct lightningd *ld,
  * and send them over to the plugin. This finalizes the initialization
  * of the plugins and signals that lightningd is now ready to process
  * incoming JSON-RPC calls and messages.
+ *
+ * It waits for plugins to be initialized, but returns false if we
+ * should exit (an important plugin failed, or we got a shutdown command).
  */
-void plugins_config(struct plugins *plugins);
-
-/**
- * Are any plugins at this state still?
- */
-bool plugins_any_in_state(const struct plugins *plugins, enum plugin_state state);
-
-/**
- * Are all plugins at this state?
- */
-bool plugins_all_in_state(const struct plugins *plugins, enum plugin_state state);
+bool plugins_config(struct plugins *plugins);
 
 /**
  * This populates the jsonrpc request with the plugin/lightningd specifications
@@ -340,14 +335,29 @@ char *add_plugin_dir(struct plugins *plugins, const char *dir,
  */
 void clear_plugins(struct plugins *plugins);
 
+/**
+ * Send notification to this single plugin, if interested.
+ *
+ * Returns true if it was subscribed to the notification.
+ */
+bool plugin_single_notify(struct plugin *p,
+			  const struct jsonrpc_notification *n TAKES);
+
+/**
+ * Send notification to all interested plugins.
+ */
 void plugins_notify(struct plugins *plugins,
 		    const struct jsonrpc_notification *n TAKES);
 
 /**
  * Send a jsonrpc_request to the specified plugin
+ * @plugin: the plugin to send the request to
+ * @req: the request.
+ *
+ * If @req is freed, any response from the plugin is ignored.
  */
 void plugin_request_send(struct plugin *plugin,
-			 struct jsonrpc_request *req TAKES);
+			 struct jsonrpc_request *req);
 
 /**
  * Callback called when parsing options. It just stores the value in
@@ -373,7 +383,7 @@ struct io_plan *plugin_stdout_conn_init(struct io_conn *conn,
 /**
  * Needed for I/O logging for plugin messages.
 */
-struct log *plugin_get_log(struct plugin *plugin);
+struct logger *plugin_get_logger(struct plugin *plugin);
 
 /**
  * Tells the plugin system the directory for builtin plugins.
@@ -381,8 +391,43 @@ struct log *plugin_get_log(struct plugin *plugin);
 void plugins_set_builtin_plugins_dir(struct plugins *plugins,
 				     const char *dir);
 
-/* Pair of functions to detect if plugin destroys itself: must always
- * call both! */
-struct plugin_destroyed *plugin_detect_destruction(const struct plugin *plugin);
-bool was_plugin_destroyed(struct plugin_destroyed *destroyed);
+/* Is this option for a plugin? */
+bool is_plugin_opt(const struct opt_table *ot);
+
+/* Does any plugin care about this notification? */
+bool plugins_anyone_cares(struct plugins *plugins, const char *method);
+
+/* Add this field if this ot is owned by a plugin */
+void json_add_config_plugin(struct json_stream *stream,
+			    const struct plugins *plugins,
+			    const char *fieldname,
+			    const struct opt_table *ot);
+
+/* Attempt to setconfig an option in a plugin.  Calls success or fail, may be async!
+ * For scalar options: vals is 1-element array (or NULL/0 for NOARG).
+ * For multi options: vals is the complete new set of values. */
+struct command_result *plugin_set_dynamic_opt(struct command *cmd,
+					      const struct opt_table *ot,
+					      const char **vals,
+					      size_t nvals,
+					      bool transient,
+					      struct command_result *(*success)
+					      (struct command *,
+					       const struct opt_table *,
+					       const char **,
+					       size_t,
+					       bool));
+
+/* --dev-plugin-save-io */
+void dev_save_plugin_io_in(struct plugins *plugins,
+			   const char *type,
+			   const char *name,
+			   const char *buffer,
+			   const jsmntok_t *tok);
+
+void dev_save_plugin_io_out(struct plugins *plugins,
+			    const char *type,
+			    const char *name,
+			    const struct json_stream *stream);
+
 #endif /* LIGHTNING_LIGHTNINGD_PLUGIN_H */

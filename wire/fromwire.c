@@ -1,13 +1,10 @@
-#include "wire.h"
+#include "config.h"
 #include <assert.h>
-#include <ccan/build_assert/build_assert.h>
 #include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/str/str.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
+#include <wire/wire.h>
 
 #ifndef SUPERVERBOSE
 #define SUPERVERBOSE(...)
@@ -35,22 +32,28 @@ const u8 *fromwire(const u8 **cursor, size_t *max, void *copy, size_t n)
 			SUPERVERBOSE("less than encoding length");
 		return fromwire_fail(cursor, max);
 	}
-	*cursor += n;
+	/* ubsan: runtime error: applying zero offset to null pointer */
+	if (*cursor)
+		*cursor += n;
 	*max -= n;
-	if (copy)
+	if (copy && n)
 		memcpy(copy, p, n);
 	return memcheck(p, n);
 }
 
-int fromwire_peektype(const u8 *cursor)
+int fromwire_peektypen(const u8 *cursor, size_t max)
 {
 	be16 be_type;
-	size_t max = tal_count(cursor);
 
 	fromwire(&cursor, &max, &be_type, sizeof(be_type));
 	if (!cursor)
 		return -1;
 	return be16_to_cpu(be_type);
+}
+
+int fromwire_peektype(const u8 *cursor)
+{
+	return fromwire_peektypen(cursor, tal_count(cursor));
 }
 
 u8 fromwire_u8(const u8 **cursor, size_t *max)
@@ -89,6 +92,26 @@ u64 fromwire_u64(const u8 **cursor, size_t *max)
 	return be64_to_cpu(ret);
 }
 
+s8 fromwire_s8(const u8 **cursor, size_t *max)
+{
+	return (s8)fromwire_u8(cursor, max);
+}
+
+s16 fromwire_s16(const u8 **cursor, size_t *max)
+{
+	return (s16)fromwire_u16(cursor, max);
+}
+
+s32 fromwire_s32(const u8 **cursor, size_t *max)
+{
+	return (s32)fromwire_u32(cursor, max);
+}
+
+s64 fromwire_s64(const u8 **cursor, size_t *max)
+{
+	return (s64)fromwire_u64(cursor, max);
+}
+
 static u64 fromwire_tlv_uint(const u8 **cursor, size_t *max, size_t maxlen)
 {
 	u8 bytes[8];
@@ -123,8 +146,7 @@ static u64 fromwire_tlv_uint(const u8 **cursor, size_t *max, size_t maxlen)
 		fromwire_fail(cursor, max);
 		return 0;
 	}
-	BUILD_ASSERT(sizeof(val) == sizeof(bytes));
-	memcpy(&val, bytes, sizeof(bytes));
+	CROSS_TYPE_ASSIGNMENT(&val, &bytes);
 	return be64_to_cpu(val);
 }
 
@@ -154,9 +176,9 @@ bool fromwire_bool(const u8 **cursor, size_t *max)
 	return ret;
 }
 
-errcode_t fromwire_errcode_t(const u8 **cursor, size_t *max)
+enum jsonrpc_errcode fromwire_jsonrpc_errcode(const u8 **cursor, size_t *max)
 {
-	errcode_t ret;
+	enum jsonrpc_errcode ret;
 
 	ret = (s32)fromwire_u32(cursor, max);
 
@@ -226,6 +248,8 @@ u8 *fromwire_tal_arrn(const tal_t *ctx,
 
 	arr = tal_arr(ctx, u8, num);
 	fromwire_u8_array(cursor, max, arr, num);
+	if (!*cursor)
+		return tal_free(arr);
 	return arr;
 }
 
@@ -259,3 +283,4 @@ void fromwire_siphash_seed(const u8 **cursor, size_t *max,
 {
 	fromwire(cursor, max, seed, sizeof(*seed));
 }
+

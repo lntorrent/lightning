@@ -1,26 +1,18 @@
+#include "config.h"
 #include <bitcoin/address.h>
-#include <bitcoin/base58.h>
-#include <bitcoin/chainparams.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
-#include <ccan/cast/cast.h>
-#include <ccan/endian/endian.h>
 #include <ccan/tal/str/str.h>
 #include <common/bech32.h>
 #include <common/bech32_util.h>
 #include <common/bolt11.h>
 #include <common/features.h>
-#include <common/utils.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <lightningd/hsm_control.h>
-#include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/log.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <wire/wire.h>
-#include <wire/wire_sync.h>
+
+bool dev_bolt11_old_order;
+bool dev_bolt11_omit_c_value;
 
 struct multiplier {
 	const char letter;
@@ -45,10 +37,11 @@ static struct multiplier multipliers[] = {
 };
 
 /* If pad is false, we discard any bits which don't fit in the last byte.
- * Otherwise we add an extra byte */
-static bool pull_bits(struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len, void *dst, size_t nbits,
-		      bool pad)
+ * Otherwise we add an extra byte.  Returns error string or NULL on success. */
+static const char *pull_bits(struct hash_u5 *hu5,
+			     const u5 **data, size_t *data_len,
+			     void *dst, size_t nbits,
+			     bool pad)
 {
 	size_t n5 = nbits / 5;
 	size_t len = 0;
@@ -57,52 +50,72 @@ static bool pull_bits(struct hash_u5 *hu5,
 		n5++;
 
 	if (*data_len < n5)
-		return false;
+		return "truncated";
 	if (!bech32_convert_bits(dst, &len, 8, *data, n5, 5, pad))
-		return false;
+		return "non-zero trailing bits";
 	if (hu5)
 		hash_u5(hu5, *data, n5);
 	*data += n5;
 	*data_len -= n5;
 
-	return true;
+	return NULL;
 }
 
-/* For pulling fields where we should have checked it will succeed already. */
-#ifndef NDEBUG
-#define pull_bits_certain(hu5, data, data_len, dst, nbits, pad)	     \
-	assert(pull_bits((hu5), (data), (data_len), (dst), (nbits), (pad)))
-#else
-#define pull_bits_certain pull_bits
-#endif
-
 /* Helper for pulling a variable-length big-endian int. */
-static bool pull_uint(struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      u64 *val, size_t databits)
+static const char *pull_uint(struct hash_u5 *hu5,
+			     const u5 **data, size_t *data_len,
+			     u64 *val, size_t databits,
+			     bool must_be_minimal)
 {
 	be64 be_val;
+	const char *err;
 
 	/* Too big. */
 	if (databits > sizeof(be_val) * CHAR_BIT)
-		return false;
-	if (!pull_bits(hu5, data, data_len, &be_val, databits, true))
-		return false;
-	*val = be64_to_cpu(be_val) >> (sizeof(be_val) * CHAR_BIT - databits);
-	return true;
+		return "integer too large";
+	if (must_be_minimal
+	    && databits >= 5
+	    && *data_len > 1
+	    && (*data)[0] == 0)
+		return "not a minimal value";
+	err = pull_bits(hu5, data, data_len, &be_val, databits, true);
+	if (err)
+		return err;
+	if (databits == 0)
+		*val = 0;
+	else
+		*val = be64_to_cpu(be_val) >>
+		       (sizeof(be_val) * CHAR_BIT - databits);
+	return NULL;
 }
 
-static size_t num_u8(size_t num_u5)
+static void *pull_all(const tal_t *ctx,
+		      struct hash_u5 *hu5,
+		      const u5 **data, size_t *data_len,
+		      bool pad,
+		      const char **err)
 {
-	return (num_u5 * 5 + 4) / 8;
+	void *ret;
+	size_t retlen;
+
+	if (pad)
+		retlen = (*data_len * 5 + 7) / 8;
+	else
+		retlen = (*data_len * 5) / 8;
+
+	ret = tal_arr(ctx, u8, retlen);
+	*err = pull_bits(hu5, data, data_len, ret, *data_len * 5, pad);
+	if (*err)
+		return tal_free(ret);
+	return ret;
 }
 
 /* Frees bolt11, returns NULL. */
-static struct bolt11 *decode_fail(struct bolt11 *b11, char **fail,
+static struct bolt11 *decode_fail(struct bolt11 *b11, const char **fail,
 				  const char *fmt, ...)
 	PRINTF_FMT(3,4);
 
-static struct bolt11 *decode_fail(struct bolt11 *b11, char **fail,
+static struct bolt11 *decode_fail(struct bolt11 *b11, const char **fail,
 				  const char *fmt, ...)
 {
 	va_list ap;
@@ -117,20 +130,39 @@ static struct bolt11 *decode_fail(struct bolt11 *b11, char **fail,
  * These handle specific fields in the payment request; returning the problem
  * if any, or NULL.
  */
-static char *unknown_field(struct bolt11 *b11,
-			   struct hash_u5 *hu5,
-			   u5 **data, size_t *data_len,
-			   u5 type, size_t length)
+static const char *unknown_field(struct bolt11 *b11,
+				 struct hash_u5 *hu5,
+				 const u5 **data, size_t *field_len,
+				 u5 type)
 {
 	struct bolt11_field *extra = tal(b11, struct bolt11_field);
-	u8 u8data[num_u8(length)];
+	const char *err;
 
 	extra->tag = type;
-	extra->data = tal_dup_arr(extra, u5, *data, length, 0);
+	/* FIXME: record u8 data here, not u5! */
+	extra->data = tal_dup_arr(extra, u5, *data, *field_len, 0);
 	list_add_tail(&b11->extra_fields, &extra->list);
 
-	pull_bits_certain(hu5, data, data_len, u8data, length * 5, true);
-	return NULL;
+	tal_free(pull_all(extra, hu5, data, field_len, true, &err));
+	return err;
+}
+
+/* If field isn't expected length (in *bech32*!), call unknown_field.
+ * Otherwise copy into dst without padding, set have_flag if non-NULL. */
+static const char *pull_expected_length(struct bolt11 *b11,
+					struct hash_u5 *hu5,
+					const u5 **data, size_t *field_len,
+					size_t expected_length,
+					u5 type,
+					bool *have_flag,
+					void *dst)
+{
+	if (*field_len != expected_length)
+		return unknown_field(b11, hu5, data, field_len, type);
+
+	if (have_flag)
+		*have_flag = true;
+	return pull_bits(hu5, data, field_len, dst, *field_len * 5, false);
 }
 
 /* BOLT #11:
@@ -138,34 +170,26 @@ static char *unknown_field(struct bolt11 *b11,
  * `p` (1): `data_length` 52.  256-bit SHA256 payment_hash.  Preimage of this
  * provides proof of payment
  */
-static void decode_p(struct bolt11 *b11,
-		     struct hash_u5 *hu5,
-		     u5 **data, size_t *data_len,
-		     size_t data_length, bool *have_p)
+static const char *decode_p(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_p)
 {
 	/* BOLT #11:
 	 *
-	 * A payer... SHOULD use the first `p` field that it did NOT
-	 * skip as the payment hash.
+	 * A payer... SHOULD use the first `p` field as the payment hash.
 	 */
-	if (*have_p) {
-		unknown_field(b11, hu5, data, data_len, 'p', data_length);
-		return;
-	}
+	assert(!*have_p);
 
 	/* BOLT #11:
 	 *
-	 * A reader... MUST skip over unknown fields, OR an `f` field
-	 * with unknown `version`, OR `p`, `h`, `s` or `n` fields that do
-	 * NOT have `data_length`s of 52, 52, 52 or 53, respectively.
-	*/
-	if (data_length != 52) {
-		unknown_field(b11, hu5, data, data_len, 'p', data_length);
-		return;
-	}
-
-	pull_bits_certain(hu5, data, data_len, &b11->payment_hash, 256, false);
-	*have_p = true;
+	 * A reader...
+	 * - MUST fail the payment if any field with fixed `data_length` (`p`, `h`, `s`, `n`)
+	 *   does not have the correct length (52, 52, 52, 53).
+	 */
+	return pull_expected_length(b11, hu5, data, field_len, 52, 'p',
+				    have_p, &b11->payment_hash);
 }
 
 /* BOLT #11:
@@ -173,17 +197,19 @@ static void decode_p(struct bolt11 *b11,
  * `d` (13): `data_length` variable.  Short description of purpose of payment
  * (UTF-8), e.g. '1 cup of coffee' or 'ナンセンス 1杯'
  */
-static char *decode_d(struct bolt11 *b11,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length, bool *have_d)
+static const char *decode_d(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_d)
 {
 	u8 *desc;
-	if (*have_d)
-		return unknown_field(b11, hu5, data, data_len, 'd', data_length);
+	const char *err;
 
-	desc = tal_arr(NULL, u8, data_length * 5 / 8);
-	pull_bits_certain(hu5, data, data_len, desc, data_length*5, false);
+	assert(!*have_d);
+	desc = pull_all(NULL, hu5, data, field_len, false, &err);
+	if (!desc)
+		return err;
 
 	*have_d = true;
 	b11->description = utf8_str(b11, take(desc), tal_bytelen(desc));
@@ -200,30 +226,28 @@ static char *decode_d(struct bolt11 *b11,
  * 639 bytes, but the transport mechanism for the description in that case is
  * transport specific and not defined here.
  */
-static void decode_h(struct bolt11 *b11,
-		     struct hash_u5 *hu5,
-		     u5 **data, size_t *data_len,
-		     size_t data_length, bool *have_h)
+static const char *decode_h(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_h)
 {
-	if (*have_h) {
-		unknown_field(b11, hu5, data, data_len, 'h', data_length);
-		return;
-	}
+	const char *err;
+	struct sha256 hash;
 
+	assert(!*have_h);
 	/* BOLT #11:
 	 *
-	 * A reader... MUST skip over unknown fields, OR an `f` field
-	 * with unknown `version`, OR `p`, `h`, `s` or `n` fields that do
-	 * NOT have `data_length`s of 52, 52, 52 or 53, respectively. */
-	if (data_length != 52) {
-		unknown_field(b11, hu5, data, data_len, 'h', data_length);
-		return;
-	}
+	 * A reader...
+	 * - MUST fail the payment if any field with fixed `data_length` (`p`, `h`, `s`, `n`)
+	 *   does not have the correct length (52, 52, 52, 53). */
+	err = pull_expected_length(b11, hu5, data, field_len, 52, 'h',
+				    have_h, &hash);
 
-	b11->description_hash = tal(b11, struct sha256);
-	pull_bits_certain(hu5, data, data_len, b11->description_hash, 256,
-			  false);
-	*have_h = true;
+	/* If that gave us the hash, store it */
+	if (*have_h)
+		b11->description_hash = tal_dup(b11, struct sha256, &hash);
+	return err;
 }
 
 /* BOLT #11:
@@ -232,75 +256,89 @@ static void decode_h(struct bolt11 *b11,
  * (big-endian). Default is 3600 (1 hour) if not specified.
  */
 #define DEFAULT_X 3600
-static char *decode_x(struct bolt11 *b11,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length, const bool *have_x)
+static const char *decode_x(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_x)
 {
-	if (*have_x)
-		return unknown_field(b11, hu5, data, data_len, 'x',
-				     data_length);
+	const char *err;
 
-	/* FIXME: Put upper limit in bolt 11 */
-	if (!pull_uint(hu5, data, data_len, &b11->expiry, data_length * 5))
-		return tal_fmt(b11, "x: length %zu chars is excessive",
-			       *data_len);
+	assert(!*have_x);
+
+	/* BOLT #11:
+	 * - if a `c`, `x`, or `9` field is provided which has a non-minimal `data_length`
+	 *   (i.e. begins with 0 field elements):
+	 *   - SHOULD treat the invoice as invalid.
+	 */
+	err = pull_uint(hu5, data, field_len, &b11->expiry, *field_len * 5, true);
+	if (err)
+		return tal_fmt(b11, "x: %s", err);
+
+	*have_x = true;
 	return NULL;
 }
 
 /* BOLT #11:
  *
- * `c` (24): `data_length` variable.  `min_final_cltv_expiry` to use for the
+ * `c` (24): `data_length` variable. `min_final_cltv_expiry_delta` to use for the
  * last HTLC in the route. Default is 18 if not specified.
  */
-static char *decode_c(struct bolt11 *b11,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length, const bool *have_c)
+static const char *decode_c(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_c)
 {
 	u64 c;
-	if (*have_c)
-		return unknown_field(b11, hu5, data, data_len, 'c',
-				     data_length);
+	const char *err;
 
-	/* FIXME: Put upper limit in bolt 11 */
-	if (!pull_uint(hu5, data, data_len, &c, data_length * 5))
-		return tal_fmt(b11, "c: length %zu chars is excessive",
-			       *data_len);
+	assert(!*have_c);
+
+	/* BOLT #11:
+	 * - if a `c`, `x`, or `9` field is provided which has a non-minimal `data_length`
+	 *   (i.e. begins with 0 field elements):
+	 *   - SHOULD treat the invoice as invalid.
+	 */
+	err = pull_uint(hu5, data, field_len, &c, *field_len * 5, true);
+	if (err)
+		return tal_fmt(b11, "c: %s", err);
 	b11->min_final_cltv_expiry = c;
 	/* Can overflow, since c is 64 bits but value must be < 32 bits */
 	if (b11->min_final_cltv_expiry != c)
 		return tal_fmt(b11, "c: %"PRIu64" is too large", c);
 
+	*have_c = true;
 	return NULL;
 }
 
-static char *decode_n(struct bolt11 *b11,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length, bool *have_n)
+static const char *decode_n(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_n)
 {
-	if (*have_n)
-		return unknown_field(b11, hu5, data, data_len, 'n',
-				     data_length);
+	const char *err;
 
+	assert(!*have_n);
 	/* BOLT #11:
 	 *
-	 * A reader... MUST skip over unknown fields, OR an `f` field
-	 * with unknown `version`, OR `p`, `h`, `s` or `n` fields that do
-	 * NOT have `data_length`s of 52, 52, 52 or 53, respectively. */
-	if (data_length != 53)
-		return unknown_field(b11, hu5, data, data_len, 'n',
-				     data_length);
+	 * A reader...
+	 * - MUST fail the payment if any field with fixed `data_length` (`p`, `h`, `s`, `n`)
+	 *   does not have the correct length (52, 52, 52, 53). */
+	err = pull_expected_length(b11, hu5, data, field_len, 53, 'n', have_n,
+				   &b11->receiver_id.k);
 
-	pull_bits_certain(hu5, data, data_len, &b11->receiver_id.k,
-			  data_length * 5, false);
-	if (!node_id_valid(&b11->receiver_id))
-		return tal_fmt(b11, "n: invalid pubkey %s",
-			       node_id_to_hexstr(tmpctx, &b11->receiver_id));
+	/* If that gave us a node ID, check it. */
+	if (*have_n) {
+		struct pubkey k;
+		if (!pubkey_from_node_id(&k, &b11->receiver_id))
+			return tal_fmt(
+			    b11, "invalid public key %s",
+			    fmt_node_id(tmpctx, &b11->receiver_id));
+	}
 
-	*have_n = true;
-	return NULL;
+	return err;
 }
 
 /* BOLT #11:
@@ -308,30 +346,27 @@ static char *decode_n(struct bolt11 *b11,
  * * `s` (16): `data_length` 52. This 256-bit secret prevents
  *    forwarding nodes from probing the payment recipient.
  */
-static char *decode_s(struct bolt11 *b11,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length,
-		      bool *have_s)
+static const char *decode_s(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_s)
 {
-	if (*have_s)
-		return unknown_field(b11, hu5, data, data_len, 's',
-				     data_length);
+	const char *err;
+	struct secret secret;
+
+	assert(!*have_s);
 
 	/* BOLT #11:
 	 *
-	 * A reader... MUST skip over unknown fields, OR an `f` field
-	 * with unknown `version`, OR `p`, `h`, `s` or `n` fields that do
-	 * NOT have `data_length`s of 52, 52, 52 or 53, respectively. */
-	if (data_length != 52)
-		return unknown_field(b11, hu5, data, data_len, 's',
-				     data_length);
-
-	b11->payment_secret = tal(b11, struct secret);
-	pull_bits_certain(hu5, data, data_len, b11->payment_secret, 256,
-			  false);
-	*have_s = true;
-	return NULL;
+	 * A reader...
+	 * - MUST fail the payment if any field with fixed `data_length` (`p`, `h`, `s`, `n`)
+	 *   does not have the correct length (52, 52, 52, 53). */
+	err = pull_expected_length(b11, hu5, data, field_len, 52, 's',
+				   have_s, &secret);
+	if (*have_s)
+		b11->payment_secret = tal_dup(b11, struct secret, &secret);
+	return err;
 }
 
 /* BOLT #11:
@@ -340,17 +375,33 @@ static char *decode_s(struct bolt11 *b11,
  * on-chain address: for Bitcoin, this starts with a 5-bit `version`
  * and contains a witness program or P2PKH or P2SH address.
  */
-static char *decode_f(struct bolt11 *b11,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length)
+static const char *decode_f(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_f)
 {
 	u64 version;
 	u8 *fallback;
+	const u5 *orig_data = *data;
+	size_t orig_len = *field_len;
+	const char *err;
 
-	if (!pull_uint(hu5, data, data_len, &version, 5))
-		return tal_fmt(b11, "f: data_length %zu short", data_length);
-	data_length--;
+	/* Read version but don't commit to hash yet */
+	err = pull_uint(NULL, &orig_data, &orig_len, &version, 5, false);
+	if (err)
+			return tal_fmt(b11, "f: %s", err);
+
+	bool is_known_version = version == 17 || version == 18 || version < 17;
+
+	if (!is_known_version) {
+		return unknown_field(b11, hu5, data, field_len, 'f');
+	}
+
+	/* For known versions, process with hash */
+	err = pull_uint(hu5, data, field_len, &version, 5, false);
+	if (err)
+		return tal_fmt(b11, "f: %s", err);
 
 	/* BOLT #11:
 	 *
@@ -360,44 +411,51 @@ static char *decode_f(struct bolt11 *b11,
 	*/
 	if (version == 17) {
 		/* Pay to pubkey hash (P2PKH) */
-		struct bitcoin_address pkhash;
-		if (num_u8(data_length) != sizeof(pkhash))
+		struct bitcoin_address *pkhash;
+		pkhash = pull_all(tmpctx, hu5, data, field_len, false, &err);
+		if (!pkhash)
+			return err;
+		if (tal_bytelen(pkhash) != sizeof(*pkhash))
 			return tal_fmt(b11, "f: pkhash length %zu",
-				       data_length);
-
-		pull_bits_certain(hu5, data, data_len, &pkhash, data_length*5,
-				  false);
-		fallback = scriptpubkey_p2pkh(b11, &pkhash);
+				       tal_bytelen(pkhash));
+		fallback = scriptpubkey_p2pkh(b11, pkhash);
 	} else if (version == 18) {
 		/* Pay to pubkey script hash (P2SH) */
-		struct ripemd160 shash;
-		if (num_u8(data_length) != sizeof(shash))
+		struct ripemd160 *shash;
+		shash = pull_all(tmpctx, hu5, data, field_len, false, &err);
+		if (!shash)
+			return err;
+		if (tal_bytelen(shash) != sizeof(*shash))
 			return tal_fmt(b11, "f: p2sh length %zu",
-				       data_length);
-
-		pull_bits_certain(hu5, data, data_len, &shash, data_length*5,
-				  false);
-		fallback = scriptpubkey_p2sh_hash(b11, &shash);
+				       tal_bytelen(shash));
+		fallback = scriptpubkey_p2sh_hash(b11, shash);
 	} else if (version < 17) {
-		u8 *f = tal_arr(b11, u8, data_length * 5 / 8);
+		u8 *f = pull_all(tmpctx, hu5, data, field_len, false, &err);
+		if (!f)
+			return err;
 		if (version == 0) {
 			if (tal_count(f) != 20 && tal_count(f) != 32)
 				return tal_fmt(b11,
 					       "f: witness v0 bad length %zu",
-					       data_length);
+					       tal_count(f));
 		}
-		pull_bits_certain(hu5, data, data_len, f, data_length * 5,
-				  false);
+		if (version == 1 && tal_count(f) != 32) {
+			return tal_fmt(b11,
+				       "f: witness v1 bad length %zu",
+				       tal_count(f));
+		}
+		if (tal_count(f) > 40 || tal_count(f) < 2) {
+			return tal_fmt(b11,
+				       "f: witness v%"PRIu64" bad length %zu",
+				       version,
+				       tal_count(f));
+		}
 		fallback = scriptpubkey_witness_raw(b11, version,
 						    f, tal_count(f));
-		tal_free(f);
 	} else {
-		/* Restore version for unknown field! */
-		(*data)--;
-		(*data_len)++;
-		data_length++;
-		return unknown_field(b11, hu5, data, data_len, 'f',
-				     data_length);
+		// This should be unreachable because all valid versions (17, 18, or <17)
+		// and invalid versions are caught above.
+		return tal_fmt(b11, "f: unknown version %"PRIu64, version);
 	}
 
 	if (b11->fallbacks == NULL)
@@ -407,6 +465,7 @@ static char *decode_f(struct bolt11 *b11,
 
 	b11->fallbacks[tal_count(b11->fallbacks)-1]
 		= tal_steal(b11->fallbacks, fallback);
+	*have_f = true;
 	return NULL;
 }
 
@@ -414,7 +473,7 @@ static bool fromwire_route_info(const u8 **cursor, size_t *max,
 				struct route_info *route_info)
 {
 	fromwire_node_id(cursor, max, &route_info->pubkey);
-	fromwire_short_channel_id(cursor, max, &route_info->short_channel_id);
+	route_info->short_channel_id = fromwire_short_channel_id(cursor, max);
 	route_info->fee_base_msat = fromwire_u32(cursor, max);
 	route_info->fee_proportional_millionths = fromwire_u32(cursor, max);
 	route_info->cltv_expiry_delta = fromwire_u16(cursor, max);
@@ -424,7 +483,7 @@ static bool fromwire_route_info(const u8 **cursor, size_t *max,
 static void towire_route_info(u8 **pptr, const struct route_info *route_info)
 {
 	towire_node_id(pptr, &route_info->pubkey);
-	towire_short_channel_id(pptr, &route_info->short_channel_id);
+	towire_short_channel_id(pptr, route_info->short_channel_id);
 	towire_u32(pptr, route_info->fee_base_msat);
 	towire_u32(pptr, route_info->fee_proportional_millionths);
 	towire_u16(pptr, route_info->cltv_expiry_delta);
@@ -442,30 +501,38 @@ static void towire_route_info(u8 **pptr, const struct route_info *route_info)
  *   * `fee_proportional_millionths` (32 bits, big-endian)
  *   * `cltv_expiry_delta` (16 bits, big-endian)
  */
-static char *decode_r(struct bolt11 *b11,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length)
+static const char *decode_r(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_r)
 {
-	size_t rlen = data_length * 5 / 8;
-	u8 *r8 = tal_arr(tmpctx, u8, rlen);
+	const u8 *r8;
 	size_t n = 0;
-	struct route_info *r = tal_arr(tmpctx, struct route_info, n);
-	const u8 *cursor = r8;
+	struct route_info *r = tal_arr(b11->routes, struct route_info, n);
+	const char *err;
+	size_t rlen;
 
 	/* Route hops don't split in 5 bit boundaries, so convert whole thing */
-	pull_bits_certain(hu5, data, data_len, r8, data_length * 5, false);
+	r8 = pull_all(tmpctx, hu5, data, field_len, false, &err);
+	if (!r8)
+		return err;
+	rlen = tal_bytelen(r8);
 
 	do {
 		struct route_info ri;
-		if (!fromwire_route_info(&cursor, &rlen, &ri)) {
+		if (!fromwire_route_info(&r8, &rlen, &ri)) {
 			return tal_fmt(b11, "r: hop %zu truncated", n);
+		}
+		if (!node_id_valid(&ri.pubkey)) {
+			return tal_fmt(b11, "r: hop %zu pubkey invalid", n);
 		}
 		tal_arr_expand(&r, ri);
 	} while (rlen);
 
 	/* Append route */
-	tal_arr_expand(&b11->routes, tal_steal(b11, r));
+	tal_arr_expand(&b11->routes, r);
+	*have_r = true;
 	return NULL;
 }
 
@@ -489,22 +556,34 @@ static void shift_bitmap_down(u8 *bitmap, size_t bits)
  *  supported or required for receiving this payment.
  *  See [Feature Bits](#feature-bits).
  */
-static char *decode_9(struct bolt11 *b11,
-		      const struct feature_set *our_features,
-		      struct hash_u5 *hu5,
-		      u5 **data, size_t *data_len,
-		      size_t data_length)
+static const char *decode_9(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_9)
 {
-	size_t flen = (data_length * 5 + 7) / 8;
+	size_t flen = (*field_len * 5 + 7) / 8;
 	int badf;
+	size_t databits = *field_len * 5;
+	const char *err;
 
-	b11->features = tal_arr(b11, u8, flen);
-	pull_bits_certain(hu5, data, data_len, b11->features,
-			  data_length * 5, true);
+	assert(!*have_9);
+
+	b11->features = pull_all(b11, hu5, data, field_len, true, &err);
+	if (!b11->features)
+		return err;
+
+	/* BOLT #11:
+	 *   - if a `c`, `x`, or `9` field is provided which has a non-minimal `data_length`
+	 *     (i.e. begins with 0 field elements):
+	 *   - SHOULD treat the invoice as invalid.
+	 */
+	if (tal_count(b11->features) > 0 && b11->features[0] == 0)
+		return tal_fmt(b11, "9: non-minimal length (begins with 0)");
 
 	/* pull_bits pads with zero bits: we need to remove them. */
 	shift_bitmap_down(b11->features,
-			  flen * 8 - data_length * 5);
+			  flen * 8 - databits);
 
 	/* BOLT #11:
 	 *
@@ -521,6 +600,32 @@ static char *decode_9(struct bolt11 *b11,
 			return tal_fmt(b11, "9: unknown feature bit %i", badf);
 	}
 
+	*have_9 = true;
+	return NULL;
+}
+
+/* BOLT #11:
+ *
+ * `m` (27): `data_length` variable. Additional metadata to attach to
+ * the payment. Note that the size of this field is limited by the
+ * maximum hop payload size. Long metadata fields reduce the maximum
+ * route length.
+ */
+static const char *decode_m(struct bolt11 *b11,
+			    const struct feature_set *our_features,
+			    struct hash_u5 *hu5,
+			    const u5 **data, size_t *field_len,
+			    bool *have_m)
+{
+	const char *err;
+
+	assert(!*have_m);
+
+	b11->metadata = pull_all(b11, hu5, data, field_len, false, &err);
+	if (!b11->metadata)
+		return err;
+
+	*have_m = true;
 	return NULL;
 }
 
@@ -538,15 +643,105 @@ struct bolt11 *new_bolt11(const tal_t *ctx,
 	b11->expiry = DEFAULT_X;
 	b11->features = tal_arr(b11, u8, 0);
 	/* BOLT #11:
-	 *   - if the `c` field (`min_final_cltv_expiry`) is not provided:
+	 *   - if the `c` field (`min_final_cltv_expiry_delta`) is not provided:
 	 *     - MUST use an expiry delta of at least 18 when making the payment
 	 */
 	b11->min_final_cltv_expiry = 18;
 	b11->payment_secret = NULL;
+	b11->metadata = NULL;
 
 	if (msat)
 		b11->msat = tal_dup(b11, struct amount_msat, msat);
 	return b11;
+}
+
+struct decoder {
+	/* What BOLT11 letter this is */
+	const char letter;
+	/* If false, then any dups get treated as "unknown" fields */
+	bool allow_duplicates;
+	/* Routine to decode: returns NULL if it decodes ok, and
+	 * sets *have_field = true if it is not an unknown form.
+	 * Otherwise returns error string (literal or tal off b11). */
+	const char *(*decode)(struct bolt11 *b11,
+			      const struct feature_set *our_features,
+			      struct hash_u5 *hu5,
+			      const u5 **data, size_t *field_len,
+			      bool *have_field);
+};
+
+static const struct decoder decoders[] = {
+	/* BOLT #11:
+	 *
+	 * A payer... SHOULD use the first `p` field as the payment hash.
+	 */
+	{ 'p', false, decode_p },
+	{ 'd', false, decode_d },
+	{ 'h', false, decode_h },
+	{ 'x', false, decode_x },
+	{ 'c', false, decode_c },
+	{ 'n', false, decode_n },
+	{ 's', false, decode_s },
+	/* BOLT #11:
+	 *   - MAY include one or more `f` fields.
+	 */
+	{ 'f', true, decode_f },
+	/* BOLT #11:
+	 *
+	 * there may be more than one `r` field
+	 */
+	{ 'r', true, decode_r },
+	{ '9', false, decode_9 },
+	{ 'm', false, decode_m },
+};
+
+static const struct decoder *find_decoder(char c)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(decoders); i++) {
+		if (decoders[i].letter == c)
+			return decoders + i;
+	}
+	return NULL;
+}
+
+static bool bech32_decode_alloc(const tal_t *ctx,
+				const char **hrp_ret,
+				const u5 **data_ret,
+				size_t *data_len,
+				const char *str)
+{
+	char *hrp = tal_arr(ctx, char, strlen(str) - 6);
+	u5 *data = tal_arr(ctx, u5, strlen(str) - 8);
+
+	if (bech32_decode(hrp, data, data_len, str, (size_t)-1)
+	    != BECH32_ENCODING_BECH32) {
+		tal_free(hrp);
+		tal_free(data);
+		return false;
+	}
+
+	/* We needed temporaries because these are const */
+	*hrp_ret = hrp;
+	*data_ret = data;
+	return true;
+}
+
+static bool has_lightning_prefix(const char *invstring)
+{
+	/* BOLT #11:
+	 *
+	 * If a URI scheme is desired, the current recommendation is to either
+	 * use 'lightning:' as a prefix before the BOLT-11 encoding */
+	return (strstarts(invstring, "lightning:") ||
+		strstarts(invstring, "LIGHTNING:"));
+}
+
+const char *to_canonical_invstr(const tal_t *ctx,
+				const char *invstring)
+{
+	if (has_lightning_prefix(invstring))
+		invstring += strlen("lightning:");
+	return str_lowering(ctx, invstring);
 }
 
 /* Extracts signature but does not check it. */
@@ -555,36 +750,27 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 				   const char *description,
 				   const struct chainparams *must_be_chain,
 				   struct sha256 *hash,
-				   u5 **sig,
+				   const u5 **sig,
 				   bool *have_n,
-				   char **fail)
+				   const char **fail)
 {
-	char *hrp, *amountstr, *prefix;
-	u5 *data;
+	const char *hrp, *prefix;
+	char *amountstr;
+	const u5 *data;
 	size_t data_len;
 	struct bolt11 *b11 = new_bolt11(ctx, NULL);
 	struct hash_u5 hu5;
-	bool have_p = false, have_d = false, have_h = false,
-		have_x = false, have_c = false, have_s = false;
+	const char *err;
+	/* We don't need all of these, but in theory we could have 32 types */
+	bool have_field[32];
 
-	*have_n = false;
+	memset(have_field, 0, sizeof(have_field));
 	b11->routes = tal_arr(b11, struct route_info *, 0);
-
-	/* BOLT #11:
-	 *
-	 * If a URI scheme is desired, the current recommendation is to either
-	 * use 'lightning:' as a prefix before the BOLT-11 encoding
-	 */
-	if (strstarts(str, "lightning:") || strstarts(str, "LIGHTNING:"))
-		str += strlen("lightning:");
 
 	if (strlen(str) < 8)
 		return decode_fail(b11, fail, "Bad bech32 string");
 
-	hrp = tal_arr(tmpctx, char, strlen(str) - 6);
-	data = tal_arr(tmpctx, u5, strlen(str) - 8);
-
-	if (!bech32_decode(hrp, data, &data_len, str, (size_t)-1))
+	if (!bech32_decode_alloc(tmpctx, &hrp, &data, &data_len, str))
 		return decode_fail(b11, fail, "Bad bech32 string");
 
 	/* For signature checking at the end. */
@@ -608,17 +794,15 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 		return decode_fail(b11, fail,
 				   "Prefix '%s' does not start with ln", prefix);
 
-	/* Signet chose to use prefix 'tb', just like testnet.  So we tread
-	 * carefully here: */
 	if (must_be_chain) {
-		if (streq(prefix + 2, must_be_chain->bip173_name))
+		if (streq(prefix + 2, must_be_chain->lightning_hrp))
 			b11->chain = must_be_chain;
 		else
 			return decode_fail(b11, fail, "Prefix %s is not for %s",
 					   prefix + 2,
 					   must_be_chain->network_name);
 	} else {
-		b11->chain = chainparams_by_bip173(prefix + 2);
+		b11->chain = chainparams_by_lightning_hrp(prefix + 2);
 		if (!b11->chain)
 			return decode_fail(b11, fail, "Unknown chain %s",
 					   prefix + 2);
@@ -656,6 +840,7 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 		 * anything except a `multiplier` (see table above)... MUST fail the
 		 * payment.
 		 **/
+		errno = 0;
 		amount = strtoull(amountstr, &end, 10);
 		if (amount == ULLONG_MAX && errno == ERANGE)
 			return decode_fail(b11, fail,
@@ -691,14 +876,19 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 	 *
 	 * 1. `timestamp`: seconds-since-1970 (35 bits, big-endian)
 	 * 1. zero or more tagged parts
-	 * 1. `signature`: Bitcoin-style signature of above (520 bits)
+	 * 1. `signature`: compact ECDSA/secp256k1 signature of the above
+	 *    (520 bits: 64-byte R||S + 1-byte recovery id)
 	 */
-	if (!pull_uint(&hu5, &data, &data_len, &b11->timestamp, 35))
-		return decode_fail(b11, fail, "Can't get 35-bit timestamp");
+	err = pull_uint(&hu5, &data, &data_len, &b11->timestamp, 35, false);
+	if (err)
+		return decode_fail(b11, fail,
+				   "Can't get 35-bit timestamp: %s", err);
 
 	while (data_len > 520 / 5) {
 		const char *problem = NULL;
-		u64 type, data_length;
+		u64 type, field_len64;
+		size_t field_len;
+		const struct decoder *decoder;
 
 		/* BOLT #11:
 		 *
@@ -708,79 +898,50 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 		 * 1. `data_length` (10 bits, big-endian)
 		 * 1. `data` (`data_length` x 5 bits)
 		 */
-		if (!pull_uint(&hu5, &data, &data_len, &type, 5)
-		    || !pull_uint(&hu5, &data, &data_len, &data_length, 10))
+		err = pull_uint(&hu5, &data, &data_len, &type, 5, false);
+		if (err)
 			return decode_fail(b11, fail,
-					   "Can't get tag and length");
+					   "Can't get tag: %s", err);
+		err = pull_uint(&hu5, &data, &data_len, &field_len64, 10, false);
+		if (err)
+			return decode_fail(b11, fail,
+					   "Can't get length: %s", err);
 
 		/* Can't exceed total data remaining. */
-		if (data_length > data_len)
+		if (field_len64 > data_len)
 			return decode_fail(b11, fail, "%c: truncated",
 					   bech32_charset[type]);
 
-		switch (bech32_charset[type]) {
-		case 'p':
-			decode_p(b11, &hu5, &data, &data_len, data_length,
-				 &have_p);
-			break;
+		/* These are different types on 32 bit!  But since data_len is
+		 * also size_t, above check ensures this will fit. */
+		field_len = field_len64;
+		assert(field_len == field_len64);
 
-		case 'd':
-			problem = decode_d(b11, &hu5, &data, &data_len,
-					   data_length, &have_d);
-			break;
+		/* Do this now: the decode function fixes up the data ptr */
+		data_len -= field_len;
 
-		case 'h':
-			decode_h(b11, &hu5, &data, &data_len, data_length,
-				 &have_h);
-			break;
-
-		case 'n':
-			problem = decode_n(b11, &hu5, &data,
-					   &data_len, data_length,
-					   have_n);
-			break;
-
-		case 'x':
-			problem = decode_x(b11, &hu5, &data,
-					   &data_len, data_length,
-					   &have_x);
-			break;
-
-		case 'c':
-			problem = decode_c(b11, &hu5, &data,
-					   &data_len, data_length,
-					   &have_c);
-			break;
-
-		case 'f':
-			problem = decode_f(b11, &hu5, &data,
-					   &data_len, data_length);
-			break;
-		case 'r':
-			problem = decode_r(b11, &hu5, &data, &data_len,
-					   data_length);
-			break;
-		case '9':
-			problem = decode_9(b11, our_features, &hu5,
-					   &data, &data_len,
-					   data_length);
-			break;
-		case 's':
-			problem = decode_s(b11, &hu5, &data, &data_len,
-					   data_length, &have_s);
-			break;
-		default:
-			unknown_field(b11, &hu5, &data, &data_len,
-				      bech32_charset[type], data_length);
+		decoder = find_decoder(bech32_charset[type]);
+		if (!decoder || (have_field[type] && !decoder->allow_duplicates)) {
+			problem = unknown_field(b11, &hu5, &data, &field_len,
+						bech32_charset[type]);
+		} else {
+			problem = decoder->decode(b11, our_features, &hu5,
+						  &data, &field_len, &have_field[type]);
 		}
 		if (problem)
 			return decode_fail(b11, fail, "%s", problem);
+		if (field_len)
+			return decode_fail(b11, fail, "%c: extra %zu bytes",
+					   bech32_charset[type], field_len);
 	}
 
-	if (!have_p)
+	if (!have_field[bech32_charset_rev['p']])
 		return decode_fail(b11, fail, "No valid 'p' field found");
 
-	if (have_h && description) {
+	if (!have_field[bech32_charset_rev['s']])
+		return decode_fail(b11, fail, "Missing required payment secret (s field)");
+
+	if (have_field[bech32_charset_rev['h']] && description) {
 		struct sha256 sha;
 
 		/* BOLT #11:
@@ -795,25 +956,49 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 					   "h: does not match description");
 	}
 
+	/* BOLT #11:
+	 * A writer:
+	 *...
+	 * - MUST include either exactly one `d` or exactly one `h` field.
+	 */
+	/* BOLT #11:
+	 * A reader:
+	 *...
+	 * - MUST fail the payment if neither a `d` field nor a `h` field is present, or if both are present.
+	 */
+	if (!have_field[bech32_charset_rev['d']]
+	    && !have_field[bech32_charset_rev['h']])
+		return decode_fail(b11, fail,
+				   "must have either 'd' or 'h' field");
+	if (have_field[bech32_charset_rev['d']]
+	    && have_field[bech32_charset_rev['h']])
+		return decode_fail(b11, fail,
+				   "must not have both 'd' and 'h' fields");
+
 	hash_u5_done(&hu5, hash);
 	*sig = tal_dup_arr(ctx, u5, data, data_len, 0);
+
+	*have_n = have_field[bech32_charset_rev['n']];
 	return b11;
 }
+
+static bool valid_recovery_id(u8 recid) { return recid <= 3; }
 
 /* Decodes and checks signature; returns NULL on error. */
 struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 			     const struct feature_set *our_features,
 			     const char *description,
 			     const struct chainparams *must_be_chain,
-			     char **fail)
+			     const char **fail)
 {
-	u5 *sigdata;
+	const u5 *sigdata;
 	size_t data_len;
 	u8 sig_and_recid[65];
 	secp256k1_ecdsa_recoverable_signature sig;
 	struct bolt11 *b11;
 	struct sha256 hash;
 	bool have_n;
+	const char *err;
 
 	b11 = bolt11_decode_nosig(ctx, str, our_features, description,
 				  must_be_chain, &hash, &sigdata, &have_n,
@@ -823,19 +1008,24 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
 	/* BOLT #11:
 	 *
-	 * A writer...MUST set `signature` to a valid 512-bit
-	 * secp256k1 signature of the SHA2 256-bit hash of the
-	 * human-readable part, represented as UTF-8 bytes,
-	 * concatenated with the data part (excluding the signature)
-	 * with 0 bits appended to pad the data to the next byte
-	 * boundary, with a trailing byte containing the recovery ID
-	 * (0, 1, 2, or 3).
+	 * A writer...MUST set `signature` to a valid
+	 * compact ECDSA signature over secp256k1 of the SHA-256 hash of:
+	 * the human-readable part (as UTF-8 bytes) concatenated with the data part
+	 * (excluding the signature), with 0 bits appended to pad to a byte boundary.
+	 * The signature is encoded as 64 bytes (R || S), followed by a trailing 1-byte
+	 * recovery id in {0,1,2,3}.
 	 */
 	data_len = tal_count(sigdata);
-	if (!pull_bits(NULL, &sigdata, &data_len, sig_and_recid, 520, false))
-		return decode_fail(b11, fail, "signature truncated");
+	err = pull_bits(NULL, &sigdata, &data_len, sig_and_recid, 520, false);
+	if (err)
+		return decode_fail(b11, fail, "can't read signature: %s",
+				   err);
 
 	assert(data_len == 0);
+
+	if (!valid_recovery_id(sig_and_recid[64]))
+		return decode_fail(b11, fail, "invalid recovery ID: %u",
+				   sig_and_recid[64]);
 
 	if (!secp256k1_ecdsa_recoverable_signature_parse_compact
 	    (secp256k1_ctx, &sig, sig_and_recid, sig_and_recid[64]))
@@ -846,10 +1036,15 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
 	/* BOLT #11:
 	 *
-	 * A reader...  MUST check that the `signature` is valid (see
-	 * the `n` tagged field specified below). ... A reader...
-	 * MUST use the `n` field to validate the signature instead of
-	 * performing signature recovery.
+	 * A reader:
+	 *   - MUST check that the `signature` is valid (see the `n` tagged field specified below).
+	 */
+	/* BOLT #11:
+	 *
+	 * A reader:
+	 * ...
+	 *   - if a valid `n` field is provided:
+	 *     - MUST use the `n` field to validate the signature instead of performing public-key recovery.
 	 */
 	if (!have_n) {
 		struct pubkey k;
@@ -905,10 +1100,11 @@ static void push_field(u5 **data, char type, const void *src, size_t nbits)
 /* BOLT #11:
  *
  * - if `x` is included:
- *   - SHOULD use the minimum `data_length` possible.
- * - MUST include one `c` field (`min_final_cltv_expiry`).
- *...
- *   - SHOULD use the minimum `data_length` possible.
+ *   - MUST use the minimum `data_length` possible, i.e. no leading 0 field-elements.
+ * - SHOULD include one `c` field (`min_final_cltv_expiry_delta`).
+ *    - MUST set `c` to the minimum `cltv_expiry` it will accept for the last
+ *      HTLC in the route.
+ *    - MUST use the minimum `data_length` possible, i.e. no leading 0 field-elements.
  */
 static void push_varlen_field(u5 **data, char type, u64 val)
 {
@@ -945,6 +1141,11 @@ static void encode_p(u5 **data, const struct sha256 *hash)
 	push_field(data, 'p', hash, 256);
 }
 
+static void encode_m(u5 **data, const u8 *metadata)
+{
+	push_field(data, 'm', metadata, tal_bytelen(metadata) * CHAR_BIT);
+}
+
 static void encode_d(u5 **data, const char *description)
 {
 	push_field(data, 'd', description, strlen(description) * CHAR_BIT);
@@ -966,8 +1167,10 @@ static void encode_x(u5 **data, u64 expiry)
 	push_varlen_field(data, 'x', expiry);
 }
 
-static void encode_c(u5 **data, u16 min_final_cltv_expiry)
+static void encode_c(u5 **data, u32 min_final_cltv_expiry)
 {
+	if (dev_bolt11_omit_c_value)
+		return;
 	push_varlen_field(data, 'c', min_final_cltv_expiry);
 }
 
@@ -981,6 +1184,7 @@ static void encode_f(u5 **data, const u8 *fallback)
 	struct bitcoin_address pkh;
 	struct ripemd160 sh;
 	struct sha256 wsh;
+	const size_t fallback_len = tal_bytelen(fallback);
 
 	/* BOLT #11:
 	 *
@@ -988,24 +1192,24 @@ static void encode_f(u5 **data, const u8 *fallback)
 	 * witness version and program, OR to `17` followed by a
 	 * public key hash, OR to `18` followed by a script hash.
 	 */
-	if (is_p2pkh(fallback, &pkh)) {
+	if (is_p2pkh(fallback, fallback_len, &pkh)) {
 		push_fallback_addr(data, 17, &pkh, sizeof(pkh));
-	} else if (is_p2sh(fallback, &sh)) {
+	} else if (is_p2sh(fallback, fallback_len, &sh)) {
 		push_fallback_addr(data, 18, &sh, sizeof(sh));
-	} else if (is_p2wpkh(fallback, &pkh)) {
+	} else if (is_p2wpkh(fallback, fallback_len, &pkh)) {
 		push_fallback_addr(data, 0, &pkh, sizeof(pkh));
-	} else if (is_p2wsh(fallback, &wsh)) {
+	} else if (is_p2wsh(fallback, fallback_len, &wsh)) {
 		push_fallback_addr(data, 0, &wsh, sizeof(wsh));
-	} else if (tal_count(fallback)
+	} else if (fallback_len > 1
 		   && fallback[0] >= 0x50
 		   && fallback[0] < (0x50+16)) {
 		/* Other (future) witness versions: turn OP_N into N */
-		push_fallback_addr(data, fallback[0] - 0x50, fallback + 1,
-				   tal_count(fallback) - 1);
+		push_fallback_addr(data, fallback[0] - 0x50, fallback + 2,
+				   tal_count(fallback) - 2);
 	} else {
 		/* Copy raw. */
 		push_field(data, 'f',
-			   fallback, tal_count(fallback) * CHAR_BIT);
+			   fallback, fallback_len * CHAR_BIT);
 	}
 }
 
@@ -1020,13 +1224,20 @@ static void encode_r(u5 **data, const struct route_info *r)
 	tal_free(rinfo);
 }
 
-static void maybe_encode_9(u5 **data, const u8 *features)
+static void maybe_encode_9(u5 **data, const u8 *features,
+			   bool have_payment_metadata)
 {
 	u5 *f5 = tal_arr(NULL, u5, 0);
 
 	for (size_t i = 0; i < tal_count(features) * CHAR_BIT; i++) {
 		if (!feature_is_set(features, i))
 			continue;
+
+		/* Don't set option_payment_metadata unless we acually use it */
+		if (!have_payment_metadata
+		    && COMPULSORY_FEATURE(i) == OPT_PAYMENT_METADATA)
+			continue;
+
 		/* We expand it out so it makes a BE 5-bit/btye bitfield */
 		set_feature_bit(&f5, (i / 5) * 8 + (i % 5));
 	}
@@ -1034,7 +1245,8 @@ static void maybe_encode_9(u5 **data, const u8 *features)
 	/* BOLT #11:
 	 *
 	 * - if `9` contains non-zero bits:
-	 *   - SHOULD use the minimum `data_length` possible.
+	 *   - MUST use the minimum `data_length` possible to encode the non-zero bits
+	 *     with no 0 field-elements at the start.
 	 * - otherwise:
 	 *   - MUST omit the `9` field altogether.
 	 */
@@ -1047,8 +1259,6 @@ static void maybe_encode_9(u5 **data, const u8 *features)
 
 static bool encode_extra(u5 **data, const struct bolt11_field *extra)
 {
-	size_t len;
-
 	/* Can't encode an invalid tag. */
 	if (bech32_charset_rev[(unsigned char)extra->tag] == -1)
 		return false;
@@ -1057,9 +1267,7 @@ static bool encode_extra(u5 **data, const struct bolt11_field *extra)
 	push_varlen_uint(data, tal_count(extra->data), 10);
 
 	/* extra->data is already u5s, so do this raw. */
-	len = tal_count(*data);
-	tal_resize(data, len + tal_count(extra->data));
-	memcpy(*data + len, extra->data, tal_count(extra->data));
+	tal_arr_append(data, extra->data);
 	return true;
 }
 
@@ -1107,17 +1315,25 @@ char *bolt11_encode_(const tal_t *ctx,
 			amount = msat * 10 / multipliers[i].m10;
 		}
 		hrp = tal_fmt(tmpctx, "ln%s%"PRIu64"%c",
-			      b11->chain->bip173_name, amount, postfix);
+			      b11->chain->lightning_hrp, amount, postfix);
 	} else
-		hrp = tal_fmt(tmpctx, "ln%s", b11->chain->bip173_name);
+		hrp = tal_fmt(tmpctx, "ln%s", b11->chain->lightning_hrp);
 
 	/* BOLT #11:
 	 *
 	 * 1. `timestamp`: seconds-since-1970 (35 bits, big-endian)
 	 * 1. zero or more tagged parts
-	 * 1. `signature`: Bitcoin-style signature of above (520 bits)
+	 * 1. `signature`: compact ECDSA/secp256k1 signature of the above
+	 *    (520 bits: 64-byte R||S + 1-byte recovery id)
 	 */
 	push_varlen_uint(&data, b11->timestamp, 35);
+
+	/* This is a hack to match the test vectors, *some* of which
+	 * order differently! */
+	if (!dev_bolt11_old_order) {
+		if (b11->payment_secret)
+			encode_s(&data, b11->payment_secret);
+	}
 
 	/* BOLT #11:
 	 *
@@ -1128,25 +1344,43 @@ char *bolt11_encode_(const tal_t *ctx,
 	/* Thus we do built-in fields, then extras last. */
 	encode_p(&data, &b11->payment_hash);
 
-	if (b11->description)
-		encode_d(&data, b11->description);
-
+	/* BOLT #11:
+	 * A writer:
+	 *...
+	 *    - MUST include either exactly one `d` or exactly one `h` field.
+	 */
+	/* We sometimes keep description around (to put in db), so prefer hash */
 	if (b11->description_hash)
 		encode_h(&data, b11->description_hash);
+	else if (b11->description)
+		encode_d(&data, b11->description);
+
+	if (b11->metadata)
+		encode_m(&data, b11->metadata);
 
 	if (n_field)
 		encode_n(&data, &b11->receiver_id);
+
+	if (dev_bolt11_old_order) {
+		if (b11->payment_secret)
+			encode_s(&data, b11->payment_secret);
+	}
 
 	if (b11->expiry != DEFAULT_X)
 		encode_x(&data, b11->expiry);
 
 	/* BOLT #11:
-	 *   - MUST include one `c` field (`min_final_cltv_expiry`).
+	 *   - SHOULD include one `c` field (`min_final_cltv_expiry_delta`).
+	 *...
+	 * A reader:
+	 *...
+	 *   - if the `c` field (`min_final_cltv_expiry_delta`) is not provided:
+	 *     - MUST use an expiry delta of at least 18 when making the payment
 	 */
+	/* FIXME: Only encode if non-default once all implementations update
+	 * default min_final_cltv_expiry_delta to 18. Forcing inclusion in the
+	 * interrim to ensure compatibility with existing nodes. */
 	encode_c(&data, b11->min_final_cltv_expiry);
-
-	if (b11->payment_secret)
-		encode_s(&data, b11->payment_secret);
 
 	for (size_t i = 0; i < tal_count(b11->fallbacks); i++)
 		encode_f(&data, b11->fallbacks[i]);
@@ -1154,7 +1388,7 @@ char *bolt11_encode_(const tal_t *ctx,
 	for (size_t i = 0; i < tal_count(b11->routes); i++)
 		encode_r(&data, b11->routes[i]);
 
-	maybe_encode_9(&data, b11->features);
+	maybe_encode_9(&data, b11->features, b11->metadata != NULL);
 
 	list_for_each(&b11->extra_fields, extra, list)
 		if (!encode_extra(&data, extra))
@@ -1178,8 +1412,16 @@ char *bolt11_encode_(const tal_t *ctx,
 
 	bech32_push_bits(&data, sig_and_recid, sizeof(sig_and_recid) * CHAR_BIT);
 
+	/* BOLT #11:
+	 * A writer:
+	 *    - MUST encode the payment request in Bech32 (see BIP-0173)
+	 *    - SHOULD use upper case for QR codes (see BIP-0173)
+	 *    - MAY exceed the 90-character limit specified in BIP-0173.
+	 */
+	/* We let the user upcase if they want */
 	output = tal_arr(ctx, char, strlen(hrp) + tal_count(data) + 8);
-	if (!bech32_encode(output, hrp, data, tal_count(data), (size_t)-1))
+	if (!bech32_encode(output, hrp, data, tal_count(data), (size_t)-1,
+			   BECH32_ENCODING_BECH32))
 		output = tal_free(output);
 
 	return output;

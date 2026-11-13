@@ -29,8 +29,8 @@ static bool trace_eq(const struct trace *t1, const struct trace *t2)
 }
 
 /* struct thash */
-HTABLE_DEFINE_TYPE(struct trace, (const struct trace *), hash_trace, trace_eq,
-		   thash);
+HTABLE_DEFINE_NODUPS_TYPE(struct trace, (const struct trace *), hash_trace, trace_eq,
+			  thash);
 
 static struct thash htable
 = { HTABLE_INITIALIZER(htable.raw, thash_hash, NULL) };
@@ -84,6 +84,7 @@ char *likely_stats(unsigned int min_hits, unsigned int percent)
 	struct thash_iter i;
 	char *ret;
 	struct trace *t;
+	size_t maxlen;
 
 	worst = NULL;
 	worst_ratio = 2;
@@ -98,18 +99,19 @@ char *likely_stats(unsigned int min_hits, unsigned int percent)
 		}
 	}
 
-	if (worst_ratio * 100 > percent)
+	if (!worst || worst_ratio * 100 > percent)
 		return NULL;
 
-	ret = malloc(strlen(worst->condstr) +
-		     strlen(worst->file) +
-		     sizeof(long int) * 8 +
-		     sizeof("%s:%u:%slikely(%s) correct %u%% (%lu/%lu)"));
-	sprintf(ret, "%s:%u:%slikely(%s) correct %u%% (%lu/%lu)",
-		worst->file, worst->line,
-		worst->expect ? "" : "un", worst->condstr,
-		(unsigned)(worst_ratio * 100),
-		worst->right, worst->count);
+	maxlen = strlen(worst->condstr) +
+		strlen(worst->file) +
+		sizeof(long int) * 8 +
+		sizeof("%s:%u:%slikely(%s) correct %u%% (%lu/%lu)");
+	ret = malloc(maxlen);
+	snprintf(ret, maxlen - 1, "%s:%u:%slikely(%s) correct %u%% (%lu/%lu)",
+		 worst->file, worst->line,
+		 worst->expect ? "" : "un", worst->condstr,
+		 (unsigned)(worst_ratio * 100),
+		 worst->right, worst->count);
 
 	thash_del(&htable, worst);
 	free(worst);

@@ -4,14 +4,15 @@
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <secp256k1.h>
-#include <stdbool.h>
 
+struct sha256;
 struct sha256_double;
 struct sha256_ctx;
 struct bitcoin_tx;
 struct pubkey;
 struct privkey;
 struct bitcoin_tx_output;
+struct bip340sig;
 
 enum sighash_type {
     SIGHASH_ALL = 1,
@@ -122,6 +123,13 @@ bool check_tx_sig(const struct bitcoin_tx *tx, size_t input_num,
 		  const struct pubkey *key,
 		  const struct bitcoin_signature *sig);
 
+/**
+ * check a Schnorr signature
+ */
+bool check_schnorr_sig(const struct sha256 *hash,
+		       const secp256k1_pubkey *pubkey,
+		       const struct bip340sig *sig);
+
 /* Give DER encoding of signature: returns length used (<= 73). */
 size_t signature_to_der(u8 der[73], const struct bitcoin_signature *sig);
 
@@ -142,13 +150,19 @@ void fromwire_bip340sig(const u8 **cursor, size_t *max,
 			struct bip340sig *bip340sig);
 
 /* Get a hex string sig */
-char *fmt_signature(const tal_t *ctx, const secp256k1_ecdsa_signature *sig);
+char *fmt_secp256k1_ecdsa_signature(const tal_t *ctx,
+				    const secp256k1_ecdsa_signature *sig);
 char *fmt_bip340sig(const tal_t *ctx, const struct bip340sig *bip340sig);
+char *fmt_bitcoin_signature(const tal_t *ctx,
+			    const struct bitcoin_signature *sig);
 
 /* For caller convenience, we hand in tag in parts (any can be "") */
 void bip340_sighash_init(struct sha256_ctx *sctx,
 			 const char *tag1,
 			 const char *tag2,
 			 const char *tag3);
+
+/* Some of the spec test vectors assume no sig grinding. */
+extern bool dev_no_signature_grind;
 
 #endif /* LIGHTNING_BITCOIN_SIGNATURE_H */

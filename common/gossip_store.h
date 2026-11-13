@@ -5,54 +5,81 @@
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 
-struct per_peer_state;
+struct gossip_state;
+struct gossip_rcvd_filter;
 
 /**
  * gossip_store -- On-disk storage related information
  */
-#define GOSSIP_STORE_VERSION 9
+
+/* First byte of file is the version.
+ *
+ * Top three bits mean incompatible change.
+ * As of this writing, major == 0, minor == 16.
+ */
+#define GOSSIP_STORE_MAJOR_VERSION_MASK 0xE0
+#define GOSSIP_STORE_MINOR_VERSION_MASK 0x1F
+
+/* Extract version from first byte */
+#define GOSSIP_STORE_MAJOR_VERSION(verbyte) (((u8)(verbyte)) >> 5)
+#define GOSSIP_STORE_MINOR_VERSION(verbyte) ((verbyte) & GOSSIP_STORE_MINOR_VERSION_MASK)
 
 /**
- * Bit of length we use to mark a deleted record.
+ * Bit of flags we use to mark a deleted record.
  */
-#define GOSSIP_STORE_LEN_DELETED_BIT 0x80000000U
+#define GOSSIP_STORE_DELETED_BIT 0x8000U
 
 /**
- * Bit of length we use to mark an important record.
+ * Bit of flags indicating record has been written.
  */
-#define GOSSIP_STORE_LEN_PUSH_BIT 0x40000000U
+#define GOSSIP_STORE_COMPLETED_BIT 0x2000U
 
-/* Mask for extracting just the length part of len field */
-#define GOSSIP_STORE_LEN_MASK \
-	(~(GOSSIP_STORE_LEN_PUSH_BIT | GOSSIP_STORE_LEN_DELETED_BIT))
+/**
+ * Bit of flags used to mark a channel announcement closed (not deleted for 12 blocks)
+ */
+#define GOSSIP_STORE_DYING_BIT 0x0800U
+
 
 /**
  * gossip_hdr -- On-disk format header.
  */
 struct gossip_hdr {
-	beint32_t len; /* Length of message after header. */
+	beint16_t flags; /* GOSSIP_STORE_xxx_BIT flags. */
+	beint16_t len; /* Length of message after header. */
 	beint32_t crc; /* crc of message of timestamp, after header. */
 	beint32_t timestamp; /* timestamp of msg. */
 };
 
+/* Useful to read gossip_hdr and type of msg.  */
+struct gossip_hdr_and_type {
+	struct gossip_hdr hdr;
+	be16 type;
+};
+/* Beware padding! */
+#define GOSSIP_HDR_AND_TYPE_SIZE (sizeof(struct gossip_hdr) + sizeof(u16))
+
 /**
- * Direct store accessor: loads gossip msg from store.
+ * Direct store accessor: read gossip msg hdr from store.
+ * @gossip_store_fd: the readable file descriptor
+ * @off: the offset to read
+ * @len (out): the length of the message (not including header)
+ * @timestamp (out): if non-NULL, set to the timestamp.
+ * @flags (out): if non-NULL, set to the flags.
+ * @type (out): if non-NULL, set to the msg type.
  *
- * Returns NULL and resets time_to_next_gossip(pps) if there are no
- * more gossip msgs.
+ * Returns false if there are no more gossip msgs, or message
+ * is incomplete.  To iterate, simply add sizeof(gossip_hdr) + *len to off.
  */
-u8 *gossip_store_next(const tal_t *ctx, struct per_peer_state *pps);
+bool gossip_store_readhdr(int gossip_store_fd, size_t off,
+			  size_t *len,
+			  u32 *timestamp,
+			  u16 *flags,
+			  u16 *type);
 
 /**
- * Switches the gossip store fd, and gets to the correct offset.
+ * Gossipd will be writing to this, and it's not atomic!  Safest
+ * way to find the "end" is to walk through.
+ * @old_end: 1 if no previous end.
  */
-void gossip_store_switch_fd(struct per_peer_state *pps,
-			    int newfd, u64 offset_shorter);
-
-/**
- * Sets up the tiemstamp filter once they told us to set it.(
- */
-void gossip_setup_timestamp_filter(struct per_peer_state *pps,
-				   u32 first_timestamp,
-				   u32 timestamp_range);
+size_t find_gossip_store_end(int gossip_store_fd, size_t old_end);
 #endif /* LIGHTNING_COMMON_GOSSIP_STORE_H */

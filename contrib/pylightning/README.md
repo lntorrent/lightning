@@ -5,6 +5,9 @@ This package implements the Unix socket based JSON-RPC protocol that
 arbitrary functions on the RPC interface, and serves as a basis for plugins
 written in python.
 
+If you are writing a new plugin you should use [pyln-client](https://github.com/ElementsProject/lightning/tree/master/contrib/pyln-client)
+(the renamed, updated version of pylightning) instead as pylightning is
+currently an empty shell around pyln-client.
 
 ## Installation
 
@@ -15,7 +18,7 @@ pip install pylightning
 ```
 
 Alternatively you can also install the development version to get access to
-currently unreleased features by checking out the c-lightning source code and
+currently unreleased features by checking out the Core Lightning source code and
 installing into your python3 environment:
 
 ```bash
@@ -40,7 +43,7 @@ Generate invoice on one daemon and pay it on the other
 from lightning import LightningRpc
 import random
 
-# Create two instances of the LightningRpc object using two different c-lightning daemons on your computer
+# Create two instances of the LightningRpc object using two different Core Lightning daemons on your computer
 l1 = LightningRpc("/tmp/lightning1/lightning-rpc")
 l5 = LightningRpc("/tmp/lightning5/lightning-rpc")
 
@@ -91,8 +94,8 @@ def init(options, configuration, plugin):
 
 
 @plugin.subscribe("connect")
-def on_connect(plugin, id, address):
-    plugin.log("Received connect event for peer {}".format(id))
+def on_connect(plugin, connect):
+    plugin.log("Received connect event for peer {}".format(connect))
 
 
 plugin.add_option('greeting', 'Hello', 'The greeting I should use.')

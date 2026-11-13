@@ -3,54 +3,55 @@ lightningd -- Daemon for running a Lightning Network node
 
 SYNOPSIS
 --------
+
 ```bash
-lightningd [--conf=<config-file>] [OPTIONS]…
+lightningd [--conf=<config-file>] [OPTIONS]
 ```
 
 DESCRIPTION
 -----------
 
-**lightningd** starts the C-Lightning daemon, which implements a
+**lightningd** starts the Core Lightning daemon, which implements a
 standards-compliant Lightning Network node.
 
 CONFIGURATION OPTIONS
 ---------------------
 
- **--conf**=*FILE*
+* **--conf**=*FILE*
 Specify configuration file. If not an absolute path, will be relative
 from the lightning-dir location. Defaults to *config*.
 
- **--lightning-dir**=*DIR*
-Set the directory for the C-Lightning daemon. Defaults to
+* **--lightning-dir**=*DIR*
+Set the directory for the Core Lightning daemon. Defaults to
 *$HOME/.lightning*.
 
 MORE OPTIONS
 ------------
 
 Command line options are mirrored as configuration options in the
-configuration file, so *foo* in the configuration file simply becomes
-**--foo** on the command line, and **foo=bar** becomes **--foo=bar**.
+configuration file, so `foo` in the configuration file simply becomes
+`--foo` on the command line, and `foo=bar` becomes `--foo=bar`.
 
 See lightningd-config(5) for a comprehensive list of all available
 options.
 
-LOGGING AND COMMANDING C-LIGHTNING
-----------------------------------
+LOGGING AND COMMANDING CORE LIGHTNING
+-------------------------------------
 
-By default, C-Lightning will log to the standard output.
+By default, Core Lightning will log to the standard output.
 To log to a specific file, use **--log-file**=*PATH*.
-Sending SIGHUP will cause C-Lightning to reopen this file,
+Sending SIGHUP will cause Core Lightning to reopen this file,
 for example to do log rotation.
 
-C-Lightning will set up a Unix domain socket for receiving
+Core Lightning will set up a Unix domain socket for receiving
 commands.
 By default this will be the file **lightning-rpc** in your
 specified **lightning-dir**.
-You can use lightning-cli(1) to send commands to C-Lightning
+You can use lightning-cli(1) to send commands to Core Lightning
 once **lightningd** has started; you need to match the
 **--lightning-dir** and **--rpc-file** options between them.
 
-Commands for C-Lightning are described in various manpages
+Commands for Core Lightning are described in various manpages
 in section 7, with the common prefix **lightning-**.
 
 QUICK START
@@ -63,9 +64,9 @@ directory containing your configuration.
 Your other main preparation would be to set up a mainnet Bitcoin
 fullnode, i.e. run a bitcoind(1) instance. The rest of this quick start
 guide will assume you are reckless and want to spend real funds on
-Lightning. Indicate *network=bitcoin* in your *config* file explicitly.
+Lightning: otherwise indicate *network=testnet* in your *config* file explicitly.
 
-C-Lightning needs to communicate with the Bitcoin Core RPC. You can set
+Core Lightning needs to communicate with the Bitcoin Core RPC. You can set
 this up using *bitcoin-datadir*, *bitcoin-rpcconnect*,
 *bitcoin-rpcport*, *bitcoin-rpcuser*, and *bitcoin-rpcpassword* options
 in your *config* file.
@@ -84,8 +85,8 @@ option.
 
 Check if things are working:
 
-    $ lightning-cli --lightning-dir=%HOME/.lightning help
-    $ lightning-cli --lightning-dir=%HOME/.lightning getinfo
+    $ lightning-cli --lightning-dir=$HOME/.lightning help
+    $ lightning-cli --lightning-dir=$HOME/.lightning getinfo
 
 The **getinfo** command in particular will return a *blockheight* field,
 which indicates the block height to which **lightningd** has been
@@ -102,11 +103,10 @@ elided, specify it if you selected your own *lightning-dir*):
 
     $ lightning-cli newaddr
 
-This will provide a native SegWit bech32 address. In case all your money
-is in services that do not support native SegWit and have to use
-P2SH-wrapped addresses, instead use:
+This will provide a native SegWit bech32 address. Alternatively you can
+generate a taproot address with:
 
-    $ lightning-cli newaddr p2sh-segwit
+    $ lightning-cli newaddr p2tr
 
 Transfer a small amount of onchain funds to the given address. Check the
 status of all your funds (onchain and on-Lightning) via
@@ -121,7 +121,7 @@ which you can do by using dig(1) and querying *lseed.bitcoinstats.com*:
 
 This will give 25 IPv4 addresses, you can select any one of those. You
 will also need to learn the corresponding public key, which you can
-determine by searching the IP addrss on <https://1ml.com/> . The public
+determine by searching the IP address on [https://1ml.com/](https://1ml.com/) . The public
 key is a long hex string, like so:
 *024772ee4fa461febcef09d5869e1238f932861f57be7a6633048514e3f56644a1*.
 (this example public key is not used as of this writing)
@@ -148,9 +148,22 @@ confirmed deeply.
 
 Once the channel *state* is *CHANNELD\_NORMAL*, you can start paying
 merchants over Lightning. Acquire a Lightning invoice from your favorite
-merchant, and use lightning-pay(7) to pay it:
+merchant, and use lightning-xpay(7) to pay it:
 
-    $ lightning-cli pay $INVOICE
+    $ lightning-cli xpay $INVOICE
+
+ERRORS CODE
+---
+
+- 1: Generic lightning-cli error
+- 10: Error executing subdaemons
+- 11: Error locking pidfile (often another lightningd running)
+- 20: Generic error related to HSM secret
+- 21: HSM secret is encrypted
+- 22: Bad password used to decrypt the HSM secred
+- 23: Error caused from the I/O operation during a HSM decryption/encryption operation
+- 30: Wallet database does not match (network or hsm secret)
+
 
 BUGS
 ----
@@ -161,27 +174,26 @@ to gain our eternal gratitude!
 AUTHOR
 ------
 
-ZmnSCPxj <<ZmnSCPxj@protonmail.com>> wrote the initial version of
-this man page, but many others did the hard work of actually
-implementing a standards-compliant Lightning Network node
-implementation.
+ZmnSCPxj [ZmnSCPxj@protonmail.com](mailto:ZmnSCPxj@protonmail.com) wrote the initial version of
+this man page, but many others did the hard work of actually implementing a standards-compliant
+Lightning Network node implementation.
 
 SEE ALSO
 --------
 
-lightning-listconfigs(7), lightning-config(5), lightning-cli(1),
+lightningd-rpc(7),
+lightning-listconfigs(7), lightningd-config(5), lightning-cli(1),
 lightning-newaddr(7), lightning-listfunds(7), lightning-connect(7),
-lightning-fundchannel(7), lightning-listpeers(7), lightning-pay(7),
+lightning-fundchannel(7), lightning-listpeers(7), lightning-xpay(7),
 lightning-hsmtool(8)
 
 RESOURCES
 ---------
 
-Main web site: <https://github.com/ElementsProject/lightning>
+Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)
 
 COPYING
 -------
 
 Note: the modules in the ccan/ directory have their own licenses, but
 the rest of the code is covered by the BSD-style MIT license.
-

@@ -2,17 +2,10 @@
 #include <assert.h>
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
-#include <ccan/crypto/sha256/sha256.h>
-#include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
-#include <ccan/take/take.h>
 #include <common/cryptomsg.h>
-#include <common/dev_disconnect.h>
-#include <common/status.h>
 #include <common/utils.h>
 #include <sodium/crypto_aead_chacha20poly1305.h>
-#include <wire/peer_wire.h>
-#include <wire/wire.h>
 #include <wire/wire_io.h>
 
 static void hkdf_two_keys(struct secret *out1, struct secret *out2,
@@ -46,7 +39,7 @@ static void maybe_rotate_key(u64 *n, struct secret *k, struct secret *ck)
 	 * A key is to be rotated after a party encrypts or decrypts 1000 times
 	 * with it (i.e. every 500 messages). This can be properly accounted
 	 * for by rotating the key once the nonce dedicated to it
-	 * exceeds 1000.
+	 * reaches 1000.
 	 */
 	if (*n != 1000)
 		return;
@@ -56,7 +49,7 @@ static void maybe_rotate_key(u64 *n, struct secret *k, struct secret *ck)
 	 * Key rotation for a key `k` is performed according to the following
 	 * steps:
 	 *
-	 * 1. Let `ck` be the chaining key obtained at the end of Act Three.
+	 * 1. Let `ck` be the chaining key (i.e. `rck` for `rk` or `sck` for `sk`)
 	 * 2. `ck', k' = HKDF(ck, k)`
 	 * 3. Reset the nonce for the key to `n = 0`.
 	 * 4. `k = k'`
@@ -79,9 +72,9 @@ static void le64_nonce(unsigned char *npub, u64 nonce)
 {
 	/* BOLT #8:
 	 *
-	 * ...with nonce `n` encoded as 32 zero bits, followed by a
-	 * *little-endian* 64-bit value.  Note: this follows the Noise Protocol
-	 * convention, rather than our normal endian
+	 * with nonce `n` encoded as 32 zero bits, followed by a
+	 * *little-endian* 64-bit value. Note: this follows the Noise
+	 * Protocol convention, rather than our normal endian.
 	 */
 	le64 le_nonce = cpu_to_le64(nonce);
 	const size_t zerolen = crypto_aead_chacha20poly1305_ietf_NPUBBYTES - sizeof(le_nonce);
@@ -127,7 +120,8 @@ u8 *cryptomsg_decrypt_body(const tal_t *ctx,
 	return decrypted;
 }
 
-bool cryptomsg_decrypt_header(struct crypto_state *cs, u8 hdr[18], u16 *lenp)
+bool cryptomsg_decrypt_header(struct crypto_state *cs, const u8 hdr[18],
+			      u16 *lenp)
 {
 	unsigned char npub[crypto_aead_chacha20poly1305_ietf_NPUBBYTES];
 	unsigned long long mlen;
@@ -239,7 +233,6 @@ u8 *cryptomsg_encrypt_msg(const tal_t *ctx,
 
 	maybe_rotate_key(&cs->sn, &cs->sk, &cs->s_ck);
 
-	if (taken(msg))
-		tal_free(msg);
+	tal_free_if_taken(msg);
 	return out;
 }

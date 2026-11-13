@@ -1,19 +1,18 @@
 #include "config.h"
-#include <assert.h>
 #include <bitcoin/block.h>
-#include <bitcoin/chainparams.h>
 #include <bitcoin/tx.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
-#include <common/type_to_string.h>
-#include <wire/wire.h>
+#include <common/utils.h>
 
 /* Sets *cursor to NULL and returns NULL when a pull fails. */
 static const u8 *pull(const u8 **cursor, size_t *max, void *copy, size_t n)
 {
 	const u8 *p = *cursor;
 
-	if (*max < n) {
+	/* Once a pull has overrun, the cursor stays NULL: a later zero-length
+	 * pull must not resume from it. */
+	if (!p || *max < n) {
 		*cursor = NULL;
 		*max = 0;
 		/* Just make sure we don't leak uninitialized mem! */
@@ -23,7 +22,6 @@ static const u8 *pull(const u8 **cursor, size_t *max, void *copy, size_t n)
 	}
 	*cursor += n;
 	*max -= n;
-	assert(p);
 	if (copy)
 		memcpy(copy, p, n);
 	return memcheck(p, n);
@@ -62,6 +60,16 @@ static void sha256_varint(struct sha256_ctx *ctx, u64 val)
 	sha256_update(ctx, vt, vtlen);
 }
 
+/* Hashing before the pull reads past the end of a truncated block, so let
+ * pull() say whether the bytes are there. */
+static void pull_and_hash(const u8 **cursor, size_t *len,
+			  struct sha256_ctx *shactx, size_t n)
+{
+	const u8 *p = pull(cursor, len, NULL, n);
+	if (p)
+		sha256_update(shactx, p, n);
+}
+
 static void bitcoin_block_pull_dynafed_params(const u8 **cursor, size_t *len, struct sha256_ctx *shactx)
 {
 	u8 type;
@@ -75,49 +83,41 @@ static void bitcoin_block_pull_dynafed_params(const u8 **cursor, size_t *len, st
 		/* "scriptPubKey" used for block signing */
 		l1 = pull_varint(cursor, len);
 		sha256_varint(shactx, l1);
-		sha256_update(shactx, *cursor, l1);
-		pull(cursor, len, NULL, l1);
+		pull_and_hash(cursor, len, shactx, l1);
 
 		/* signblock_witness_limit */
-		sha256_update(shactx, *cursor, 4);
-		pull(cursor, len, NULL, 4);
+		pull_and_hash(cursor, len, shactx, 4);
 
 		/* Skip elided_root */
-		sha256_update(shactx, *cursor, 32);
-		pull(cursor, len, NULL, 32);
+		pull_and_hash(cursor, len, shactx, 32);
 		break;
 
 	case DYNAFED_PARAMS_FULL:
 		/* "scriptPubKey" used for block signing */
 		l1 = pull_varint(cursor, len);
 		sha256_varint(shactx, l1);
-		sha256_update(shactx, *cursor, l1);
-		pull(cursor, len, NULL, l1);
+		pull_and_hash(cursor, len, shactx, l1);
 
 		/* signblock_witness_limit */
-		sha256_update(shactx, *cursor, 4);
-		pull(cursor, len, NULL, 4);
+		pull_and_hash(cursor, len, shactx, 4);
 
 		/* fedpeg_program */
 		l1 = pull_varint(cursor, len);
 		sha256_varint(shactx, l1);
-		sha256_update(shactx, *cursor, l1);
-		pull(cursor, len, NULL, l1);
+		pull_and_hash(cursor, len, shactx, l1);
 
 		/* fedpegscript */
 		l1 = pull_varint(cursor, len);
 		sha256_varint(shactx, l1);
-		sha256_update(shactx, *cursor, l1);
-		pull(cursor, len, NULL, l1);
+		pull_and_hash(cursor, len, shactx, l1);
 
 		/* extension space */
 		l2 = pull_varint(cursor, len);
 		sha256_varint(shactx, l2);
-		for (size_t i = 0; i < l2; i++) {
+		for (size_t i = 0; i < l2 && *cursor; i++) {
 			l1 = pull_varint(cursor, len);
 			sha256_varint(shactx, l1);
-			sha256_update(shactx, *cursor, l1);
-			pull(cursor, len, NULL, l1);
+			pull_and_hash(cursor, len, shactx, l1);
 		}
 		break;
 	}
@@ -130,7 +130,7 @@ static void bitcoin_block_pull_dynafed_details(const u8 **cursor, size_t *len, s
 
 	/* Consume the signblock_witness */
 	u64 numwitnesses = pull_varint(cursor, len);
-	for (size_t i=0; i<numwitnesses; i++) {
+	for (size_t i=0; i<numwitnesses && *cursor; i++) {
 		u64 witsize = pull_varint(cursor, len);
 		pull(cursor, len, NULL, witsize);
 	}
@@ -157,7 +157,7 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 
 	/* De-hex the array. */
 	len = hex_data_size(hexlen);
-	p = linear_tx = tal_arr(ctx, u8, len);
+	p = linear_tx = tal_arr(b, u8, len);
 	if (!hex_decode(hex, hexlen, linear_tx, len))
 		return tal_free(b);
 
@@ -189,8 +189,7 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 			/* elemens_header.challenge */
 			templen = pull_varint(&p, &len);
 			sha256_varint(&shactx, templen);
-			sha256_update(&shactx, p, templen);
-			pull(&p, &len, NULL, templen);
+			pull_and_hash(&p, &len, &shactx, templen);
 
 			/* elements_header.solution. Not hashed since it'd be
 			 * a circular dependency. */
@@ -208,10 +207,15 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 	sha256_double_done(&shactx, &b->hdr.hash.shad);
 
 	num = pull_varint(&p, &len);
+	/* Every transaction takes at least one byte */
+	if (num > len)
+		return tal_free(b);
 	b->tx = tal_arr(b, struct bitcoin_tx *, num);
 	b->txids = tal_arr(b, struct bitcoin_txid, num);
 	for (i = 0; i < num; i++) {
-		b->tx[i] = pull_bitcoin_tx(b->tx, &p, &len);
+		b->tx[i] = pull_bitcoin_tx_only(b->tx, &p, &len);
+		if (!b->tx[i])
+			return tal_free(b);
 		b->tx[i]->chainparams = chainparams;
 		bitcoin_txid(b->tx[i], &b->txids[i]);
 	}
@@ -230,34 +234,30 @@ void bitcoin_block_blkid(const struct bitcoin_block *b,
 	*out = b->hdr.hash;
 }
 
-/* We do the same hex-reversing crud as txids. */
 bool bitcoin_blkid_from_hex(const char *hexstr, size_t hexstr_len,
-			    struct bitcoin_blkid *blockid)
+			   struct bitcoin_blkid *blkid)
 {
-	struct bitcoin_txid fake_txid;
-	if (!bitcoin_txid_from_hex(hexstr, hexstr_len, &fake_txid))
+	if (!hex_decode(hexstr, hexstr_len, blkid, sizeof(*blkid)))
 		return false;
-	blockid->shad = fake_txid.shad;
+	reverse_bytes(blkid->shad.sha.u.u8, sizeof(blkid->shad.sha.u.u8));
 	return true;
 }
 
-bool bitcoin_blkid_to_hex(const struct bitcoin_blkid *blockid,
-			  char *hexstr, size_t hexstr_len)
+bool bitcoin_blkid_to_hex(const struct bitcoin_blkid *blkid,
+			 char *hexstr, size_t hexstr_len)
 {
-	struct bitcoin_txid fake_txid;
-	fake_txid.shad = blockid->shad;
-	return bitcoin_txid_to_hex(&fake_txid, hexstr, hexstr_len);
+	struct sha256_double rev = blkid->shad;
+	reverse_bytes(rev.sha.u.u8, sizeof(rev.sha.u.u8));
+	return hex_encode(&rev, sizeof(rev), hexstr, hexstr_len);
 }
 
-static char *fmt_bitcoin_blkid(const tal_t *ctx,
-			       const struct bitcoin_blkid *blkid)
+char *fmt_bitcoin_blkid(const tal_t *ctx, const struct bitcoin_blkid *blkid)
 {
 	char *hexstr = tal_arr(ctx, char, hex_str_size(sizeof(*blkid)));
 
 	bitcoin_blkid_to_hex(blkid, hexstr, hex_str_size(sizeof(*blkid)));
 	return hexstr;
 }
-REGISTER_TYPE_TO_STRING(bitcoin_blkid, fmt_bitcoin_blkid);
 
 void fromwire_bitcoin_blkid(const u8 **cursor, size_t *max,
 			    struct bitcoin_blkid *blkid)

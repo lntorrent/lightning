@@ -1,9 +1,9 @@
-#include "privkey.h"
-#include "pubkey.h"
+#include "config.h"
 #include <assert.h>
+#include <bitcoin/privkey.h>
+#include <bitcoin/pubkey.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <wire/wire.h>
 
@@ -62,16 +62,15 @@ bool pubkey_from_hexstr(const char *derstr, size_t slen, struct pubkey *key)
 	return pubkey_from_der(der, dlen, key);
 }
 
-char *pubkey_to_hexstr(const tal_t *ctx, const struct pubkey *key)
+char *fmt_pubkey(const tal_t *ctx, const struct pubkey *key)
 {
 	unsigned char der[PUBKEY_CMPR_LEN];
 
 	pubkey_to_der(der, key);
 	return tal_hexstr(ctx, der, sizeof(der));
 }
-REGISTER_TYPE_TO_STRING(pubkey, pubkey_to_hexstr);
 
-char *secp256k1_pubkey_to_hexstr(const tal_t *ctx, const secp256k1_pubkey *key)
+char *fmt_secp256k1_pubkey(const tal_t *ctx, const secp256k1_pubkey *key)
 {
 	unsigned char der[PUBKEY_CMPR_LEN];
 	size_t outlen = sizeof(der);
@@ -81,11 +80,10 @@ char *secp256k1_pubkey_to_hexstr(const tal_t *ctx, const secp256k1_pubkey *key)
 	assert(outlen == sizeof(der));
 	return tal_hexstr(ctx, der, sizeof(der));
 }
-REGISTER_TYPE_TO_STRING(secp256k1_pubkey, secp256k1_pubkey_to_hexstr);
 
 int pubkey_cmp(const struct pubkey *a, const struct pubkey *b)
 {
-	u8 keya[33], keyb[33];
+	u8 keya[PUBKEY_CMPR_LEN], keyb[PUBKEY_CMPR_LEN];
 	pubkey_to_der(keya, a);
 	pubkey_to_der(keyb, b);
 	return memcmp(keya, keyb, sizeof(keya));
@@ -125,37 +123,3 @@ void towire_pubkey(u8 **pptr, const struct pubkey *pubkey)
 
 	towire(pptr, output, outputlen);
 }
-
-void fromwire_pubkey32(const u8 **cursor, size_t *max, struct pubkey32 *pubkey32)
-{
-	u8 raw[32];
-
-	if (!fromwire(cursor, max, raw, sizeof(raw)))
-		return;
-
-	if (secp256k1_xonly_pubkey_parse(secp256k1_ctx,
-					 &pubkey32->pubkey,
-					 raw) != 1) {
-		SUPERVERBOSE("not a valid point");
-		fromwire_fail(cursor, max);
-	}
-}
-
-void towire_pubkey32(u8 **pptr, const struct pubkey32 *pubkey32)
-{
-	u8 output[32];
-
-	secp256k1_xonly_pubkey_serialize(secp256k1_ctx, output,
-					 &pubkey32->pubkey);
-	towire(pptr, output, sizeof(output));
-}
-
-char *pubkey32_to_hexstr(const tal_t *ctx, const struct pubkey32 *pubkey32)
-{
-	u8 output[32];
-
-	secp256k1_xonly_pubkey_serialize(secp256k1_ctx, output,
-					 &pubkey32->pubkey);
-	return tal_hexstr(ctx, output, sizeof(output));
-}
-REGISTER_TYPE_TO_STRING(pubkey32, pubkey32_to_hexstr);

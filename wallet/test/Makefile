@@ -5,33 +5,7 @@ WALLET_TEST_PROGRAMS := $(WALLET_TEST_OBJS:.o=)
 ALL_C_SOURCES += $(WALLET_TEST_SRC)
 ALL_TEST_PROGRAMS += $(WALLET_TEST_PROGRAMS)
 
-WALLET_TEST_COMMON_OBJS :=			\
-	common/amount.o				\
-	common/base32.o				\
-	common/derive_basepoints.o		\
-	common/htlc_state.o			\
-	common/htlc_wire.o			\
-	common/fee_states.o			\
-	common/type_to_string.o			\
-	common/memleak.o			\
-	common/node_id.o			\
-	common/onionreply.o			\
-	common/key_derive.o			\
-	common/pseudorand.o			\
-	common/setup.o				\
-	common/timeout.o			\
-	common/utils.o				\
-	common/wireaddr.o			\
-	common/version.o			\
-	wallet/db_sqlite3.o			\
-	wire/towire.o				\
-	wire/fromwire.o
-
-$(WALLET_TEST_PROGRAMS): $(BITCOIN_OBJS) $(WALLET_TEST_COMMON_OBJS)
-$(WALLET_TEST_OBJS): $(WALLET_HDRS) $(WALLET_SRC)
-
-wallet/tests: $(WALLET_TEST_PROGRAMS:%=unittest/%)
-
-update-mocks: $(WALLET_TEST_SRC:%=update-mocks/%)
+$(WALLET_TEST_PROGRAMS): wallet/db_sqlite3_sqlgen.o libcommon.a
+$(WALLET_TEST_OBJS): $(WALLET_HDRS) $(WALLET_SRC) wallet/test/Makefile
 
 check-units: $(WALLET_TEST_PROGRAMS:%=unittest/%)

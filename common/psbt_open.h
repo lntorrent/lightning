@@ -1,12 +1,9 @@
 #ifndef LIGHTNING_COMMON_PSBT_OPEN_H
 #define LIGHTNING_COMMON_PSBT_OPEN_H
 #include "config.h"
-#include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <common/tx_roles.h>
-#include <stdbool.h>
 #include <wally_psbt.h>
-#include <wally_transaction.h>
 
 struct channel_id;
 struct wally_tx_input;
@@ -17,14 +14,12 @@ struct wally_psbt_output;
 struct wally_map;
 
 struct input_set {
-	struct wally_tx_input tx_input;
 	struct wally_psbt_input input;
 	/* index on PSBT of this input */
 	size_t idx;
 };
 
 struct output_set {
-	struct wally_tx_output tx_output;
 	struct wally_psbt_output output;
 	/* index on PSBT of this output */
 	size_t idx;
@@ -39,6 +34,8 @@ struct psbt_changeset {
 
 #define PSBT_TYPE_SERIAL_ID 0x01
 #define PSBT_TYPE_INPUT_MARKER 0x02
+#define PSBT_TYPE_OUTPUT_EXTERNAL 0x04
+#define PSBT_TYPE_CHANNELIDS 0x08 /* The channel ids (used for splice resume) */
 
 /* psbt_get_serial_id - Returns the serial_id from an unknowns map
  *
@@ -57,6 +54,25 @@ WARN_UNUSED_RESULT bool psbt_get_serial_id(const struct wally_map *map,
  * @psbt - psbt to sort
  */
 void psbt_sort_by_serial_id(struct wally_psbt *psbt);
+
+
+/* psbt_get_channel_ids - Returns the array of channel_ids stored in the PSBT
+ *
+ * @ctx - allocation context for returned changeset
+ * @psbt - psbt to search
+ * @channel_ids - result placed into this tal array
+ */
+WARN_UNUSED_RESULT bool psbt_get_channel_ids(const tal_t *ctx,
+					     const struct wally_psbt *psbt,
+					     struct channel_id **channel_ids);
+
+/* psbt_set_channel_ids - Stores the channel_ids in the PSBT
+ *
+ * @psbt - the psbt to put the channel_ids into
+ * @channel_ids - the channel ids to put in
+ */
+void psbt_set_channel_ids(struct wally_psbt *psbt,
+			  struct channel_id *channel_ids);
 
 /* psbt_get_changeset - Returns set of diffs btw orig + new psbt
  *
@@ -174,4 +190,28 @@ void psbt_input_mark_ours(const tal_t *ctx,
  */
 bool psbt_input_is_ours(const struct wally_psbt_input *input);
 
+/* psbt_has_our_input  - Returns true if this psbt contains
+ * 			 any input that is ours
+ */
+bool psbt_has_our_input(const struct wally_psbt *psbt);
+
+/* psbt_output_mark_external - Marks an output as a deposit to
+ * 			       an external address.
+ * 			       Used when withdrawing from internal
+ * 			       wallet */
+void psbt_output_mark_as_external(const tal_t *ctx,
+				  struct wally_psbt_output *output);
+
+/* psbt_output_to_external - Is this an output we're paying to an external
+ * 			     party? */
+bool psbt_output_to_external(const struct wally_psbt_output *output);
+
+/* psbt_contribs_changed - Returns true if the psbt's inputs/outputs
+ *                         have changed.
+ *
+ * @orig - originating psbt
+ * @new  - 'updated' psbt, to verify is unchanged
+ */
+bool psbt_contribs_changed(struct wally_psbt *orig,
+			   struct wally_psbt *new);
 #endif /* LIGHTNING_COMMON_PSBT_OPEN_H */

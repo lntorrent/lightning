@@ -1,14 +1,13 @@
 #include "config.h"
 #include <assert.h>
 #include <bitcoin/chainparams.h>
-#include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/amount.h>
 #include <common/overflows.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <inttypes.h>
+#include <stdio.h>
 #include <wire/wire.h>
 
 bool amount_sat_to_msat(struct amount_msat *msat,
@@ -20,6 +19,16 @@ bool amount_sat_to_msat(struct amount_msat *msat,
 	return true;
 }
 
+bool amount_msat_to_sat(struct amount_sat *sat,
+			struct amount_msat msat)
+{
+	if (msat.millisatoshis % MSAT_PER_SAT)
+		return false;
+	sat->satoshis = msat.millisatoshis / MSAT_PER_SAT;
+	return true;
+}
+
+
 /* You can always truncate millisatoshis->satoshis. */
 struct amount_sat amount_msat_to_sat_round_down(struct amount_msat msat)
 {
@@ -27,6 +36,14 @@ struct amount_sat amount_msat_to_sat_round_down(struct amount_msat msat)
 
 	sat.satoshis = msat.millisatoshis / MSAT_PER_SAT;
 	return sat;
+}
+
+struct amount_msat amount_msat_to_sat_remainder(struct amount_msat msat)
+{
+	struct amount_msat res;
+
+	res.millisatoshis = msat.millisatoshis % MSAT_PER_SAT;
+	return res;
 }
 
 /* Different formatting by amounts: btc, sat and msat */
@@ -43,17 +60,28 @@ const char *fmt_amount_msat_btc(const tal_t *ctx,
 		       append_unit ? "btc" : "");
 }
 
-const char *fmt_amount_msat(const tal_t *ctx, struct amount_msat msat)
+char *fmt_amount_msat(const tal_t *ctx, struct amount_msat msat)
 {
 	return tal_fmt(ctx, "%"PRIu64"msat", msat.millisatoshis);
 }
 
-static const char *fmt_amount_msat_ptr(const tal_t *ctx,
-				       const struct amount_msat *msat)
+#define LSIZE 5
+
+char *fmt_amount_m_as_sat(const tal_t *ctx, struct amount_msat msat)
 {
-	return fmt_amount_msat(ctx, *msat);
+	char last[LSIZE] = {0};
+
+	if (msat.millisatoshis % MSAT_PER_SAT) {
+		snprintf(last, LSIZE, ".%03"PRIu64,
+			 msat.millisatoshis % MSAT_PER_SAT);
+		while(last[strlen(last) - 1] == '0')
+			last[strlen(last) - 1] = 0;
+	}
+
+	return tal_fmt(ctx, "%"PRIu64"%ssat",
+		       msat.millisatoshis / MSAT_PER_SAT,
+		       last);
 }
-REGISTER_TYPE_TO_STRING(amount_msat, fmt_amount_msat_ptr);
 
 const char *fmt_amount_sat_btc(const tal_t *ctx,
 			       struct amount_sat sat,
@@ -68,17 +96,10 @@ const char *fmt_amount_sat_btc(const tal_t *ctx,
 		       append_unit ? "btc" : "");
 }
 
-const char *fmt_amount_sat(const tal_t *ctx, struct amount_sat sat)
+char *fmt_amount_sat(const tal_t *ctx, struct amount_sat sat)
 {
 	return tal_fmt(ctx, "%"PRIu64"sat", sat.satoshis);
 }
-
-static const char *fmt_amount_sat_ptr(const tal_t *ctx,
-				      const struct amount_sat *sat)
-{
-	return fmt_amount_sat(ctx, *sat);
-}
-REGISTER_TYPE_TO_STRING(amount_sat, fmt_amount_sat_ptr);
 
 static bool breakup(const char *str, size_t slen,
 		    /* Length of first numeric part. */
@@ -255,6 +276,24 @@ WARN_UNUSED_RESULT bool amount_msat_add(struct amount_msat *val,
 	return true;
 }
 
+WARN_UNUSED_RESULT bool amount_msat_accumulate(struct amount_msat *a,
+					       struct amount_msat b)
+{
+	return amount_msat_add(a, *a, b);
+}
+
+WARN_UNUSED_RESULT bool amount_msat_deduct(struct amount_msat *a,
+					       struct amount_msat b)
+{
+	return amount_msat_sub(a, *a, b);
+}
+
+WARN_UNUSED_RESULT bool amount_msat_deduct_sat(struct amount_msat *a,
+					       struct amount_sat b)
+{
+	return amount_msat_sub_sat(a, *a, b);
+}
+
 WARN_UNUSED_RESULT bool amount_msat_sub(struct amount_msat *val,
 					struct amount_msat a,
 					struct amount_msat b)
@@ -325,10 +364,13 @@ WARN_UNUSED_RESULT bool amount_msat_add_sat(struct amount_msat *val,
 }
 
 WARN_UNUSED_RESULT bool amount_msat_scale(struct amount_msat *val,
-					  struct amount_msat sat,
+					  struct amount_msat msat,
 					  double scale)
 {
-	double scaled = sat.millisatoshis * scale;
+	if (scale != scale || scale < 0)
+		return false;
+
+	double scaled = msat.millisatoshis * scale;
 
 	/* If mantissa is < 64 bits, a naive "if (scaled >
 	 * UINT64_MAX)" doesn't work.  Stick to powers of 2. */
@@ -338,9 +380,64 @@ WARN_UNUSED_RESULT bool amount_msat_scale(struct amount_msat *val,
 	return true;
 }
 
+WARN_UNUSED_RESULT bool amount_sat_scale(struct amount_sat *val,
+					 struct amount_sat sat,
+					 double scale)
+{
+	if (scale != scale || scale < 0)
+		return false;
+
+	double scaled = sat.satoshis * scale;
+
+	/* If mantissa is < 64 bits, a naive "if (scaled >
+	 * UINT64_MAX)" doesn't work.  Stick to powers of 2. */
+	if (scaled >= (double)((u64)1 << 63) * 2)
+		return false;
+	val->satoshis = scaled;
+	return true;
+}
+
+WARN_UNUSED_RESULT bool amount_msat_add_sat_s64(struct amount_msat *val,
+						struct amount_msat a,
+						s64 b)
+{
+	if (b < 0)
+		return amount_msat_sub_sat(val, a, amount_sat(-b));
+	else
+		return amount_msat_add_sat(val, a, amount_sat(b));
+}
+
+
+WARN_UNUSED_RESULT bool amount_sat_add_sat_s64(struct amount_sat *val,
+					       struct amount_sat a,
+					       s64 b)
+{
+	if (b < 0)
+		return amount_sat_sub(val, a, amount_sat(-b));
+	else
+		return amount_sat_add(val, a, amount_sat(b));
+}
+
+bool amount_msat_can_add_sat_s64(struct amount_msat a, s64 b)
+{
+	struct amount_msat val;
+	/* This fails if the result goes below 0 */
+	return amount_msat_add_sat_s64(&val, a, b);
+}
+
 bool amount_sat_eq(struct amount_sat a, struct amount_sat b)
 {
 	return a.satoshis == b.satoshis;
+}
+
+bool amount_sat_is_zero(struct amount_sat a)
+{
+	return a.satoshis == 0;
+}
+
+bool amount_msat_is_zero(struct amount_msat a)
+{
+	return a.millisatoshis == 0;
 }
 
 bool amount_msat_eq(struct amount_msat a, struct amount_msat b)
@@ -463,9 +560,26 @@ double amount_msat_ratio(struct amount_msat a, struct amount_msat b)
 	return (double)a.millisatoshis / b.millisatoshis;
 }
 
+u64 amount_msat_ratio_floor(struct amount_msat a, struct amount_msat b)
+{
+	return a.millisatoshis / b.millisatoshis;
+}
+
+u64 amount_msat_ratio_ceil(struct amount_msat a, struct amount_msat b)
+{
+	return (a.millisatoshis + b.millisatoshis - 1) / b.millisatoshis;
+}
+
 struct amount_msat amount_msat_div(struct amount_msat msat, u64 div)
 {
 	msat.millisatoshis /= div;
+	return msat;
+}
+
+struct amount_msat amount_msat_div_ceil(struct amount_msat msat, u64 div)
+{
+	u64 res = msat.millisatoshis / div;
+	msat.millisatoshis = res + (div * res == msat.millisatoshis ? 0 : 1);
 	return msat;
 }
 
@@ -473,6 +587,36 @@ struct amount_sat amount_sat_div(struct amount_sat sat, u64 div)
 {
 	sat.satoshis /= div;
 	return sat;
+}
+
+bool amount_sat_mul(struct amount_sat *res, struct amount_sat sat, u64 mul)
+{
+	if (mul_overflows_u64(sat.satoshis, mul))
+		return false;
+	res->satoshis = sat.satoshis * mul;
+	return true;
+}
+
+bool amount_msat_mul(struct amount_msat *res, struct amount_msat msat, u64 mul)
+{
+	if (mul_overflows_u64(msat.millisatoshis, mul))
+		return false;
+	res->millisatoshis = msat.millisatoshis * mul;
+	return true;
+}
+
+static bool amount_msat_mul_div(struct amount_msat *res,
+				struct amount_msat msat, u64 mul, u64 div)
+{
+	/* We avoid overflow in the operation (a/b)*x noticing that we can
+	 * decompose x = q_x * b + r_x, where q_x = floor(x/b) and
+	 * r_x = x mod b, then: x*(a/b) = a*q_x + a*r_x/b, which does not
+	 * overflow if a*b does not. */
+	if (mul_overflows_u64(mul, div))
+		return false;
+	u64 x = msat.millisatoshis;
+	res->millisatoshis = mul * (x / div) + (mul * (x % div)) / div;
+	return true;
 }
 
 bool amount_msat_fee(struct amount_msat *fee,
@@ -488,13 +632,55 @@ bool amount_msat_fee(struct amount_msat *fee,
 	 *    - fee_base_msat + ( amount_to_forward * fee_proportional_millionths / 1000000 )
 	 */
 	fee_base.millisatoshis = fee_base_msat;
-
-	if (mul_overflows_u64(amt.millisatoshis, fee_proportional_millionths))
+	if (!amount_msat_mul_div(&fee_prop, amt, fee_proportional_millionths,
+				 1000000))
 		return false;
-	fee_prop.millisatoshis = amt.millisatoshis * fee_proportional_millionths
-		/ 1000000;
 
 	return amount_msat_add(fee, fee_base, fee_prop);
+}
+
+/* Does this input give enough to provide fee for output? */
+static bool within_fee(struct amount_msat in,
+		       struct amount_msat out,
+		       u32 fee_base_msat,
+		       u32 fee_proportional_millionths)
+{
+	struct amount_msat with_fee = out;
+	if (!amount_msat_add_fee(&with_fee,
+				 fee_base_msat,
+				 fee_proportional_millionths))
+		return false;
+	return amount_msat_less_eq(with_fee, in);
+}
+
+struct amount_msat amount_msat_sub_fee(struct amount_msat in,
+				       u32 fee_base_msat,
+				       u32 fee_proportional_millionths)
+{
+	struct amount_msat out, out_plus_one;
+
+	/* out = in - base - (out * prop / 1000000)
+	 * Thus: out * (1 + prop / 1000000) = in - base
+	 *       out = (in - base) / (1 + prop / 1000000)
+	 *       out = 1000000 * (in - base) / (1000000 + prop)
+	 *
+	 * Since we round the fee down, out can be a bit bigger than
+	 * expected, so we iterate upwards.
+	 */
+	if (!amount_msat_sub(&out, in, amount_msat(fee_base_msat)))
+		return AMOUNT_MSAT(0);
+	if (!amount_msat_mul_div(&out, out, 1000000,
+				 1000000 + fee_proportional_millionths))
+		return AMOUNT_MSAT(0);
+
+	/* If we calc reverse, it must work! */
+	assert(within_fee(in, out, fee_base_msat, fee_proportional_millionths));
+
+	/* We can be out-by-one */
+	if (amount_msat_add(&out_plus_one, out, AMOUNT_MSAT(1))
+	    && within_fee(in, out_plus_one, fee_base_msat, fee_proportional_millionths))
+		return out_plus_one;
+	return out;
 }
 
 bool amount_msat_add_fee(struct amount_msat *amt,
@@ -518,6 +704,16 @@ struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight)
 	fee.satoshis = (u64)fee_per_kw * weight / 1000;
 
 	return fee;
+}
+
+bool amount_feerate(u32 *feerate, struct amount_sat fee, size_t weight)
+{
+	assert(weight);
+
+	if (!amount_sat_mul(&fee, fee, 1000))
+		return false;
+
+	return assign_overflow_u32(feerate, fee.satoshis / weight);
 }
 
 bool amount_asset_is_main(struct amount_asset *amount)

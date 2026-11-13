@@ -2,21 +2,18 @@
 #define LIGHTNING_COMMON_BOLT11_H
 #include "config.h"
 
-#include <bitcoin/pubkey.h>
 #include <bitcoin/short_channel_id.h>
 #include <ccan/list/list.h>
-#include <ccan/short_types/short_types.h>
-#include <ccan/take/take.h>
 #include <common/hash_u5.h>
 #include <common/node_id.h>
 #include <secp256k1_recovery.h>
 
 /* We only have 10 bits for the field length, meaning < 640 bytes */
-#define BOLT11_FIELD_BYTE_LIMIT ((1 << 10) * 5 / 8)
+#define BOLT11_FIELD_BYTE_LIMIT (((1 << 10) * 5 / 8) - 1)
 
 /* BOLT #11:
  * * `c` (24): `data_length` variable.
- *    `min_final_cltv_expiry` to use for the last HTLC in the route.
+ *    `min_final_cltv_expiry_delta` to use for the last HTLC in the route.
  *    Default is 18 if not specified.
  */
 #define DEFAULT_FINAL_CLTV_DELTA 18
@@ -79,6 +76,9 @@ struct bolt11 {
 	/* Features bitmap, if any. */
 	u8 *features;
 
+	/* Optional metadata to send with payment. */
+	u8 *metadata;
+
 	struct list_head extra_fields;
 };
 
@@ -92,7 +92,7 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 			     const struct feature_set *our_features,
 			     const char *description,
 			     const struct chainparams *must_be_chain,
-			     char **fail);
+			     const char **fail);
 
 /* Extracts signature but does not check it. */
 struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
@@ -100,9 +100,9 @@ struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
 				   const char *description,
 				   const struct chainparams *must_be_chain,
 				   struct sha256 *hash,
-				   u5 **sig,
+				   const u5 **sig,
 				   bool *have_n,
-				   char **fail);
+				   const char **fail);
 
 /* Initialize an empty bolt11 struct with optional amount */
 struct bolt11 *new_bolt11(const tal_t *ctx,
@@ -124,5 +124,15 @@ char *bolt11_encode_(const tal_t *ctx,
 				const u8 *,			\
 				secp256k1_ecdsa_recoverable_signature *rsig), \
 		       (arg))
+
+/** to_canonical_invstr - return a canonical string where the following constrains are follow:
+ * - There is no `lightning:` prefix;
+ * - all the string is in lower case.
+ */
+const char *to_canonical_invstr(const tal_t *ctx, const char *invstring);
+
+/* Flags to tweak generation to match test vectors */
+extern bool dev_bolt11_old_order;
+extern bool dev_bolt11_omit_c_value;
 
 #endif /* LIGHTNING_COMMON_BOLT11_H */

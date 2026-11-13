@@ -3,10 +3,8 @@
 #include <bitcoin/privkey.h>
 #include <bitcoin/script.h>
 #include <bitcoin/short_channel_id.h>
-#include <bitcoin/tx.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/err/err.h>
-#include <ccan/mem/mem.h>
 #include <ccan/opt/opt.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
@@ -111,7 +109,8 @@ static void copy_column(void *dst, size_t size,
 
 int main(int argc, char *argv[])
 {
-	char *config_dir, *net_dir, *config_filename, *rpc_filename, *hsmfile, *dbfile;
+	char *config_filename, *base_dir;
+	char *net_dir, *rpc_filename, *hsmfile, *dbfile;
 	sqlite3 *sql;
 	sqlite3_stmt *stmt;
 	int flags = SQLITE_OPEN_READONLY, dberr;
@@ -126,14 +125,14 @@ int main(int argc, char *argv[])
 
 	setup_option_allocators();
 
-	initial_config_opts(top_ctx, argc, argv,
-			    &config_filename, &config_dir, &net_dir,
-			    &rpc_filename);
+	minimal_config_opts(top_ctx, argc, argv, &config_filename, &base_dir,
+			    &net_dir, &rpc_filename);
 
 	opt_register_noarg("-v|--verbose", opt_set_bool, &verbose,
 			 "Print everything");
 
 	opt_parse(&argc, argv, opt_log_stderr_exit);
+
 	if (argc != 1)
 		errx(1, "no arguments accepted");
 
@@ -145,7 +144,7 @@ int main(int argc, char *argv[])
 		errx(1, "failed to open database %s: %s", dbfile,
 			 sqlite3_errstr(dberr));
 
-	hsm_secret = grab_file(hsmfile, hsmfile);
+	hsm_secret = grab_file_raw(hsmfile, hsmfile);
 	if (!hsm_secret)
 		err(1, "failed to read %s", hsmfile);
 
@@ -184,8 +183,8 @@ int main(int argc, char *argv[])
 		sqlite3_column_pubkey(stmt, 6, &remote_fundingkey);
 
 		printf("Channel %s with peer %s: funding %s/%u: ",
-			     short_channel_id_to_str(ctx, &scid),
-			     node_id_to_hexstr(ctx, &peer_id),
+			     fmt_short_channel_id(ctx, scid),
+			     fmt_node_id(ctx, &peer_id),
 			     txid_hex, funding_outnum);
 		fflush(stdout);
 
@@ -206,8 +205,7 @@ int main(int argc, char *argv[])
 		wscript = bitcoin_redeem_2of2(ctx, &local_fundingkey, &remote_fundingkey);
 		expect_scriptpubkey = scriptpubkey_p2wsh(ctx, wscript);
 
-		if (!memeq(expect_scriptpubkey, tal_bytelen(expect_scriptpubkey),
-			   scriptpubkey, tal_bytelen(scriptpubkey))) {
+		if (!tal_arr_eq(expect_scriptpubkey, scriptpubkey)) {
 			printf("*** FATAL *** outscript %s should be %s\n",
 			       tal_hex(ctx, scriptpubkey),
 			       tal_hex(ctx, expect_scriptpubkey));

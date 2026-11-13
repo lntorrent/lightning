@@ -3,32 +3,16 @@
  * by using bitcoin-cli, but the interface we use to gather Bitcoin data is
  * standardized and you can use another plugin as the Bitcoin backend, or
  * even make your own! */
-#include "bitcoin/base58.h"
-#include "bitcoin/block.h"
-#include "bitcoin/feerate.h"
-#include "bitcoin/script.h"
-#include "bitcoin/shadouble.h"
-#include "bitcoind.h"
-#include "lightningd.h"
-#include "log.h"
+#include "config.h"
+#include <bitcoin/feerate.h>
+#include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
-#include <ccan/cast/cast.h>
 #include <ccan/io/io.h>
-#include <ccan/pipecmd/pipecmd.h>
-#include <ccan/str/hex/hex.h>
-#include <ccan/str/str.h>
-#include <ccan/take/take.h>
-#include <ccan/tal/grab_file/grab_file.h>
-#include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
-#include <common/configdir.h>
-#include <common/json_helpers.h>
-#include <common/memleak.h>
-#include <common/timeout.h>
-#include <common/utils.h>
-#include <errno.h>
-#include <inttypes.h>
+#include <common/trace.h>
+#include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
+#include <lightningd/io_loop_with_timers.h>
 #include <lightningd/plugin.h>
 
 /* The names of the requests we can make to our Bitcoin backend. */
@@ -49,14 +33,17 @@ static void plugin_config_cb(const char *buffer,
 			     struct plugin *plugin)
 {
 	plugin->plugin_state = INIT_COMPLETE;
+	log_debug(plugin->plugins->ld->log, "io_break: %s", __func__);
 	io_break(plugin);
 }
 
 static void config_plugin(struct plugin *plugin)
 {
 	struct jsonrpc_request *req;
+	void *ret;
 
-	req = jsonrpc_request_start(plugin, "init", plugin->log,
+	req = jsonrpc_request_start(plugin, "init", NULL,
+				    plugin->log,
 	                            NULL, plugin_config_cb, plugin);
 	plugin_populate_init_request(plugin, req);
 	jsonrpc_request_end(req);
@@ -64,7 +51,9 @@ static void config_plugin(struct plugin *plugin)
 
 	tal_add_destructor(plugin, bitcoin_destructor);
 
-	io_loop_with_timers(plugin->plugins->ld);
+	ret = io_loop_with_timers(plugin->plugins->ld);
+	log_debug(plugin->plugins->ld->log, "io_loop_with_timers: %s", __func__);
+	assert(ret == plugin);
 }
 
 static void wait_plugin(struct bitcoind *bitcoind, const char *method,
@@ -104,9 +93,10 @@ void bitcoind_check_commands(struct bitcoind *bitcoind)
 }
 
 /* Our Bitcoin backend plugin gave us a bad response. We can't recover. */
-static void bitcoin_plugin_error(struct bitcoind *bitcoind, const char *buf,
-				 const jsmntok_t *toks, const char *method,
-				 const char *fmt, ...)
+static void NORETURN
+bitcoin_plugin_error(struct bitcoind *bitcoind, const char *buf,
+		     const jsmntok_t *toks, const char *method,
+		     const char *fmt, ...)
 {
 	va_list ap;
 	char *reason;
@@ -116,10 +106,39 @@ static void bitcoin_plugin_error(struct bitcoind *bitcoind, const char *buf,
 	reason = tal_vfmt(NULL, fmt, ap);
 	va_end(ap);
 
-	p = strmap_get(&bitcoind->pluginsmap, method);
+	p = strmap_getn(&bitcoind->pluginsmap, method, strcspn(method, "."));
 	fatal("%s error: bad response to %s (%s), response was %.*s",
-	      p->cmd, method, reason,
+	      p ? p->cmd : "UNKNOWN CALL", method, reason,
 	      toks->end - toks->start, buf + toks->start);
+}
+
+/* Check response for error (fatal if found) and return result token (fatal if not found). */
+static const jsmntok_t *get_bitcoin_result(struct bitcoind *bitcoind,
+					   const char *buf,
+					   const jsmntok_t *toks,
+					   const char *method)
+{
+	const jsmntok_t *err_tok, *msg_tok, *result_tok;
+
+	err_tok = json_get_member(buf, toks, "error");
+	if (err_tok) {
+		msg_tok = json_get_member(buf, err_tok, "message");
+		if (msg_tok)
+			bitcoin_plugin_error(bitcoind, buf, toks, method,
+					     "%.*s", json_tok_full_len(msg_tok),
+					     json_tok_full(buf, msg_tok));
+		else
+			bitcoin_plugin_error(bitcoind, buf, toks, method,
+					     "%.*s", json_tok_full_len(err_tok),
+					     json_tok_full(buf, err_tok));
+	}
+
+	result_tok = json_get_member(buf, toks, "result");
+	if (!result_tok)
+		bitcoin_plugin_error(bitcoind, buf, toks, method,
+				     "missing 'result' field");
+
+	return result_tok;
 }
 
 /* Send a request to the Bitcoin plugin which registered that method,
@@ -150,88 +169,163 @@ static void bitcoin_plugin_send(struct bitcoind *bitcoind,
  *
  * Plugin response:
  * {
- *	"opening": <sat per kVB>,
- *	"mutual_close": <sat per kVB>,
- *	"unilateral_close": <sat per kVB>,
- *	"delayed_to_us": <sat per kVB>,
- *	"htlc_resolution": <sat per kVB>,
- *	"penalty": <sat per kVB>,
- *	"min_acceptable": <sat per kVB>,
- *	"max_acceptable": <sat per kVB>,
+ *	"feerate_floor": <sat per kVB>,
+ *	"feerates": {
+ *		{ "blocks": 2, "feerate": <sat per kVB> },
+ *		{ "blocks": 6, "feerate": <sat per kVB> },
+ *		{ "blocks": 12, "feerate": <sat per kVB> }
+ *		{ "blocks": 100, "feerate": <sat per kVB> }
+ *	}
  * }
+ *
+ * If rates are missing, we linearly interpolate (we don't extrapolate tho!).
  */
-
 struct estimatefee_call {
 	struct bitcoind *bitcoind;
-	void (*cb)(struct bitcoind *bitcoind, const u32 satoshi_per_kw[],
-		   void *);
-	void *arg;
+	void (*cb)(struct lightningd *ld, u32 feerate_floor,
+		   const struct feerate_est *rates, void *);
+	void *cb_arg;
 };
+
+/* Note: returns estimates in perkb, caller converts! */
+static struct feerate_est *parse_feerate_ranges(const tal_t *ctx,
+						struct bitcoind *bitcoind,
+						const char *buf,
+						const jsmntok_t *floortok,
+						const jsmntok_t *feerates,
+						u32 *floor)
+{
+	size_t i;
+	const jsmntok_t *t;
+	struct feerate_est *rates = tal_arr(ctx, struct feerate_est, 0);
+
+	if (!json_to_u32(buf, floortok, floor))
+		bitcoin_plugin_error(bitcoind, buf, floortok,
+				     "estimatefees.feerate_floor", "Not a u32?");
+
+	json_for_each_arr(i, t, feerates) {
+		struct feerate_est rate;
+		const char *err;
+
+		err = json_scan(tmpctx, buf, t, "{blocks:%,feerate:%}",
+				JSON_SCAN(json_to_u32, &rate.blockcount),
+				JSON_SCAN(json_to_u32, &rate.rate));
+		if (err)
+			bitcoin_plugin_error(bitcoind, buf, t,
+					     "estimatefees.feerates", err);
+
+		/* Block count must be in order.  If rates go up somehow, we
+		 * reduce to prev. */
+		if (tal_count(rates) != 0) {
+			const struct feerate_est *prev = &rates[tal_count(rates)-1];
+			if (rate.blockcount <= prev->blockcount)
+				bitcoin_plugin_error(bitcoind, buf, feerates,
+						     "estimatefees.feerates",
+						     "Blocks must be ascending"
+						     " order: %u <= %u!",
+						     rate.blockcount,
+						     prev->blockcount);
+			if (rate.rate > prev->rate) {
+				log_unusual(bitcoind->log,
+					    "Feerate for %u blocks (%u) is > rate"
+					    " for %u blocks (%u)!",
+					    rate.blockcount, rate.rate,
+					    prev->blockcount, prev->rate);
+				rate.rate = prev->rate;
+			}
+		}
+
+		tal_arr_expand(&rates, rate);
+	}
+
+	if (tal_count(rates) == 0) {
+		if (chainparams->testnet)
+			log_debug(bitcoind->log, "Unable to estimate any fees");
+		else
+			log_unusual(bitcoind->log, "Unable to estimate any fees");
+	}
+
+	return rates;
+}
 
 static void estimatefees_callback(const char *buf, const jsmntok_t *toks,
 				  const jsmntok_t *idtok,
 				  struct estimatefee_call *call)
 {
-	const jsmntok_t *resulttok, *feeratetok;
-	u32 *feerates = tal_arr(call, u32, NUM_FEERATES);
+	const jsmntok_t *resulttok, *floortok;
+	struct feerate_est *feerates;
+	u32 floor;
 
-	resulttok = json_get_member(buf, toks, "result");
-	if (!resulttok)
-		bitcoin_plugin_error(call->bitcoind, buf, toks,
+	resulttok = get_bitcoin_result(call->bitcoind, buf, toks, "estimatefees");
+
+	/* Modern style has floor. */
+	floortok = json_get_member(buf, resulttok, "feerate_floor");
+	if (floortok) {
+		feerates = parse_feerate_ranges(call, call->bitcoind,
+						buf, floortok,
+						json_get_member(buf, resulttok,
+								"feerates"),
+						&floor);
+	} else {
+		bitcoin_plugin_error(call->bitcoind, buf, resulttok,
 				     "estimatefees",
-				     "bad 'result' field");
-
-	for (int f = 0; f < NUM_FEERATES; f++) {
-		feeratetok = json_get_member(buf, resulttok, feerate_name(f));
-		if (!feeratetok)
-			bitcoin_plugin_error(call->bitcoind, buf, toks,
-					     "estimatefees",
-					     "missing '%s' field", feerate_name(f));
-
-		/* FIXME: We could trawl recent blocks for median fee... */
-		if (!json_to_u32(buf, feeratetok, &feerates[f])) {
-			log_unusual(call->bitcoind->log,
-				    "Unable to estimate %s fees",
-				    feerate_name(f));
-
-#if DEVELOPER
-			/* This is needed to test for failed feerate estimates
-			* in DEVELOPER mode */
-			feerates[f] = 0;
-#else
-			/* If we are in testnet mode we want to allow payments
-			* with the minimal fee even if the estimate didn't
-			* work out. This is less disruptive than erring out
-			* all the time. */
-			if (chainparams->testnet)
-				feerates[f] = FEERATE_FLOOR;
-			else
-				feerates[f] = 0;
-#endif
-		} else
-			/* Rate in satoshi per kw. */
-			feerates[f] = feerate_from_style(feerates[f],
-							 FEERATE_PER_KBYTE);
+				     "missing feerate_floor field");
 	}
 
-	call->cb(call->bitcoind, feerates, call->arg);
+	/* Convert to perkw */
+	floor = feerate_from_style(floor, FEERATE_PER_KBYTE);
+	if (floor < FEERATE_FLOOR)
+		floor = FEERATE_FLOOR;
+
+	/* Anything this high is a broken fee source, not a busy mempool:
+	 * clamp it rather than let it loose on the rest of lightningd. */
+	if (floor > FEERATE_CEILING) {
+		log_unusual(call->bitcoind->log,
+			    "Feerate floor (%u) is above sanity ceiling (%u):"
+			    " clamping!",
+			    floor, (u32)FEERATE_CEILING);
+		floor = FEERATE_CEILING;
+	}
+
+	/* FIXME: We could let this go below the dynamic floor, but we'd
+	 * need to know if the floor is because of their node's policy
+	 * (minrelaytxfee) or mempool conditions (mempoolminfee). */
+	for (size_t i = 0; i < tal_count(feerates); i++) {
+		feerates[i].rate = feerate_from_style(feerates[i].rate,
+						      FEERATE_PER_KBYTE);
+		if (feerates[i].rate > FEERATE_CEILING) {
+			log_unusual(call->bitcoind->log,
+				    "Feerate for %u blocks (%u) is above sanity"
+				    " ceiling (%u): clamping!",
+				    feerates[i].blockcount, feerates[i].rate,
+				    (u32)FEERATE_CEILING);
+			feerates[i].rate = FEERATE_CEILING;
+		}
+		if (feerates[i].rate < floor)
+			feerates[i].rate = floor;
+	}
+
+	call->cb(call->bitcoind->ld, floor, feerates, call->cb_arg);
 	tal_free(call);
 }
 
-void bitcoind_estimate_fees_(struct bitcoind *bitcoind,
-			     size_t num_estimates,
-			     void (*cb)(struct bitcoind *bitcoind,
-					const u32 satoshi_per_kw[], void *),
-			     void *arg)
+void bitcoind_estimate_fees_(const tal_t *ctx,
+			     struct bitcoind *bitcoind,
+			     void (*cb)(struct lightningd *ld,
+					u32 feerate_floor,
+					const struct feerate_est *feerates,
+					void *arg),
+			     void *cb_arg)
 {
 	struct jsonrpc_request *req;
-	struct estimatefee_call *call = tal(bitcoind, struct estimatefee_call);
+	struct estimatefee_call *call = tal(ctx, struct estimatefee_call);
 
 	call->bitcoind = bitcoind;
 	call->cb = cb;
-	call->arg = arg;
+	call->cb_arg = cb_arg;
 
-	req = jsonrpc_request_start(bitcoind, "estimatefees", bitcoind->log,
+	req = jsonrpc_request_start(call, "estimatefees", NULL,
+				    bitcoind->log,
 				    NULL, estimatefees_callback, call);
 	jsonrpc_request_end(req);
 	plugin_request_send(strmap_get(&bitcoind->pluginsmap,
@@ -264,49 +358,53 @@ static void sendrawtx_callback(const char *buf, const jsmntok_t *toks,
 			       const jsmntok_t *idtok,
 			       struct sendrawtx_call *call)
 {
+	const jsmntok_t *resulttok;
 	const char *err;
 	const char *errmsg = NULL;
 	bool success = false;
 
-	err = json_scan(tmpctx, buf, toks, "{result:{success:%}}",
+	resulttok = get_bitcoin_result(call->bitcoind, buf, toks, "sendrawtransaction");
+
+	err = json_scan(tmpctx, buf, resulttok, "{success:%}",
 			JSON_SCAN(json_to_bool, &success));
 	if (err) {
-		bitcoin_plugin_error(call->bitcoind, buf, toks,
+		bitcoin_plugin_error(call->bitcoind, buf, resulttok,
 				     "sendrawtransaction",
 				     "bad 'result' field: %s", err);
 	} else if (!success) {
-		err = json_scan(tmpctx, buf, toks, "{result:{errmsg:%}}",
+		err = json_scan(tmpctx, buf, resulttok, "{errmsg:%}",
 				JSON_SCAN_TAL(tmpctx, json_strdup, &errmsg));
 		if (err)
-			bitcoin_plugin_error(call->bitcoind, buf, toks,
+			bitcoin_plugin_error(call->bitcoind, buf, resulttok,
 					     "sendrawtransaction",
 					     "bad 'errmsg' field: %s",
 					     err);
 	}
 
-	db_begin_transaction(call->bitcoind->ld->wallet->db);
+	/* In case they don't free it, we will. */
+	tal_steal(tmpctx, call);
 	call->cb(call->bitcoind, success, errmsg, call->cb_arg);
-	db_commit_transaction(call->bitcoind->ld->wallet->db);
-
-	tal_free(call);
 }
 
-void bitcoind_sendrawtx_ahf_(struct bitcoind *bitcoind,
-			     const char *hextx,
-			     bool allowhighfees,
-			     void (*cb)(struct bitcoind *bitcoind,
-					bool success, const char *msg, void *),
-			     void *cb_arg)
+void bitcoind_sendrawtx_(const tal_t *ctx,
+			 struct bitcoind *bitcoind,
+			 const char *id_prefix,
+			 const char *hextx,
+			 bool allowhighfees,
+			 void (*cb)(struct bitcoind *bitcoind,
+				    bool success, const char *msg, void *),
+			 void *cb_arg)
 {
 	struct jsonrpc_request *req;
-	struct sendrawtx_call *call = tal(bitcoind, struct sendrawtx_call);
+	struct sendrawtx_call *call = tal(ctx, struct sendrawtx_call);
 
 	call->bitcoind = bitcoind;
 	call->cb = cb;
 	call->cb_arg = cb_arg;
 	log_debug(bitcoind->log, "sendrawtransaction: %s", hextx);
 
-	req = jsonrpc_request_start(bitcoind, "sendrawtransaction",
+	req = jsonrpc_request_start(call, "sendrawtransaction",
+				    id_prefix,
 				    bitcoind->log,
 				    NULL, sendrawtx_callback,
 				    call);
@@ -314,15 +412,6 @@ void bitcoind_sendrawtx_ahf_(struct bitcoind *bitcoind,
 	json_add_bool(req->stream, "allowhighfees", allowhighfees);
 	jsonrpc_request_end(req);
 	bitcoin_plugin_send(bitcoind, req);
-}
-
-void bitcoind_sendrawtx_(struct bitcoind *bitcoind,
-			 const char *hextx,
-			 void (*cb)(struct bitcoind *bitcoind,
-				    bool success, const char *msg, void *),
-			 void *arg)
-{
-	return bitcoind_sendrawtx_ahf_(bitcoind, hextx, false, cb, arg);
 }
 
 /* `getrawblockbyheight`
@@ -337,7 +426,9 @@ void bitcoind_sendrawtx_(struct bitcoind *bitcoind,
 
 struct getrawblockbyheight_call {
 	struct bitcoind *bitcoind;
+	u32 height;
 	void (*cb)(struct bitcoind *bitcoind,
+		   u32 height,
 		   struct bitcoin_blkid *blkid,
 		   struct bitcoin_block *block,
 		   void *);
@@ -349,64 +440,76 @@ getrawblockbyheight_callback(const char *buf, const jsmntok_t *toks,
 			     const jsmntok_t *idtok,
 			     struct getrawblockbyheight_call *call)
 {
+	const jsmntok_t *resulttok;
 	const char *block_str, *err;
 	struct bitcoin_blkid blkid;
 	struct bitcoin_block *blk;
+	const tal_t *ctx;
+	trace_span_resume(call);
+	trace_span_end(call);
+
+	resulttok = get_bitcoin_result(call->bitcoind, buf, toks, "getrawblockbyheight");
+
+	/* Callback may free parent of call, so steal onto context to
+	 * free if it doesn't */
+	ctx = tal(NULL, char);
+	tal_steal(ctx, call);
 
 	/* If block hash is `null`, this means not found! Call the callback
 	 * with NULL values. */
-	err = json_scan(tmpctx, buf, toks, "{result:{blockhash:null}}");
+	err = json_scan(tmpctx, buf, resulttok, "{blockhash:null}");
 	if (!err) {
-		db_begin_transaction(call->bitcoind->ld->wallet->db);
-		call->cb(call->bitcoind, NULL, NULL, call->cb_arg);
-		db_commit_transaction(call->bitcoind->ld->wallet->db);
+		call->cb(call->bitcoind, call->height, NULL, NULL, call->cb_arg);
 		goto clean;
 	}
 
-	err = json_scan(tmpctx, buf, toks, "{result:{blockhash:%,block:%}}",
+	err = json_scan(tmpctx, buf, resulttok, "{blockhash:%,block:%}",
 			JSON_SCAN(json_to_sha256, &blkid.shad.sha),
 			JSON_SCAN_TAL(tmpctx, json_strdup, &block_str));
 	if (err)
-		bitcoin_plugin_error(call->bitcoind, buf, toks,
+		bitcoin_plugin_error(call->bitcoind, buf, resulttok,
 				     "getrawblockbyheight",
 				     "bad 'result' field: %s", err);
 
 	blk = bitcoin_block_from_hex(tmpctx, chainparams, block_str,
 				     strlen(block_str));
 	if (!blk)
-		bitcoin_plugin_error(call->bitcoind, buf, toks,
+		bitcoin_plugin_error(call->bitcoind, buf, resulttok,
 				     "getrawblockbyheight",
 				     "bad block");
 
-	db_begin_transaction(call->bitcoind->ld->wallet->db);
-	call->cb(call->bitcoind, &blkid, blk, call->cb_arg);
-	db_commit_transaction(call->bitcoind->ld->wallet->db);
+	call->cb(call->bitcoind, call->height, &blkid, blk, call->cb_arg);
 
 clean:
-	tal_free(call);
+	tal_free(ctx);
 }
 
-void bitcoind_getrawblockbyheight_(struct bitcoind *bitcoind,
+void bitcoind_getrawblockbyheight_(const tal_t *ctx,
+				   struct bitcoind *bitcoind,
 				   u32 height,
 				   void (*cb)(struct bitcoind *bitcoind,
+					      u32 blockheight,
 					      struct bitcoin_blkid *blkid,
 					      struct bitcoin_block *blk,
 					      void *arg),
 				   void *cb_arg)
 {
 	struct jsonrpc_request *req;
-	struct getrawblockbyheight_call *call = tal(NULL,
+	struct getrawblockbyheight_call *call = tal(ctx,
 						    struct getrawblockbyheight_call);
 
 	call->bitcoind = bitcoind;
 	call->cb = cb;
 	call->cb_arg = cb_arg;
+	call->height = height;
 
-	req = jsonrpc_request_start(bitcoind, "getrawblockbyheight",
+	trace_span_start("plugin/bitcoind", call);
+	trace_span_tag(call, "method", "getrawblockbyheight");
+	trace_span_suspend_may_free(call);
+	req = jsonrpc_request_start(call, "getrawblockbyheight", NULL,
 				    bitcoind->log,
 				    NULL,  getrawblockbyheight_callback,
-				    /* Freed in cb. */
-				    notleak(call));
+				    call);
 	json_add_num(req->stream, "height", height);
 	jsonrpc_request_end(req);
 	bitcoin_plugin_send(bitcoind, req);
@@ -427,14 +530,11 @@ void bitcoind_getrawblockbyheight_(struct bitcoind *bitcoind,
 
 struct getchaininfo_call {
 	struct bitcoind *bitcoind;
-	/* Should we log verbosely? */
-	bool first_call;
 	void (*cb)(struct bitcoind *bitcoind,
 		   const char *chain,
 		   u32 headercount,
 		   u32 blockcount,
 		   const bool ibd,
-		   const bool first_call,
 		   void *);
 	void *cb_arg;
 };
@@ -443,49 +543,51 @@ static void getchaininfo_callback(const char *buf, const jsmntok_t *toks,
 				  const jsmntok_t *idtok,
 				  struct getchaininfo_call *call)
 {
+	const jsmntok_t *resulttok;
 	const char *err, *chain;
 	u32 headers, blocks;
 	bool ibd;
 
-	err = json_scan(tmpctx, buf, toks,
-			"{result:{chain:%,headercount:%,blockcount:%,ibd:%}}",
+	resulttok = get_bitcoin_result(call->bitcoind, buf, toks, "getchaininfo");
+
+	err = json_scan(tmpctx, buf, resulttok,
+			"{chain:%,headercount:%,blockcount:%,ibd:%}",
 			JSON_SCAN_TAL(tmpctx, json_strdup, &chain),
 			JSON_SCAN(json_to_number, &headers),
 			JSON_SCAN(json_to_number, &blocks),
 			JSON_SCAN(json_to_bool, &ibd));
 	if (err)
-		bitcoin_plugin_error(call->bitcoind, buf, toks, "getchaininfo",
+		bitcoin_plugin_error(call->bitcoind, buf, resulttok, "getchaininfo",
 				     "bad 'result' field: %s", err);
 
-	db_begin_transaction(call->bitcoind->ld->wallet->db);
 	call->cb(call->bitcoind, chain, headers, blocks, ibd,
-		 call->first_call, call->cb_arg);
-	db_commit_transaction(call->bitcoind->ld->wallet->db);
+		 call->cb_arg);
 
 	tal_free(call);
 }
 
-void bitcoind_getchaininfo_(struct bitcoind *bitcoind,
-			    const bool first_call,
+void bitcoind_getchaininfo_(const tal_t *ctx,
+			    struct bitcoind *bitcoind,
+			    const u32 height,
 			    void (*cb)(struct bitcoind *bitcoind,
 				       const char *chain,
 				       u32 headercount,
 				       u32 blockcount,
 				       const bool ibd,
-				       const bool first_call,
 				       void *),
 			    void *cb_arg)
 {
 	struct jsonrpc_request *req;
-	struct getchaininfo_call *call = tal(bitcoind, struct getchaininfo_call);
+	struct getchaininfo_call *call = tal(ctx, struct getchaininfo_call);
 
 	call->bitcoind = bitcoind;
 	call->cb = cb;
 	call->cb_arg = cb_arg;
-	call->first_call = first_call;
 
-	req = jsonrpc_request_start(bitcoind, "getchaininfo", bitcoind->log,
+	req = jsonrpc_request_start(call, "getchaininfo", NULL,
+				    bitcoind->log,
 				    NULL, getchaininfo_callback, call);
+	json_add_u32(req->stream, "last_height", height);
 	jsonrpc_request_end(req);
 	bitcoin_plugin_send(bitcoind, req);
 }
@@ -515,51 +617,52 @@ static void getutxout_callback(const char *buf, const jsmntok_t *toks,
 			      const jsmntok_t *idtok,
 			      struct getutxout_call *call)
 {
+	const jsmntok_t *resulttok;
 	const char *err;
 	struct bitcoin_tx_output txout;
 
-	err = json_scan(tmpctx, buf, toks, "{result:{script:null}}");
+	/* Whatever happens, we want to free this. */
+	tal_steal(tmpctx, call);
+
+	resulttok = get_bitcoin_result(call->bitcoind, buf, toks, "getutxout");
+
+	err = json_scan(tmpctx, buf, resulttok, "{script:null}");
 	if (!err) {
-		db_begin_transaction(call->bitcoind->ld->wallet->db);
 		call->cb(call->bitcoind, NULL, call->cb_arg);
-		db_commit_transaction(call->bitcoind->ld->wallet->db);
-		goto clean;
+		return;
 	}
 
-	err = json_scan(tmpctx, buf, toks, "{result:{script:%,amount:%}}",
+	err = json_scan(tmpctx, buf, resulttok, "{script:%,amount:%}",
 			JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex,
 				      &txout.script),
 			JSON_SCAN(json_to_sat, &txout.amount));
 	if (err)
-		bitcoin_plugin_error(call->bitcoind, buf, toks, "getutxout",
+		bitcoin_plugin_error(call->bitcoind, buf, resulttok, "getutxout",
 				     "bad 'result' field: %s", err);
 
-	db_begin_transaction(call->bitcoind->ld->wallet->db);
 	call->cb(call->bitcoind, &txout, call->cb_arg);
-	db_commit_transaction(call->bitcoind->ld->wallet->db);
-
-clean:
-	tal_free(call);
 }
 
-void bitcoind_getutxout_(struct bitcoind *bitcoind,
-			 const struct bitcoin_txid *txid, const u32 outnum,
-			 void (*cb)(struct bitcoind *bitcoind,
-				    const struct bitcoin_tx_output *txout,
-				    void *arg),
+void bitcoind_getutxout_(const tal_t *ctx,
+			 struct bitcoind *bitcoind,
+			 const struct bitcoin_outpoint *outpoint,
+			 void (*cb)(struct bitcoind *,
+				    const struct bitcoin_tx_output *,
+				    void *),
 			 void *cb_arg)
 {
 	struct jsonrpc_request *req;
-	struct getutxout_call *call = tal(bitcoind, struct getutxout_call);
+	struct getutxout_call *call = tal(ctx, struct getutxout_call);
 
 	call->bitcoind = bitcoind;
 	call->cb = cb;
 	call->cb_arg = cb_arg;
 
-	req = jsonrpc_request_start(bitcoind, "getutxout", bitcoind->log,
+	req = jsonrpc_request_start(call, "getutxout", NULL,
+				    bitcoind->log,
 				    NULL, getutxout_callback, call);
-	json_add_txid(req->stream, "txid", txid);
-	json_add_num(req->stream, "vout", outnum);
+	json_add_txid(req->stream, "txid", &outpoint->txid);
+	json_add_num(req->stream, "vout", outpoint->n);
 	jsonrpc_request_end(req);
 	bitcoin_plugin_send(bitcoind, req);
 }
@@ -575,7 +678,6 @@ struct filteredblock_call {
 	struct filteredblock *result;
 	struct filteredblock_outpoint **outpoints;
 	size_t current_outpoint;
-	struct timeabs start_time;
 	u32 height;
 };
 
@@ -599,8 +701,8 @@ process_getfilteredblock_step2(struct bitcoind *bitcoind,
 	call->current_outpoint++;
 	if (call->current_outpoint < tal_count(call->outpoints)) {
 		o = call->outpoints[call->current_outpoint];
-		bitcoind_getutxout(bitcoind, &o->txid, o->outnum,
-				  process_getfilteredblock_step2, call);
+		bitcoind_getutxout(call, bitcoind, &o->outpoint,
+				   process_getfilteredblock_step2, call);
 	} else {
 		/* If there were no more outpoints to check, we call the callback. */
 		process_getfiltered_block_final(bitcoind, call);
@@ -608,6 +710,7 @@ process_getfilteredblock_step2(struct bitcoind *bitcoind,
 }
 
 static void process_getfilteredblock_step1(struct bitcoind *bitcoind,
+					   u32 height,
 					   struct bitcoin_blkid *blkid,
 					   struct bitcoin_block *block,
 					   struct filteredblock_call *call)
@@ -640,19 +743,22 @@ static void process_getfilteredblock_step1(struct bitcoind *bitcoind,
 	for (size_t i = 0; i < tal_count(block->tx); i++) {
 		tx = block->tx[i];
 		for (size_t j = 0; j < tx->wtx->num_outputs; j++) {
-			const u8 *script = bitcoin_tx_output_get_script(NULL, tx, j);
-			struct amount_asset amount = bitcoin_tx_output_get_amount(tx, j);
-			if (amount_asset_is_main(&amount) && is_p2wsh(script, NULL)) {
+			const struct wally_tx_output *output;
+			output = &tx->wtx->outputs[j];
+
+			if (!is_p2wsh(output->script, output->script_len, NULL))
+				continue;
+
+			struct amount_asset amount = wally_tx_output_get_amount(output);
+			if (amount_asset_is_main(&amount)) {
 				/* This is an interesting output, remember it. */
 				o = tal(call->outpoints, struct filteredblock_outpoint);
-				bitcoin_txid(tx, &o->txid);
+				bitcoin_txid(tx, &o->outpoint.txid);
+				o->outpoint.n = j;
 				o->amount = amount_asset_to_sat(&amount);
 				o->txindex = i;
-				o->outnum = j;
-				o->scriptPubKey = tal_steal(o, script);
+				o->scriptPubKey = tal_dup_arr(o, u8, output->script, output->script_len, 0);
 				tal_arr_expand(&call->outpoints, o);
-			} else {
-				tal_free(script);
 			}
 		}
 	}
@@ -667,13 +773,29 @@ static void process_getfilteredblock_step1(struct bitcoind *bitcoind,
 		 * store the one's that are unspent in
 		 * call->result->outpoints. */
 		o = call->outpoints[call->current_outpoint];
-		bitcoind_getutxout(bitcoind, &o->txid, o->outnum,
-				  process_getfilteredblock_step2, call);
+		bitcoind_getutxout(call, bitcoind, &o->outpoint,
+				   process_getfilteredblock_step2, call);
 	}
 }
 
+/* Find the pending call for the highest block height: we prefer to
+ * satisfy the most recent request first, since it's usually the most
+ * urgent (e.g. catching up to the chain tip). */
+static struct filteredblock_call *
+most_recent_filteredblock_call(struct bitcoind *bitcoind)
+{
+	struct filteredblock_call *c, *best = NULL;
+
+	list_for_each(&bitcoind->pending_getfilteredblock, c, list) {
+		if (!best || c->height > best->height)
+			best = c;
+	}
+	return best;
+}
+
 /* Takes a call, dispatches it to all queued requests that match the same
- * height, and then kicks off the next call. */
+ * height, and then kicks off the call for the highest height still
+ * pending. */
 static void
 process_getfiltered_block_final(struct bitcoind *bitcoind,
 				const struct filteredblock_call *call)
@@ -689,7 +811,6 @@ process_getfiltered_block_final(struct bitcoind *bitcoind,
 	list_for_each_safe(&bitcoind->pending_getfilteredblock, c, next, list) {
 		if (c->height == height) {
 			c->cb(bitcoind, fb, c->arg);
-			list_del(&c->list);
 			tal_free(c);
 		}
 	}
@@ -699,14 +820,20 @@ next:
 	/* Nothing to free here, since `*call` was already deleted during the
 	 * iteration above. It was also removed from the list, so no need to
 	 * pop here. */
-	if (!list_empty(&bitcoind->pending_getfilteredblock)) {
-		c = list_top(&bitcoind->pending_getfilteredblock, struct filteredblock_call, list);
-		bitcoind_getrawblockbyheight(bitcoind, c->height,
+	c = most_recent_filteredblock_call(bitcoind);
+	if (c) {
+		bitcoind_getrawblockbyheight(bitcoind, bitcoind, c->height,
 					     process_getfilteredblock_step1, c);
 	}
 }
 
-void bitcoind_getfilteredblock_(struct bitcoind *bitcoind, u32 height,
+static void destroy_filteredblock_call(struct filteredblock_call *call)
+{
+	list_del(&call->list);
+}
+
+void bitcoind_getfilteredblock_(const tal_t *ctx,
+				struct bitcoind *bitcoind, u32 height,
 				void (*cb)(struct bitcoind *bitcoind,
 					   const struct filteredblock *fb,
 					   void *arg),
@@ -714,20 +841,20 @@ void bitcoind_getfilteredblock_(struct bitcoind *bitcoind, u32 height,
 {
 	/* Stash the call context for when we need to call the callback after
 	 * all the bitcoind calls we need to perform. */
-	struct filteredblock_call *call = tal(bitcoind, struct filteredblock_call);
+	struct filteredblock_call *call = tal(ctx, struct filteredblock_call);
 	/* If this is the first request, we should start processing it. */
 	bool start = list_empty(&bitcoind->pending_getfilteredblock);
 	call->cb = cb;
 	call->arg = arg;
 	call->height = height;
 	assert(call->cb != NULL);
-	call->start_time = time_now();
 	call->result = NULL;
 	call->current_outpoint = 0;
 
 	list_add_tail(&bitcoind->pending_getfilteredblock, &call->list);
+	tal_add_destructor(call, destroy_filteredblock_call);
 	if (start)
-		bitcoind_getrawblockbyheight(bitcoind, height,
+		bitcoind_getrawblockbyheight(call, bitcoind, height,
 					     process_getfilteredblock_step1, call);
 }
 
@@ -738,7 +865,7 @@ static void destroy_bitcoind(struct bitcoind *bitcoind)
 
 struct bitcoind *new_bitcoind(const tal_t *ctx,
 			      struct lightningd *ld,
-			      struct log *log)
+			      struct logger *log)
 {
 	struct bitcoind *bitcoind = tal(ctx, struct bitcoind);
 

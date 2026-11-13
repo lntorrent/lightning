@@ -1,0 +1,174 @@
+import json
+import os
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from msggen.gen.grpc import GrpcGenerator, GrpcConverterGenerator, GrpcUnconverterGenerator, GrpcServerGenerator
+from msggen.gen.grpc.wire import WireState, released_contract
+from msggen.gen.grpc2py import Grpc2PyGenerator
+from msggen.gen.rpc import RustGenerator, NotificationGenerator, HookGenerator
+from msggen.gen.generator import GeneratorChain
+from msggen.utils import load_jsonrpc_service, combine_schemas
+import logging
+from msggen.patch import VersionAnnotationPatch, OptionalPatch, OverridePatch
+from msggen.checks import VersioningCheck
+from msggen.utils.utils import check_missing
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
+
+def add_handler_gen_grpc(generator_chain: GeneratorChain, meta):
+    """Load all mapped RPC methods, wrap them in a Service, and split them into messages.
+    """
+    state = WireState()
+    fname = Path("cln-grpc") / "proto" / "node.proto"
+    dest = open(fname, "w")
+    generator_chain.add_generator(GrpcGenerator(dest, meta, state))
+
+    fname = Path("cln-grpc") / "src" / "convert.rs"
+    dest = open(fname, "w")
+    generator_chain.add_generator(GrpcConverterGenerator(dest, state))
+    generator_chain.add_generator(GrpcUnconverterGenerator(dest, state))
+
+    fname = Path("cln-grpc") / "src" / "server.rs"
+    dest = open(fname, "w")
+    generator_chain.add_generator(GrpcServerGenerator(dest))
+
+
+def add_handler_get_grpc2py(generator_chain: GeneratorChain):
+    fname = Path("contrib") / "pyln-testing" / "pyln" / "testing" / "grpc2py.py"
+    dest = open(fname, "w")
+    generator_chain.add_generator(Grpc2PyGenerator(dest))
+
+
+def add_handler_gen_rust_jsonrpc(generator_chain: GeneratorChain, meta):
+    fname = Path("cln-rpc") / "src" / "model.rs"
+    dest = open(fname, "w")
+    generator_chain.add_generator(RustGenerator(dest, meta))
+
+    fname = Path("cln-rpc") / "src" / "notifications.rs"
+    dest = open(fname, "w")
+    generator_chain.add_generator(NotificationGenerator(dest, meta))
+
+    fname = Path("cln-rpc") / "src" / "hooks.rs"
+    dest = open(fname, "w")
+    generator_chain.add_generator(HookGenerator(dest, meta))
+
+
+def load_msggen_meta():
+    meta = json.load(open('.msggen.json', 'r'))
+    return meta
+
+
+def write_msggen_meta(meta):
+    pid = os.getpid()
+    with open(f'.msggen.json.tmp.{pid}', 'w') as f:
+        json.dump(meta, f, sort_keys=True, indent=4)
+    os.rename(f'.msggen.json.tmp.{pid}', '.msggen.json')
+
+
+def record_wire_contract(revision: str):
+    """Replace `grpc-wire-contract` with the labels released at `revision`.
+
+    Reads `cln-grpc/proto/node.proto` and `primitives.proto` from git, so
+    the contract records what was shipped, not what the schema now says.
+    """
+    def show(path):
+        res = subprocess.run(
+            ["git", "show", f"{revision}:{path}"], capture_output=True, text=True
+        )
+        if res.returncode != 0:
+            raise SystemExit(f"{revision}:{path} not found: {res.stderr.strip()}")
+        return res.stdout
+
+    contract = released_contract(
+        [show("cln-grpc/proto/node.proto"), show("cln-grpc/proto/primitives.proto")]
+    )
+    meta = load_msggen_meta()
+    meta["grpc-wire-contract"] = contract
+    write_msggen_meta(meta)
+    print(f"Recorded {sum(len(f) for f in contract.values())} fields from {revision}")
+
+
+def run():
+    meta = load_msggen_meta()
+    service = load_jsonrpc_service(
+    )
+
+    p = VersionAnnotationPatch(meta=meta)
+    p.apply(service)
+    OptionalPatch().apply(service)
+
+    # Mark some fields we can't map as omitted, and for complex types
+    # we manually mapped, use those types instead.
+    OverridePatch().apply(service)
+
+    # Run the checks here, we should eventually split that out to a
+    # separate subcommand
+    VersioningCheck().check(service)
+    generator_chain = GeneratorChain()
+
+    add_handler_gen_grpc(generator_chain, meta)
+    add_handler_gen_rust_jsonrpc(generator_chain, meta)
+    add_handler_get_grpc2py(generator_chain)
+
+    generator_chain.generate(service)
+
+    write_msggen_meta(meta)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-v', '--verbose', action='store_true', help="Debug level logging")
+    parser.add_argument('-s', '--silent', action='store_true', help="Don't print anything")
+    subcmds = parser.add_subparsers(required=True, dest='command')
+    bundle = subcmds.add_parser("bundle", help="bundle schemas into package")
+    bundle.add_argument('schema_dir', action='store')
+
+    subcmds.add_parser("generate", help="generate all files")
+    subcmds.add_parser("missing-grpc", help="print all rpc commands missing from grpc")
+    record = subcmds.add_parser(
+        "record-wire-contract",
+        help="replace grpc-wire-contract with the labels released at a git revision",
+    )
+    record.add_argument("revision", help="git tag or revision, e.g. v26.06")
+    args = parser.parse_args()
+
+    if args.silent:
+        logging.getLogger().setLevel(logging.ERROR)
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.command == 'generate':
+        run()
+    elif args.command == 'bundle':
+        dest = Path(__file__).parent / 'schema.json'
+        src = Path(__file__).parent / '..' / '..' / '..' / 'doc' / 'schemas'
+
+        print(f"Combining schemas from {src.resolve()} into {dest.resolve()}")
+        schema = combine_schemas(src, dest)
+        print(f"Created {dest} from {len(schema)} files")
+    elif args.command == 'record-wire-contract':
+        record_wire_contract(args.revision)
+    elif args.command == 'missing-grpc':
+        missing, stale = check_missing()
+        print("Missing RPC commands in grpc:")
+        for name in sorted(missing):
+            print(name)
+        print("Stale grpc_method_blacklist entries:")
+        for name in sorted(stale):
+            print(name)
+        if missing or stale:
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

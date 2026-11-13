@@ -1,12 +1,10 @@
 #ifndef LIGHTNING_CHANNELD_CHANNELD_HTLC_H
 #define LIGHTNING_CHANNELD_CHANNELD_HTLC_H
 #include "config.h"
-#include <bitcoin/locktime.h>
-#include <ccan/short_types/short_types.h>
+#include <ccan/crypto/sha256/sha256.h>
 #include <common/amount.h>
 #include <common/htlc.h>
 #include <common/pseudorand.h>
-#include <wire/onion_wire.h>
 
 struct htlc {
 	/* What's the status. */
@@ -29,7 +27,13 @@ struct htlc {
 	const u8 *routing;
 
 	/* Blinding (optional). */
-	struct pubkey *blinding;
+	struct pubkey *path_key;
+
+	/* Any extra tlvs attached to this hltc (optional). */
+	struct tlv_field *extra_tlvs;
+
+	/* Should we immediately fail this htlc? */
+	bool fail_immediate;
 };
 
 static inline bool htlc_has(const struct htlc *h, int flag)
@@ -55,7 +59,8 @@ static inline size_t htlc_hash(u64 id)
 {
 	return siphash24(siphash_seed(), &id, sizeof(id));
 }
-HTABLE_DEFINE_TYPE(struct htlc, htlc_key, htlc_hash, htlc_cmp, htlc_map);
+HTABLE_DEFINE_DUPS_TYPE(struct htlc, htlc_key, htlc_hash, htlc_cmp,
+			htlc_map);
 
 static inline struct htlc *htlc_get(struct htlc_map *htlcs, u64 id, enum side owner)
 {
@@ -71,7 +76,6 @@ static inline struct htlc *htlc_get(struct htlc_map *htlcs, u64 id, enum side ow
 	return NULL;
 }
 
-/* FIXME: Move these out of the hash! */
 static inline bool htlc_is_dead(const struct htlc *htlc)
 {
 	return htlc->state == RCVD_REMOVE_ACK_REVOCATION

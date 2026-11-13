@@ -1,18 +1,30 @@
-#include "address.h"
-#include "locktime.h"
-#include "preimage.h"
-#include "pubkey.h"
-#include "script.h"
+#include "config.h"
 #include <assert.h>
-#include <ccan/crypto/ripemd160/ripemd160.h>
-#include <ccan/crypto/sha256/sha256.h>
-#include <ccan/endian/endian.h>
+#include <bitcoin/address.h>
+#include <bitcoin/locktime.h>
+#include <bitcoin/preimage.h>
+#include <bitcoin/pubkey.h>
+#include <bitcoin/script.h>
 #include <ccan/mem/mem.h>
+#include <common/pseudorand.h>
+#include <common/randbytes.h>
 #include <common/utils.h>
-#include <sodium/randombytes.h>
+#include <wally_script.h>
 
 /* To push 0-75 bytes onto stack. */
 #define OP_PUSHBYTES(val) (val)
+
+size_t script_with_len_hash(const struct script_with_len *swl)
+{
+	return siphash24(siphash_seed(), swl->script, swl->len);
+}
+
+bool script_with_len_eq(const struct script_with_len *a,
+			       const struct script_with_len *b)
+{
+	return memeq(a->script, a->len, b->script, b->len);
+}
+
 
 /* Bitcoin's OP_HASH160 is RIPEMD(SHA256()) */
 static void hash160(struct ripemd160 *redeemhash, const void *mem, size_t len)
@@ -25,9 +37,7 @@ static void hash160(struct ripemd160 *redeemhash, const void *mem, size_t len)
 
 static void add(u8 **scriptp, const void *mem, size_t len)
 {
-	size_t oldlen = tal_count(*scriptp);
-	tal_resize(scriptp, oldlen + len);
-	memcpy(*scriptp + oldlen, mem, len);
+	tal_arr_appendn(scriptp, mem, len);
 }
 
 static void add_op(u8 **scriptp, u8 op)
@@ -188,24 +198,6 @@ u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr)
 	return script;
 }
 
-u8 *scriptpubkey_opreturn(const tal_t *ctx)
-{
-	u8 *script = tal_arr(ctx, u8, 0);
-
-	add_op(&script, OP_RETURN);
-	return script;
-}
-u8 *scriptpubkey_opreturn_padded(const tal_t *ctx)
-{
-	u8 *script = tal_arr(ctx, u8, 0);
-	u8 random[20];
-	randombytes_buf(random, sizeof(random));
-
-	add_op(&script, OP_RETURN);
-	script_push_bytes(&script, random, sizeof(random));
-	return script;
-}
-
 /* Create an input script which spends p2pkh */
 u8 *bitcoin_redeem_p2pkh(const tal_t *ctx, const struct pubkey *pubkey,
 			 const struct bitcoin_signature *sig)
@@ -245,8 +237,7 @@ u8 *bitcoin_scriptsig_redeem(const tal_t *ctx,
 	script_push_bytes(&script, redeemscript,
 			  tal_count(redeemscript));
 
-	if (taken(redeemscript))
-		tal_free(redeemscript);
+	tal_free_if_taken(redeemscript);
 
 	return script;
 }
@@ -318,39 +309,119 @@ u8 *scriptpubkey_witness_raw(const tal_t *ctx, u8 version,
 	return script;
 }
 
+u8 *scriptpubkey_raw_p2tr(const tal_t *ctx, const struct pubkey *output_pubkey)
+{
+	int ok;
+	secp256k1_xonly_pubkey x_key;
+	unsigned char x_key_bytes[32];
+	u8 *script = tal_arr(ctx, u8, 0);
+
+	add_op(&script, OP_1);
+
+	ok = secp256k1_xonly_pubkey_from_pubkey(secp256k1_ctx,
+		&x_key,
+		/* pk_parity */ NULL,
+		&(output_pubkey->pubkey));
+	assert(ok);
+
+	ok = secp256k1_xonly_pubkey_serialize(secp256k1_ctx,
+		x_key_bytes,
+		&x_key);
+	assert(ok);
+
+	script_push_bytes(&script, x_key_bytes, sizeof(x_key_bytes));
+	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
+	return script;
+}
+
+u8 *scriptpubkey_raw_p2tr_derkey(const tal_t *ctx, const u8 output_der[33])
+{
+	struct pubkey tr_key;
+	if (!pubkey_from_der(output_der, 33, &tr_key)) {
+		abort();
+	}
+	return scriptpubkey_raw_p2tr(ctx, &tr_key);
+}
+
+u8 *scriptpubkey_p2tr(const tal_t *ctx, const struct pubkey *inner_pubkey)
+{
+	unsigned char key_bytes[33];
+	unsigned char tweaked_key_bytes[33];
+	size_t out_len = sizeof(key_bytes);
+	u8 *script = tal_arr(ctx, u8, 0);
+
+	add_op(&script, OP_1);
+
+	secp256k1_ec_pubkey_serialize(secp256k1_ctx, key_bytes, &out_len, &inner_pubkey->pubkey, SECP256K1_EC_COMPRESSED);
+	/* Only commit to inner pubkey in tweak */
+	if (wally_ec_public_key_bip341_tweak(key_bytes, 33, /* merkle_root*/ NULL, 0, 0 /* flags */, tweaked_key_bytes, sizeof(tweaked_key_bytes)) != WALLY_OK)
+		abort();
+
+	/* Cut off the first byte from the serialized compressed key */
+	script_push_bytes(&script, tweaked_key_bytes + 1, sizeof(tweaked_key_bytes) - 1);
+	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
+	return script;
+}
+
+u8 *scriptpubkey_p2tr_derkey(const tal_t *ctx, const u8 inner_der[33])
+{
+	struct pubkey tr_key;
+	if (!pubkey_from_der(inner_der, 33, &tr_key)) {
+		abort();
+	}
+	return scriptpubkey_p2tr(ctx, &tr_key);
+}
+
 /* BOLT #3:
  *
  * #### `to_remote` Output
  *
- * If `option_anchor_outputs` applies to the commitment
+ * If `option_anchors` applies to the commitment
  * transaction, the `to_remote` output is encumbered by a one
  * block csv lock.
- *    <remote_pubkey> OP_CHECKSIGVERIFY 1 OP_CHECKSEQUENCEVERIFY
+ *    <remotepubkey> OP_CHECKSIGVERIFY 1 OP_CHECKSEQUENCEVERIFY
  */
-u8 *anchor_to_remote_redeem(const tal_t *ctx,
-			    const struct pubkey *remote_key)
+/* BOLT- #3
+ * ##### Leased channel (`option_will_fund`)
+ *
+ * If a `lease` applies to the channel, the `to_remote` output
+ * of the `initiator` ensures the `leasor` funds are not
+ * spendable until the lease expires.
+ *
+ * <remote_pubkey> OP_CHECKSIGVERIFY MAX(1, lease_end - blockheight) OP_CHECKSEQUENCEVERIFY
+ */
+
+u8 *bitcoin_wscript_to_remote_anchored(const tal_t *ctx,
+				       const struct pubkey *remote_key,
+				       u32 csv_lock)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	add_push_key(&script, remote_key);
 	add_op(&script, OP_CHECKSIGVERIFY);
-	add_number(&script, 1);
+	add_number(&script, csv_lock);
 	add_op(&script, OP_CHECKSEQUENCEVERIFY);
 
-	assert(is_anchor_witness_script(script, tal_bytelen(script)));
+	assert(is_to_remote_anchored_witness_script(script, tal_bytelen(script)));
 	return script;
 }
 
-bool is_anchor_witness_script(const u8 *script, size_t script_len)
+bool is_to_remote_anchored_witness_script(const u8 *script, size_t script_len)
 {
-	if (script_len != 34 + 1 + 1 + 1)
+	size_t len = 34 + 1 + 1 + 1;
+	/* With option_will_fund, the pushbytes can be up to 2 bytes more
+	 *
+	 * <remote_pubkey> OP_CHECKSIGVERIFY
+	 * 		MAX(1, lease_end - blockheight)
+	 * 		OP_CHECKSEQUENCEVERIFY
+	 */
+	if (script_len < len || script_len > len + 2)
 		return false;
 	if (script[0] != OP_PUSHBYTES(33))
 		return false;
 	if (script[34] != OP_CHECKSIGVERIFY)
 		return false;
-	if (script[35] != 0x51)
-		return false;
-	if (script[36] != OP_CHECKSEQUENCEVERIFY)
+	/* FIXME: check for push value */
+	if (script[script_len - 1] != OP_CHECKSEQUENCEVERIFY)
 		return false;
 	return true;
 }
@@ -404,10 +475,8 @@ u8 *p2wpkh_scriptcode(const tal_t *ctx, const struct pubkey *key)
 	return script;
 }
 
-bool is_p2pkh(const u8 *script, struct bitcoin_address *addr)
+bool is_p2pkh(const u8 *script, size_t script_len, struct bitcoin_address *addr)
 {
-	size_t script_len = tal_count(script);
-
 	if (script_len != BITCOIN_SCRIPTPUBKEY_P2PKH_LEN)
 		return false;
 	if (script[0] != OP_DUP)
@@ -425,10 +494,8 @@ bool is_p2pkh(const u8 *script, struct bitcoin_address *addr)
 	return true;
 }
 
-bool is_p2sh(const u8 *script, struct ripemd160 *addr)
+bool is_p2sh(const u8 *script, size_t script_len, struct ripemd160 *addr)
 {
-	size_t script_len = tal_count(script);
-
 	if (script_len != BITCOIN_SCRIPTPUBKEY_P2SH_LEN)
 		return false;
 	if (script[0] != OP_HASH160)
@@ -442,10 +509,8 @@ bool is_p2sh(const u8 *script, struct ripemd160 *addr)
 	return true;
 }
 
-bool is_p2wsh(const u8 *script, struct sha256 *addr)
+bool is_p2wsh(const u8 *script, size_t script_len, struct sha256 *addr)
 {
-	size_t script_len = tal_count(script);
-
 	if (script_len != BITCOIN_SCRIPTPUBKEY_P2WSH_LEN)
 		return false;
 	if (script[0] != OP_0)
@@ -457,10 +522,8 @@ bool is_p2wsh(const u8 *script, struct sha256 *addr)
 	return true;
 }
 
-bool is_p2wpkh(const u8 *script, struct bitcoin_address *addr)
+bool is_p2wpkh(const u8 *script, size_t script_len, struct bitcoin_address *addr)
 {
-	size_t script_len = tal_count(script);
-
 	if (script_len != BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN)
 		return false;
 	if (script[0] != OP_0)
@@ -472,10 +535,34 @@ bool is_p2wpkh(const u8 *script, struct bitcoin_address *addr)
 	return true;
 }
 
-bool is_known_scripttype(const u8 *script)
+bool is_p2tr(const u8 *script, size_t script_len, u8 xonly_pubkey[32])
 {
-	return is_p2wpkh(script, NULL) || is_p2wsh(script, NULL)
-		|| is_p2sh(script, NULL) || is_p2pkh(script, NULL);
+	if (script_len != BITCOIN_SCRIPTPUBKEY_P2TR_LEN)
+		return false;
+	if (script[0] != OP_1)
+		return false;
+	/* x-only pubkey */
+	if (script[1] != OP_PUSHBYTES(32))
+		return false;
+	if (xonly_pubkey)
+		memcpy(xonly_pubkey, script+2, 32);
+	return true;
+}
+
+bool is_known_scripttype(const u8 *script, size_t script_len)
+{
+	return is_p2wpkh(script, script_len, NULL)
+		|| is_p2wsh(script, script_len, NULL)
+		|| is_p2sh(script, script_len, NULL)
+		|| is_p2pkh(script, script_len, NULL)
+		|| is_p2tr(script, script_len, NULL);
+}
+
+bool is_known_segwit_scripttype(const u8 *script, size_t script_len)
+{
+	return is_p2wpkh(script, script_len, NULL)
+		|| is_p2wsh(script, script_len, NULL)
+		|| is_p2tr(script, script_len, NULL);
 }
 
 u8 **bitcoin_witness_sig_and_element(const tal_t *ctx,
@@ -510,7 +597,28 @@ u8 **bitcoin_witness_sig_and_element(const tal_t *ctx,
  *     OP_ENDIF
  *     OP_CHECKSIG
  */
+/* BOLT- #3
+ * ##### Leased channel (`option_will_fund`)
+ * If a `lease` applies to the channel, the `to_local` output of the `accepter`
+ * ensures the `leasor` funds are not spendable until the lease expires.
+ *
+ * In a leased channel, the `to_local` output that pays the `accepter` node
+ * is modified so that its CSV is equal to the greater of the
+ * `to_self_delay` or the `lease_end` - `blockheight`.
+ *
+ *  OP_IF
+ *      # Penalty transaction
+ *      <revocationpubkey>
+ *  OP_ELSE
+ *      MAX(`to_self_delay`, `lease_end` - `blockheight`)
+ *      OP_CHECKSEQUENCEVERIFY
+ *      OP_DROP
+ *      <local_delayedpubkey>
+ *  OP_ENDIF
+ *  OP_CHECKSIG
+ */
 u8 *bitcoin_wscript_to_local(const tal_t *ctx, u16 to_self_delay,
+			     u32 lease_remaining,
 			     const struct pubkey *revocation_pubkey,
 			     const struct pubkey *local_delayedkey)
 {
@@ -518,7 +626,7 @@ u8 *bitcoin_wscript_to_local(const tal_t *ctx, u16 to_self_delay,
 	add_op(&script, OP_IF);
 	add_push_key(&script, revocation_pubkey);
 	add_op(&script, OP_ELSE);
-	add_number(&script, to_self_delay);
+	add_number(&script, max_unsigned(lease_remaining, to_self_delay));
 	add_op(&script, OP_CHECKSEQUENCEVERIFY);
 	add_op(&script, OP_DROP);
 	add_push_key(&script, local_delayedkey);
@@ -534,7 +642,7 @@ u8 *bitcoin_wscript_to_local(const tal_t *ctx, u16 to_self_delay,
  * This output sends funds to either an HTLC-timeout transaction after the
  * HTLC-timeout or to the remote node using the payment preimage or the
  * revocation key. The output is a P2WSH, with a witness script (no
- * option_anchor_outputs):
+ * option_anchors):
  *
  *     # To remote node with revocation key
  *     OP_DUP OP_HASH160 <RIPEMD160(SHA256(revocationpubkey))> OP_EQUAL
@@ -552,7 +660,7 @@ u8 *bitcoin_wscript_to_local(const tal_t *ctx, u16 to_self_delay,
  *         OP_ENDIF
  *     OP_ENDIF
  *
- * Or, with `option_anchor_outputs`:
+ * Or, with `option_anchors`:
  *
  *  # To remote node with revocation key
  *  OP_DUP OP_HASH160 <RIPEMD160(SHA256(revocationpubkey))> OP_EQUAL
@@ -576,7 +684,8 @@ u8 *bitcoin_wscript_htlc_offer_ripemd160(const tal_t *ctx,
 					 const struct pubkey *remotehtlckey,
 					 const struct ripemd160 *payment_ripemd,
 					 const struct pubkey *revocationkey,
-					 bool option_anchor_outputs)
+					 bool option_anchor_outputs,
+					 bool option_anchors_zero_fee_htlc_tx)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	struct ripemd160 ripemd;
@@ -608,7 +717,7 @@ u8 *bitcoin_wscript_htlc_offer_ripemd160(const tal_t *ctx,
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
 	add_op(&script, OP_ENDIF);
-	if (option_anchor_outputs) {
+	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
 		add_number(&script, 1);
 		add_op(&script, OP_CHECKSEQUENCEVERIFY);
 		add_op(&script, OP_DROP);
@@ -623,7 +732,8 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
 			       const struct pubkey *remotehtlckey,
 			       const struct sha256 *payment_hash,
 			       const struct pubkey *revocationkey,
-			       bool option_anchor_outputs)
+			       bool option_anchor_outputs,
+			       bool option_anchors_zero_fee_htlc_tx)
 {
 	struct ripemd160 ripemd;
 
@@ -631,7 +741,8 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
 	return bitcoin_wscript_htlc_offer_ripemd160(ctx, localhtlckey,
 						    remotehtlckey,
 						    &ripemd, revocationkey,
-						    option_anchor_outputs);
+						    option_anchor_outputs,
+						    option_anchors_zero_fee_htlc_tx);
 }
 
 /* BOLT #3:
@@ -641,7 +752,7 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
  * This output sends funds to either the remote node after the HTLC-timeout or
  * using the revocation key, or to an HTLC-success transaction with a
  * successful payment preimage. The output is a P2WSH, with a witness script
- * (no `option_anchor_outputs`):
+ * (no `option_anchors`):
  *
  *     # To remote node with revocation key
  *     OP_DUP OP_HASH160 <RIPEMD160(SHA256(revocationpubkey))> OP_EQUAL
@@ -661,7 +772,7 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
  *         OP_ENDIF
  *     OP_ENDIF
  *
- * Or, with `option_anchor_outputs`:
+ * Or, with `option_anchors`:
  *
  *  # To remote node with revocation key
  *  OP_DUP OP_HASH160 <RIPEMD160(SHA256(revocationpubkey))> OP_EQUAL
@@ -687,7 +798,8 @@ u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 					const struct pubkey *remotehtlckey,
 					const struct ripemd160 *payment_ripemd,
 					const struct pubkey *revocationkey,
-					bool option_anchor_outputs)
+					bool option_anchor_outputs,
+					bool option_anchors_zero_fee_htlc_tx)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	struct ripemd160 ripemd;
@@ -722,7 +834,7 @@ u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 	add_op(&script, OP_DROP);
 	add_op(&script, OP_CHECKSIG);
 	add_op(&script, OP_ENDIF);
-	if (option_anchor_outputs) {
+	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
 		add_number(&script, 1);
 		add_op(&script, OP_CHECKSEQUENCEVERIFY);
 		add_op(&script, OP_DROP);
@@ -738,7 +850,8 @@ u8 *bitcoin_wscript_htlc_receive(const tal_t *ctx,
 				 const struct pubkey *remotehtlckey,
 				 const struct sha256 *payment_hash,
 				 const struct pubkey *revocationkey,
-				 bool option_anchor_outputs)
+				 bool option_anchor_outputs,
+				 bool option_anchors_zero_fee_htlc_tx)
 {
 	struct ripemd160 ripemd;
 
@@ -746,7 +859,8 @@ u8 *bitcoin_wscript_htlc_receive(const tal_t *ctx,
 	return bitcoin_wscript_htlc_receive_ripemd(ctx, htlc_abstimeout,
 						   localhtlckey, remotehtlckey,
 						   &ripemd, revocationkey,
-						   option_anchor_outputs);
+						   option_anchor_outputs,
+						   option_anchors_zero_fee_htlc_tx);
 }
 
 /* BOLT #3:
@@ -829,7 +943,7 @@ u8 *bitcoin_wscript_anchor(const tal_t *ctx,
 	u8 *script = tal_arr(ctx, u8, 0);
 
 	/* BOLT #3:
-	 * #### `to_local_anchor` and `to_remote_anchor` Output (option_anchor_outputs)
+	 * #### `to_local_anchor` and `to_remote_anchor` Output (option_anchors)
 	 *...
 	 *  <local_funding_pubkey/remote_funding_pubkey> OP_CHECKSIG OP_IFDUP
 	 *  OP_NOTIF
@@ -844,15 +958,35 @@ u8 *bitcoin_wscript_anchor(const tal_t *ctx,
 	add_op(&script, OP_CHECKSEQUENCEVERIFY);
 	add_op(&script, OP_ENDIF);
 
+	assert(is_anchor_witness_script(script, tal_bytelen(script)));
 	return script;
+}
+
+bool is_anchor_witness_script(const u8 *script, size_t script_len)
+{
+	if (script_len != 34 + 1 + 1 + 1 + 1 + 1 + 1)
+		return false;
+	if (script[0] != OP_PUSHBYTES(33))
+		return false;
+	if (script[34] != OP_CHECKSIG)
+		return false;
+	if (script[35] != OP_IFDUP)
+		return false;
+	if (script[36] != OP_NOTIF)
+		return false;
+	if (script[37] != 0x50 + 16)
+		return false;
+	if (script[38] != OP_CHECKSEQUENCEVERIFY)
+		return false;
+	if (script[39] != OP_ENDIF)
+		return false;
+	return true;
 }
 
 bool scripteq(const u8 *s1, const u8 *s2)
 {
-	memcheck(s1, tal_count(s1));
-	memcheck(s2, tal_count(s2));
-
-	if (tal_count(s1) != tal_count(s2))
-		return false;
-	return memcmp(s1, s2, tal_count(s1)) == 0;
+	size_t s1_len = tal_count(s1), s2_len = tal_count(s2);
+	memcheck(s1, s1_len);
+	memcheck(s2, s2_len);
+	return memeq(s1, s1_len, s2, s2_len);
 }

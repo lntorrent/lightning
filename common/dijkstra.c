@@ -1,28 +1,27 @@
 /* Without this, gheap is *really* slow!  Comment out for debugging. */
+#ifndef TESTING
 #define NDEBUG
+#endif
+#include "config.h"
 #include <ccan/cast/cast.h>
-#include <ccan/err/err.h>
-#include <ccan/tal/str/str.h>
-#include <ccan/time/time.h>
 #include <common/dijkstra.h>
 #include <common/gossmap.h>
+#include <common/overflows.h>
+#include <common/utils.h>
 #include <gheap.h>
-#include <inttypes.h>
-#include <stdio.h>
 
 /* Each node has this side-info. */
 struct dijkstra {
+	/* Number of hops: destination == 0, unreachable == UINTMAX */
 	u32 distance;
-	/* Total CLTV delay */
-	u32 total_delay;
-	/* Total cost from here to destination */
-	struct amount_msat cost;
+	/* Total amount from here to destination */
+	struct amount_msat amount;
 	/* I want to use an index here, except that gheap moves things onto
 	 * a temporary on the stack and that makes things complex. */
 	/* NULL means it's been visited already. */
 	const struct gossmap_node **heapptr;
 
-	/* How we decide "best", lower is better */
+	/* How we decide "best", lower is better (this is the cost function output) */
 	u64 score;
 
 	/* We could re-evaluate to determine this, but keeps it simple */
@@ -37,18 +36,6 @@ static const struct gossmap *global_map;
 u32 dijkstra_distance(const struct dijkstra *dij, u32 node_idx)
 {
 	return dij[node_idx].distance;
-}
-
-/* Total CLTV delay */
-u32 dijkstra_delay(const struct dijkstra *dij, u32 node_idx)
-{
-	return dij[node_idx].total_delay;
-}
-
-/* Total cost to get here. */
-struct amount_msat dijkstra_amount(const struct dijkstra *dij, u32 node_idx)
-{
-	return dij[node_idx].cost;
 }
 
 struct gossmap_chan *dijkstra_best_chan(const struct dijkstra *dij,
@@ -102,16 +89,14 @@ static const struct gossmap_node **mkheap(const tal_t *ctx,
 			heap[0] = start;
 			d->heapptr = &heap[0];
 			d->distance = 0;
-			d->total_delay = 0;
-			d->cost = sent;
+			d->amount = sent;
 			d->score = 0;
 			i--;
 		} else {
 			heap[i] = n;
 			d->heapptr = &heap[i];
 			d->distance = UINT_MAX;
-			d->cost = AMOUNT_MSAT(-1ULL);
-			d->total_delay = 0;
+			d->amount = AMOUNT_MSAT(-1ULL);
 			d->score = -1ULL;
 		}
 	}
@@ -147,9 +132,11 @@ dijkstra_(const tal_t *ctx,
 			     int dir,
 			     struct amount_msat amount,
 			     void *arg),
-	  u64 (*path_score)(u32 distance,
-			    struct amount_msat cost,
-			    struct amount_msat risk),
+	  u64 (*channel_score)(struct amount_msat fee,
+			       struct amount_msat risk,
+			       struct amount_msat total,
+			       int dir,
+			       const struct gossmap_chan *c),
 	  void *arg)
 {
 	struct dijkstra *dij;
@@ -189,24 +176,24 @@ dijkstra_(const tal_t *ctx,
 	heapsize = tal_count(heap);
 
 	/*
-	 * 3. For the current node, consider all of its unvisited neighbouds
+	 * 3. For the current node, consider all of its unvisited neighbors
 	 * and calculate their tentative distances through the current
 	 * node. Compare the newly calculated tentative distance to the
 	 * current assigned value and assign the smaller one. For example, if
 	 * the current node A is marked with a distance of 6, and the edge
-	 * connecting it with a neighbour B has length 2, then the distance to
+	 * connecting it with a neighbor B has length 2, then the distance to
 	 * B through A will be 6 + 2 = 8. If B was previously marked with a
 	 * distance greater than 8 then change it to 8. Otherwise, the current
 	 * value will be kept.
 	 *
-	 * 4. When we are done considering all of the unvisited neighbouds of
+	 * 4. When we are done considering all of the unvisited neighbors of
 	 * the current node, mark the current node as visited and remove it
 	 * from the unvisited set. A visited node will never be checked again.
 	 *
 	 * 5. If the destination node has been marked visited (when planning a
 	 * route between two specific nodes) or if the smallest tentative
 	 * distance among the nodes in the unvisited set is infinity (when
-	 * planning a complete travedsal; occuds when there is no connection
+	 * planning a complete traversal; occurs when there is no connection
 	 * between the initial node and remaining unvisited nodes), then
 	 * stop. The algorithm has finished.
 	 *
@@ -230,7 +217,7 @@ dijkstra_(const tal_t *ctx,
 			int which_half;
 			struct gossmap_chan *c;
 			struct dijkstra *d;
-			struct amount_msat cost, risk;
+			struct amount_msat fee, risk;
 			u64 score;
 
 			c = gossmap_nth_chan(map, cur, i, &which_half);
@@ -242,28 +229,33 @@ dijkstra_(const tal_t *ctx,
 				continue;
 
 			/* We're going from neighbor to c, hence !which_half */
-			if (!channel_ok(map, c, !which_half, cur_d->cost, arg))
+			if (!channel_ok(map, c, !which_half, cur_d->amount, arg))
 				continue;
 
-			cost = cur_d->cost;
-			if (!amount_msat_add_fee(&cost,
-						 c->half[!which_half].base_fee,
-						 c->half[!which_half].proportional_fee))
+			if (!amount_msat_fee(&fee, cur_d->amount,
+					     c->half[!which_half].base_fee,
+					     c->half[!which_half].proportional_fee)) {
 				/* Shouldn't happen! */
 				continue;
+			}
 
 			/* cltv_delay can't overflow: only 20 bits per hop. */
-			risk = risk_price(cost, riskfactor,
-					  cur_d->total_delay
-					  + c->half[!which_half].delay);
-			score = path_score(cur_d->distance + 1, cost, risk);
+			risk = risk_price(cur_d->amount, riskfactor, c->half[!which_half].delay);
+			score = channel_score(fee, risk, cur_d->amount, !which_half, c);
+
+			/* That score is on top of current score */
+			if (add_overflows_u64(score, cur_d->score))
+				continue;
+			score += cur_d->score;
+
 			if (score >= d->score)
 				continue;
 
+			/* Shouldn't happen! */
+			if (!amount_msat_add(&d->amount, cur_d->amount, fee))
+				continue;
+
 			d->distance = cur_d->distance + 1;
-			d->total_delay = cur_d->total_delay
-				+ c->half[!which_half].delay;
-			d->cost = cost;
 			d->best_chan = c;
 			d->score = score;
 			gheap_restore_heap_after_item_increase(&gheap_ctx,

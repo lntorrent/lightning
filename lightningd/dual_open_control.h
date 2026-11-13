@@ -4,28 +4,28 @@
 #include "config.h"
 #include <lightningd/subd.h>
 
-struct per_peer_state;
+struct peer_fd;
 
-void peer_start_dualopend(struct peer *peer,
-			  struct per_peer_state *pps,
-			  const u8 *send_msg);
+bool peer_start_dualopend(struct peer *peer, struct peer_fd *peer_fd,
+			  struct channel *channel);
 
-void peer_restart_dualopend(struct peer *peer,
-			    struct per_peer_state *pps,
+bool peer_restart_dualopend(struct peer *peer,
+			    struct peer_fd *peer_fd,
 			    struct channel *channel,
-			    const u8 *send_msg);
+			    bool from_abort);
 
-void dualopen_tell_depth(struct subd *dualopend,
-			 struct channel *channel,
-			 const struct bitcoin_txid *txid,
-			 u32 depth);
+void watch_opening_inflight(struct lightningd *ld,
+			    struct channel_inflight *inflight);
 
-void channel_close_conn(struct channel *channel,
-			const char *why);
+/* Close connection to an unsaved channel */
+void channel_unsaved_close_conn(struct channel *channel, const char *why);
 
-void channel_close_reconn(struct channel *channel,
-			  const char *why);
+void NO_NULL_ARGS json_add_unsaved_channel(struct command *cmd,
+					   struct json_stream *response,
+					   const struct channel *channel,
+					   const struct peer *peer);
 
-void json_add_unsaved_channel(struct json_stream *response,
-			      const struct channel *channel);
+void channel_update_reserve(struct channel *channel,
+			    struct channel_config *their_config,
+			    struct amount_sat funding_total);
 #endif /* LIGHTNING_LIGHTNINGD_DUAL_OPEN_CONTROL_H */

@@ -4,7 +4,6 @@
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
-#include <stdbool.h>
 
 #define MSAT_PER_SAT ((u64)1000)
 #define SAT_PER_BTC ((u64)100000000)
@@ -55,8 +54,15 @@ struct amount_sat amount_sat(u64 satoshis);
 WARN_UNUSED_RESULT bool amount_sat_to_msat(struct amount_msat *msat,
 					   struct amount_sat sat);
 
+/* You may not always be able to convert millisatoshis->satoshis without rounding. */
+WARN_UNUSED_RESULT bool amount_msat_to_sat(struct amount_sat *sat,
+					   struct amount_msat msat);
+
 /* You can always truncate millisatoshis->satoshis. */
 struct amount_sat amount_msat_to_sat_round_down(struct amount_msat msat);
+
+/* The msats truncated by `amount_msat_to_sat_round_down` */
+struct amount_msat amount_msat_to_sat_remainder(struct amount_msat msat);
 
 /* Simple operations: val = a + b, val = a - b. */
 WARN_UNUSED_RESULT bool amount_msat_add(struct amount_msat *val,
@@ -83,13 +89,52 @@ WARN_UNUSED_RESULT bool amount_sat_sub_msat(struct amount_msat *val,
 WARN_UNUSED_RESULT bool amount_msat_scale(struct amount_msat *val,
 					  struct amount_msat msat,
 					  double scale);
+WARN_UNUSED_RESULT bool amount_sat_scale(struct amount_sat *val,
+					 struct amount_sat sat,
+					 double scale);
 
+WARN_UNUSED_RESULT bool amount_msat_add_sat_s64(struct amount_msat *val,
+						struct amount_msat a,
+						s64 b);
+
+WARN_UNUSED_RESULT bool amount_sat_add_sat_s64(struct amount_sat *val,
+					       struct amount_sat a,
+					       s64 b);
+
+WARN_UNUSED_RESULT bool amount_msat_can_add_sat_s64(struct amount_msat a,
+						    s64 b);
+
+/* a += b */
+WARN_UNUSED_RESULT bool amount_msat_accumulate(struct amount_msat *a,
+					       struct amount_msat b);
+
+/* a -= b */
+WARN_UNUSED_RESULT bool amount_msat_deduct(struct amount_msat *a,
+					   struct amount_msat b);
+
+/* a -= b */
+WARN_UNUSED_RESULT bool amount_msat_deduct_sat(struct amount_msat *a,
+					       struct amount_sat b);
+
+/* returns floor(msat/div) */
 struct amount_msat amount_msat_div(struct amount_msat msat, u64 div);
+
+/* returns ceil(msat/div) */
+struct amount_msat amount_msat_div_ceil(struct amount_msat msat, u64 div);
+
+/* returns floor(sat/div) */
 struct amount_sat amount_sat_div(struct amount_sat sat, u64 div);
+
+bool amount_sat_mul(struct amount_sat *res, struct amount_sat sat, u64 mul);
+bool amount_msat_mul(struct amount_msat *res, struct amount_msat msat, u64 mul);
 
 /* Is a == b? */
 bool amount_sat_eq(struct amount_sat a, struct amount_sat b);
 bool amount_msat_eq(struct amount_msat a, struct amount_msat b);
+
+/* Is a zero? */
+bool amount_sat_is_zero(struct amount_sat a);
+bool amount_msat_is_zero(struct amount_msat a);
 
 /* Is a > b? */
 bool amount_sat_greater(struct amount_sat a, struct amount_sat b);
@@ -120,6 +165,25 @@ bool amount_msat_eq_sat(struct amount_msat msat, struct amount_sat sat);
 
 /* a / b */
 double amount_msat_ratio(struct amount_msat a, struct amount_msat b);
+
+/* floor(a/b) */
+u64 amount_msat_ratio_floor(struct amount_msat a, struct amount_msat b);
+
+/* ceil(a/b) */
+u64 amount_msat_ratio_ceil(struct amount_msat a, struct amount_msat b);
+
+/* min(a,b) and max(a,b) */
+static inline struct amount_msat amount_msat_min(struct amount_msat a,
+						 struct amount_msat b)
+{
+	return amount_msat_less(a, b) ? a : b;
+}
+
+static inline struct amount_msat amount_msat_max(struct amount_msat a,
+						 struct amount_msat b)
+{
+	return amount_msat_greater(a, b) ? a : b;
+}
 
 /* Check whether this asset is actually the main / fee-paying asset of the
  * current chain. */
@@ -152,8 +216,16 @@ WARN_UNUSED_RESULT bool amount_msat_add_fee(struct amount_msat *amt,
 					    u32 fee_base_msat,
 					    u32 fee_proportional_millionths);
 
+/* Reversed: what is the largest possible output for a given input and fee? */
+struct amount_msat amount_msat_sub_fee(struct amount_msat input,
+				       u32 fee_base_msat,
+				       u32 fee_proportional_millionths);
+
 /* What is the fee for this tx weight? */
 struct amount_sat amount_tx_fee(u32 fee_per_kw, size_t weight);
+
+/* What is the feerate given this fee and (non-zero!) weight? */
+WARN_UNUSED_RESULT bool amount_feerate(u32 *feerate, struct amount_sat fee, size_t weight);
 
 /* Different formatting by amounts: btc, sat and msat */
 /* => 1.23456789012btc (11 decimals!) */
@@ -161,14 +233,17 @@ const char *fmt_amount_msat_btc(const tal_t *ctx,
 				struct amount_msat msat,
 				bool append_unit);
 /* => 1234msat */
-const char *fmt_amount_msat(const tal_t *ctx, struct amount_msat msat);
+char *fmt_amount_msat(const tal_t *ctx, struct amount_msat msat);
+
+/* => 1234.12sat */
+char *fmt_amount_m_as_sat(const tal_t *ctx, struct amount_msat msat);
 
 /* => 1.23456789btc (8 decimals!) */
 const char *fmt_amount_sat_btc(const tal_t *ctx,
 			       struct amount_sat sat,
 			       bool append_unit);
 /* => 1234sat */
-const char *fmt_amount_sat(const tal_t *ctx, struct amount_sat sat);
+char *fmt_amount_sat(const tal_t *ctx, struct amount_sat sat);
 
 /* Valid strings:
  *  [0-9]+ => millisatoshi.

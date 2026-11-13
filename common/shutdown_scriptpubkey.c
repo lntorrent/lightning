@@ -1,19 +1,44 @@
+#include "config.h"
 #include <bitcoin/script.h>
 #include <common/shutdown_scriptpubkey.h>
+#include <wally_script.h>
+#include <wire/wire.h>
 
-#include <stdio.h>
+/* BOLT #2:
+ * 4. if (and only if) `option_simple_close` is negotiated:
+ *    * `OP_RETURN` followed by one of:
+ *      * `6` to `75` inclusive followed by exactly that many bytes
+ *      * `76` followed by `76` to `80` followed by exactly that many bytes
+ */
+bool is_valid_op_return(const u8 *scriptpubkey, size_t scriptpubkey_len)
+{
+	u8 v;
 
-/* BOLT-4e329271a358ee52bf43ddbd96776943c5d74508 #2:
- * 5. if (and only if) `option_shutdown_anysegwit` is negotiated:
+	if (fromwire_u8(&scriptpubkey, &scriptpubkey_len) != OP_RETURN)
+		return false;
+
+	v = fromwire_u8(&scriptpubkey, &scriptpubkey_len);
+	if (v >= 6 && v <= 75)
+		return scriptpubkey_len == v;
+	if (v == 76) {
+		v = fromwire_u8(&scriptpubkey, &scriptpubkey_len);
+		if (v >= 76 && v <= 80)
+			return scriptpubkey_len == v;
+	}
+	return false;
+}
+
+/* BOLT #2:
+ * 3. if (and only if) `option_shutdown_anysegwit` is negotiated:
  *      * `OP_1` through `OP_16` inclusive, followed by a single
  *         push of 2 to 40 bytes
  *         (witness program versions 1 through 16)
  */
-static bool is_valid_witnessprog(const u8 *scriptpubkey)
+static bool is_valid_witnessprog(const u8 *scriptpubkey, size_t scriptpubkey_len)
 {
 	size_t pushlen;
 
-	if (tal_bytelen(scriptpubkey) < 2)
+	if (scriptpubkey_len < 2)
 		return false;
 
 	switch (scriptpubkey[0]) {
@@ -35,29 +60,32 @@ static bool is_valid_witnessprog(const u8 *scriptpubkey)
 	case OP_16:
 		break;
 	default:
-		fprintf(stderr, "op = %u (invalid)\n", scriptpubkey[0]);
 		return false;
 	}
 
 	pushlen = scriptpubkey[1];
 	/* Must be all of the rest of scriptpubkey */
-	if (2 + pushlen != tal_bytelen(scriptpubkey)) {
-		fprintf(stderr, "2 + %zu != %zu\n", pushlen, tal_bytelen(scriptpubkey));
+	if (2 + pushlen != scriptpubkey_len) {
 		return false;
 	}
-
-	if (!(pushlen >= 2 && pushlen <= 40))
-		fprintf(stderr, "pushlen == %zu\n", pushlen);
 
 	return pushlen >= 2 && pushlen <= 40;
 }
 
 bool valid_shutdown_scriptpubkey(const u8 *scriptpubkey,
-				 bool anysegwit)
+				 bool anysegwit,
+				 bool allow_oldstyle,
+				 bool option_simple_close)
 {
-	return is_p2pkh(scriptpubkey, NULL)
-		|| is_p2sh(scriptpubkey, NULL)
-		|| is_p2wpkh(scriptpubkey, NULL)
-		|| is_p2wsh(scriptpubkey, NULL)
-		|| (anysegwit && is_valid_witnessprog(scriptpubkey));
+	const size_t script_len = tal_bytelen(scriptpubkey);
+	if (allow_oldstyle) {
+		if (is_p2pkh(scriptpubkey, script_len, NULL)
+		    || is_p2sh(scriptpubkey, script_len, NULL))
+			return true;
+	}
+
+	return is_p2wpkh(scriptpubkey, script_len, NULL)
+		|| is_p2wsh(scriptpubkey, script_len, NULL)
+		|| (anysegwit && is_valid_witnessprog(scriptpubkey, script_len))
+		|| (option_simple_close && is_valid_op_return(scriptpubkey, script_len));
 }

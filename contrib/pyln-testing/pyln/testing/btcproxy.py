@@ -1,16 +1,18 @@
 """ A bitcoind proxy that allows instrumentation and canned responses
 """
-from flask import Flask, request
+from flask import Flask, request  # type: ignore
 from bitcoin.rpc import JSONRPCError  # type: ignore
 from bitcoin.rpc import RawProxy as BitcoinProxy  # type: ignore
 from cheroot.wsgi import Server  # type: ignore
 from cheroot.wsgi import PathInfoDispatcher  # type: ignore
 
 import decimal
-import flask
+import flask  # type: ignore
 import json
 import logging
+import socket
 import threading
+import time
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -38,7 +40,7 @@ class BitcoinRpcProxy(object):
 
         # If we have set a mock for this method reply with that instead of
         # forwarding the request.
-        if method in self.mocks and type(self.mocks[method]) == dict:
+        if method in self.mocks and isinstance(self.mocks[method], dict):
             ret = {}
             ret['id'] = r['id']
             ret['error'] = None
@@ -47,7 +49,10 @@ class BitcoinRpcProxy(object):
             return ret
         elif method in self.mocks and callable(self.mocks[method]):
             self.mock_counts[method] += 1
-            return self.mocks[method](r)
+            # If a mock returns "None" it means "call the real one"
+            ret = self.mocks[method](r)
+            if ret is not None:
+                return ret
 
         try:
             reply = {
@@ -78,17 +83,28 @@ class BitcoinRpcProxy(object):
 
     def start(self):
         d = PathInfoDispatcher({'/': self.app})
-        self.server = Server(('0.0.0.0', self.rpcport), d)
+        self.server = Server(('127.0.0.1', self.rpcport), d)
         self.proxy_thread = threading.Thread(target=self.server.start)
         self.proxy_thread.daemon = True
         self.proxy_thread.start()
 
-        # Now that bitcoind is running on the real rpcport, let's tell all
-        # future callers to talk to the proxyport. We use the bind_addr as a
-        # signal that the port is bound and accepting connections.
-        while self.server.bind_addr[1] == 0:
-            pass
-        self.rpcport = self.server.bind_addr[1]
+        if self.rpcport == 0:
+            while self.server.bind_addr[1] == 0:
+                time.sleep(0.01)
+            self.rpcport = self.server.bind_addr[1]
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                s = socket.create_connection(('127.0.0.1', self.rpcport),
+                                             timeout=0.5)
+                s.close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise RuntimeError("BitcoinRpcProxy failed to bind on "
+                               "127.0.0.1:{}".format(self.rpcport))
         logging.debug("BitcoinRpcProxy proxying incoming port {} to {}".format(self.rpcport, self.bitcoind.rpcport))
 
     def stop(self):

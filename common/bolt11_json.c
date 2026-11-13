@@ -1,12 +1,10 @@
-#include <bitcoin/address.h>
-#include <bitcoin/base58.h>
-#include <bitcoin/chainparams.h>
+#include "config.h"
 #include <bitcoin/script.h>
+#include <ccan/tal/str/str.h>
+#include <common/addr.h>
 #include <common/bech32.h>
 #include <common/bolt11.h>
 #include <common/bolt11_json.h>
-#include <common/json.h>
-#include <common/json_helpers.h>
 #include <common/json_stream.h>
 
 static void json_add_fallback(struct json_stream *response,
@@ -14,32 +12,25 @@ static void json_add_fallback(struct json_stream *response,
 			      const u8 *fallback,
 			      const struct chainparams *chain)
 {
-	struct bitcoin_address pkh;
-	struct ripemd160 sh;
-	struct sha256 wsh;
+	char *addr;
+	const size_t fallback_len = tal_bytelen(fallback);
 
 	json_object_start(response, fieldname);
-	if (is_p2pkh(fallback, &pkh)) {
+	if (is_p2pkh(fallback, fallback_len, NULL)) {
 		json_add_string(response, "type", "P2PKH");
-		json_add_string(response, "addr",
-				bitcoin_to_base58(tmpctx, chain, &pkh));
-	} else if (is_p2sh(fallback, &sh)) {
+	} else if (is_p2sh(fallback, fallback_len, NULL)) {
 		json_add_string(response, "type", "P2SH");
-		json_add_string(response, "addr",
-				p2sh_to_base58(tmpctx, chain, &sh));
-	} else if (is_p2wpkh(fallback, &pkh)) {
-		char out[73 + strlen(chain->bip173_name)];
+	} else if (is_p2wpkh(fallback, fallback_len, NULL)) {
 		json_add_string(response, "type", "P2WPKH");
-		if (segwit_addr_encode(out, chain->bip173_name, 0,
-				       (const u8 *)&pkh, sizeof(pkh)))
-			json_add_string(response, "addr", out);
-	} else if (is_p2wsh(fallback, &wsh)) {
-		char out[73 + strlen(chain->bip173_name)];
+	} else if (is_p2wsh(fallback, fallback_len, NULL)) {
 		json_add_string(response, "type", "P2WSH");
-		if (segwit_addr_encode(out, chain->bip173_name, 0,
-				       (const u8 *)&wsh, sizeof(wsh)))
-			json_add_string(response, "addr", out);
+	} else if (is_p2tr(fallback, fallback_len, NULL)) {
+		json_add_string(response, "type", "P2TR");
 	}
+
+	addr = encode_scriptpubkey_to_addr(tmpctx, chain, fallback, fallback_len);
+	if (addr)
+		json_add_string(response, "addr", addr);
 	json_add_hex_talarr(response, "hex", fallback);
 	json_object_end(response);
 }
@@ -47,13 +38,12 @@ static void json_add_fallback(struct json_stream *response,
 void json_add_bolt11(struct json_stream *response,
 		     const struct bolt11 *b11)
 {
-	json_add_string(response, "currency", b11->chain->bip173_name);
+	json_add_string(response, "currency", b11->chain->lightning_hrp);
 	json_add_u64(response, "created_at", b11->timestamp);
 	json_add_u64(response, "expiry", b11->expiry);
 	json_add_node_id(response, "payee", &b11->receiver_id);
         if (b11->msat)
-                json_add_amount_msat_compat(response, *b11->msat,
-					    "msatoshi", "amount_msat");
+                json_add_amount_msat(response, "amount_msat", *b11->msat);
         if (b11->description)
                 json_add_string(response, "description", b11->description);
         if (b11->description_hash)
@@ -66,6 +56,8 @@ void json_add_bolt11(struct json_stream *response,
                                 b11->payment_secret);
 	if (b11->features)
 		json_add_hex_talarr(response, "features", b11->features);
+	if (b11->metadata)
+		json_add_hex_talarr(response, "payment_metadata", b11->metadata);
         if (tal_count(b11->fallbacks)) {
 		json_array_start(response, "fallbacks");
 		for (size_t i = 0; i < tal_count(b11->fallbacks); i++)
@@ -86,7 +78,7 @@ void json_add_bolt11(struct json_stream *response,
 						 &b11->routes[i][n].pubkey);
                                 json_add_short_channel_id(response,
                                                           "short_channel_id",
-                                                          &b11->routes[i][n]
+                                                          b11->routes[i][n]
                                                           .short_channel_id);
                                 json_add_u64(response, "fee_base_msat",
                                              b11->routes[i][n].fee_base_msat);
@@ -125,5 +117,6 @@ void json_add_bolt11(struct json_stream *response,
 
 	json_add_sha256(response, "payment_hash", &b11->payment_hash);
 
-	json_add_string(response, "signature", fmt_signature(tmpctx, &b11->sig));
+	json_add_string(response, "signature",
+			fmt_secp256k1_ecdsa_signature(tmpctx, &b11->sig));
 }

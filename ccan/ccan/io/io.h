@@ -59,7 +59,7 @@ struct io_conn;
 	io_new_conn_((ctx), (fd),					\
 		     typesafe_cb_preargs(struct io_plan *, void *,	\
 					 (init), (arg),			\
-					 struct io_conn *conn),		\
+					 struct io_conn *),		\
 		     (void *)(arg))
 
 struct io_conn *io_new_conn_(const tal_t *ctx, int fd,
@@ -113,6 +113,8 @@ void io_set_finish_(struct io_conn *conn,
  * (tal'ocated off @ctx) and pass that to init().  Note that if there is
  * an error on this file descriptor, it will be freed.
  *
+ * Note: if the accept fails (usually due to EMFILE), init() will be called
+ * wth
  * Returns NULL on error (and sets errno).
  *
  * Example:
@@ -390,6 +392,39 @@ struct io_plan *io_out_always_(struct io_conn *conn,
 			       void *arg);
 
 /**
+ * io_sock_shutdown - start socket close process (flushes TCP sockets).
+ * @conn: the connection the plan is for
+ *
+ * Simply closing a TCP socket can lose data; unfortunately you should
+ * shutdown(SHUT_WR) and wait for the other side to see this and close.
+ * Of course, you also need to set a timer, in case it doesn't (you may
+ * already have some responsiveness timer, of course).
+ *
+ * On error, is equivalent to io_close().
+ *
+ * Example:
+ * #include <ccan/timer/timer.h>
+ *
+ * // Timer infra needs wrapper to contain extra data.
+ * struct timeout_timer {
+ *    struct timer t;
+ *    struct io_conn *conn;
+ * };
+ * static struct timers timers;
+ *
+ * static struct io_plan *flush_and_close(struct io_conn *conn)
+ * {
+ *    struct timeout_timer *timeout;
+ *    // Freed if conn closes normally.
+ *    timeout = tal(conn, struct timeout_timer);
+ *    timeout->conn = conn;
+ *    timer_addrel(&timers, &timeout->t, time_from_sec(5));
+ *    return io_sock_shutdown(conn);
+ * }
+ */
+struct io_plan *io_sock_shutdown(struct io_conn *conn);
+
+/**
  * io_connect - create an asynchronous connection to a listening socket.
  * @conn: the connection that plan is for.
  * @addr: where to connect.
@@ -501,7 +536,7 @@ struct io_plan *io_halfclose(struct io_conn *conn);
  *
  * Example:
  * // Silly example to wait then close.
- * static struct io_plan *wait(struct io_conn *conn, void *b)
+ * static struct io_plan *wait_then_close(struct io_conn *conn, void *b)
  * {
  *	return io_wait(conn, b, io_close_cb, NULL);
  * }
@@ -780,5 +815,23 @@ struct timemono (*io_time_override(struct timemono (*now)(void)))(void);
  * to ccan/io).  Returns the old one.
  */
 int (*io_poll_override(int (*poll)(struct pollfd *fds, nfds_t nfds, int timeout)))(struct pollfd *, nfds_t, int);
+
+/**
+ * io_have_fd - do we own this file descriptor?
+ * @fd: the file descriptor.
+ * @listener: if non-NULL, set to true if it's a listening socket (io_listener).
+ *
+ * Returns NULL if we don't own it, otherwise a struct io_conn * or struct io_listener *.
+ */
+const void *io_have_fd(int fd, bool *listener);
+
+/**
+ * io_set_extended_errors - enable callbacks for errors.
+ * @state: true or false.
+ *
+ * Defaults false for compatibility.  See io_new_conn for what this changes.
+ */
+void io_set_extended_errors(bool state);
+bool io_get_extended_errors(void);
 
 #endif /* CCAN_IO_H */

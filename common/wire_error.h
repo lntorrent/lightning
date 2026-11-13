@@ -1,10 +1,8 @@
 #ifndef LIGHTNING_COMMON_WIRE_ERROR_H
 #define LIGHTNING_COMMON_WIRE_ERROR_H
 #include "config.h"
-#include <ccan/compiler/compiler.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
-#include <stdarg.h>
 
 struct channel_id;
 
@@ -56,6 +54,30 @@ u8 *towire_warningfmtv(const tal_t *ctx,
 		       const char *fmt,
 		       va_list ap);
 
+/**
+ * towire_abortfmt - helper to turn string into WIRE_TX_ABORT.
+ *
+ * @ctx: context to allocate from
+ * @channel: specific channel to complain about, or NULL for all.
+ * @fmt: format for warning.
+ */
+u8 *towire_abortfmt(const tal_t *ctx,
+		    const struct channel_id *channel,
+		    const char *fmt, ...) PRINTF_FMT(3,4);
+
+/**
+ * towire_abortfmtv - helper to turn string into WIRE_TX_ABORT.
+ *
+ * @ctx: context to allocate from
+ * @channel: specific channel to complain about, or NULL for all.
+ * @fmt: format for warning.
+ * @ap: accumulated varargs.
+ */
+u8 *towire_abortfmtv(const tal_t *ctx,
+		     const struct channel_id *channel,
+		     const char *fmt,
+		     va_list ap);
+
 /* BOLT #1:
  *
  * The channel is referred to by `channel_id`, unless `channel_id` is 0
@@ -75,5 +97,24 @@ bool channel_id_is_all(const struct channel_id *channel_id);
  */
 char *sanitize_error(const tal_t *ctx, const u8 *errmsg,
 		     struct channel_id *channel_id);
+
+/**
+ * is_peer_error - if it's an error, describe it.
+ * @ctx: context to allocate return from.
+ * @msg: the peer message.
+ *
+ * If this returns non-NULL, it's usually passed to
+ * peer_failed_received_errmsg().
+ */
+const char *is_peer_error(const tal_t *ctx, const u8 *msg);
+
+/**
+ * is_peer_warning - if it's a warning, describe it.
+ * @ctx: context to allocate return from.
+ * @msg: the peer message.
+ *
+ * If this returns non-NULL, it's usually logged.
+ */
+const char *is_peer_warning(const tal_t *ctx, const u8 *msg);
 
 #endif /* LIGHTNING_COMMON_WIRE_ERROR_H */

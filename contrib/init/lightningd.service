@@ -8,21 +8,27 @@
 # /etc/lightningd/lightningd.conf
 
 [Unit]
-Description=C-Lightning daemon
+Description=Core Lightning daemon
 Requires=bitcoind.service
 After=bitcoind.service
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/lightningd --daemon --conf /etc/lightningd/lightningd.conf --pid-file=/run/lightningd/lightningd.pid
+ExecStart=/usr/bin/lightningd --conf /etc/lightningd/lightningd.conf --pid-file=/run/lightningd/lightningd.pid
+# graceful was introduced in v26.06: before that, simply stop.
+ExecStop=/usr/bin/lightning-cli --conf /etc/lightningd/lightningd.conf graceful 20
+ExecStop=/usr/bin/lightning-cli --conf /etc/lightningd/lightningd.conf stop
+TimeoutStopSec=60
 
 # Creates /run/lightningd owned by bitcoin
 RuntimeDirectory=lightningd
+# Creates /etc/lightningd owned by bitcoin
+ConfigurationDirectory=lightningd
 
 User=bitcoin
 Group=bitcoin
-Type=forking
+Type=simple
 PIDFile=/run/lightningd/lightningd.pid
 Restart=on-failure
 
@@ -44,6 +50,7 @@ NoNewPrivileges=true
 PrivateDevices=true
 
 # Deny the creation of writable and executable memory mappings.
+# NOTE: This seems to break node.js plugins:
 MemoryDenyWriteExecute=true
 
 [Install]

@@ -6,7 +6,14 @@ text = """# BOLT #1: Base Protocol
 This protocol assumes an underlying authenticated and ordered transport mechanism that takes care of framing individual messages.
 [BOLT #8](08-transport.md) specifies the canonical transport layer used in Lightning, though it can be replaced by any transport that fulfills the above guarantees.
 
-The default TCP port is 9735. This corresponds to hexadecimal `0x2607`: the Unicode code point for LIGHTNING.<sup>[1](#reference-1)</sup>
+The default TCP port depends on the network used. The most common networks are:
+
+- Bitcoin mainet with port number 9735 or the corresponding hexadecimal `0x2607`;
+- Bitcoin testnet with port number 19735 (`0x4D17`);
+- Bitcoin signet with port number 39735 (`0x9B37`).
+- Bitcoin testnet4 with port number 49735 (`0xC247`).
+
+The Unicode code point for LIGHTNING <sup>[1](#reference-1)</sup>, and the port convention try to follow the Bitcoin Core convention.
 
 All data fields are unsigned big-endian unless otherwise specified.
 
@@ -18,7 +25,7 @@ All data fields are unsigned big-endian unless otherwise specified.
   * [Fundamental Types](#fundamental-types)
   * [Setup Messages](#setup-messages)
     * [The `init` Message](#the-init-message)
-    * [The `error` Message](#the-error-message)
+    * [The `error` and `warning` Messages](#the-error-and-warning-messages)
   * [Control Messages](#control-messages)
     * [The `ping` and `pong` Messages](#the-ping-and-pong-messages)
   * [Appendix A: BigSize Test Vectors](#appendix-a-bigsize-test-vectors)
@@ -136,7 +143,8 @@ according to the message-specific format determined by `type`.
 ### Requirements
 
 The sending node:
- - MUST order `tlv_record`s in a `tlv_stream` by monotonically-increasing `type`.
+ - MUST order `tlv_record`s in a `tlv_stream` by strictly-increasing `type`,
+   hence MUST not produce more than a single TLV record with the same `type`
  - MUST minimally encode `type` and `length`.
  - When defining custom record `type` identifiers:
    - SHOULD pick random `type` identifiers to avoid collision with other
@@ -152,7 +160,8 @@ The receiving node:
    - MUST stop parsing the `tlv_stream`.
  - if a `type` or `length` is not minimally encoded:
    - MUST fail to parse the `tlv_stream`.
- - if decoded `type`s are not monotonically-increasing:
+ - if decoded `type`s are not strictly-increasing (including situations when
+   two or more occurrences of the same `type` are met):
    - MUST fail to parse the `tlv_stream`.
  - if `length` exceeds the number of bytes remaining in the message:
    - MUST fail to parse the `tlv_stream`.
@@ -176,8 +185,8 @@ encoded element. Without TLV, even if a node does not wish to use a particular
 field, the node is forced to add parsing logic for that field in order to
 determine the offset of any fields that follow.
 
-The monotonicity constraint ensures that all `type`s are unique and can appear
-at most once. Fields that map to complex objects, e.g. vectors, maps, or
+The strict monotonicity constraint ensures that all `type`s are unique and can
+appear at most once. Fields that map to complex objects, e.g. vectors, maps, or
 structs, should do so by defining the encoding such that the object is
 serialized within a single `tlv_record`. The uniqueness constraint, among other
 things, enables the following optimizations:
@@ -224,6 +233,12 @@ integers can be omitted:
 * `tu32`: a 0 to 4 byte unsigned integer
 * `tu64`: a 0 to 8 byte unsigned integer
 
+When used to encode amounts, the previous fields MUST comply with the upper
+bound of 21 million BTC:
+
+* satoshi amounts MUST be at most `0x000775f05a074000`
+* milli-satoshi amounts MUST be at most `0x1d24b2dfac520000`
+
 The following convenience types are also defined:
 
 * `chain_hash`: a 32-byte chain identifier (see [BOLT #0](00-introduction.md#glossary-and-terminology-guide))
@@ -252,14 +267,17 @@ The `features` field MUST be padded to bytes with 0s.
    * [`flen*byte`:`features`]
    * [`init_tlvs`:`tlvs`]
 
-1. tlvs: `init_tlvs`
+1. `tlv_stream`: `init_tlvs`
 2. types:
     1. type: 1 (`networks`)
     2. data:
         * [`...*chain_hash`:`chains`]
-
+    1. type: 3 (`remote_addr`)
+    2. data:
+        * [`...*byte`:`data`]
 
 The optional `networks` indicates the chains the node is interested in.
+The optional `remote_addr` can be used to circumvent NAT issues.
 
 #### Requirements
 
@@ -270,6 +288,12 @@ The sending node:
   - SHOULD NOT set features greater than 13 in `globalfeatures`.
   - SHOULD use the minimum length required to represent the `features` field.
   - SHOULD set `networks` to all chains it will gossip or open channels for.
+  - SHOULD set `remote_addr` to reflect the remote IP address (and port) of an
+    incoming connection, if the node is the receiver and the connection was done
+    via IP.
+  - if it sets `remote_addr`:
+    - MUST set it to a valid `address descriptor` (1 byte type and data) as described in [BOLT 7](07-routing-gossip.md#the-node_announcement-message).
+    - SHOULD NOT set private addresses as `remote_addr`.
 
 The receiving node:
   - MUST wait to receive `init` before sending any other messages.
@@ -278,11 +302,12 @@ The receiving node:
   - upon receiving unknown _odd_ feature bits that are non-zero:
     - MUST ignore the bit.
   - upon receiving unknown _even_ feature bits that are non-zero:
-    - MUST fail the connection.
+    - MUST close the connection.
   - upon receiving `networks` containing no common chains
-    - MAY fail the connection.
+    - MAY close the connection.
   - if the feature vector does not set all known, transitive dependencies:
-    - MUST fail the connection.
+    - MUST close the connection.
+  - MAY use the `remote_addr` to update its `node_announcement`
 
 #### Rationale
 
@@ -299,7 +324,7 @@ support a single network, the `networks` fields avoids nodes
 erroneously believing they will receive updates about their preferred
 network, or that they can open channels.
 
-### The `error` Message
+### The `error` and `warning` Messages
 
 For simplicity of diagnosis, it's often useful to tell a peer that something is incorrect.
 
@@ -309,7 +334,11 @@ For simplicity of diagnosis, it's often useful to tell a peer that something is 
    * [`u16`:`len`]
    * [`len*byte`:`data`]
 
-The 2-byte `len` field indicates the number of bytes in the immediately following field.
+1. type: 1 (`warning`)
+2. data:
+   * [`channel_id`:`channel_id`]
+   * [`u16`:`len`]
+   * [`len*byte`:`data`]
 
 #### Requirements
 
@@ -324,24 +353,31 @@ The fundee node:
     - MUST use `temporary_channel_id` in lieu of `channel_id`.
 
 A sending node:
-  - when sending `error`:
-    - MUST fail the channel referred to by the error message.
   - SHOULD send `error` for protocol violations or internal errors that make channels unusable or that make further communication unusable.
   - SHOULD send `error` with the unknown `channel_id` in reply to messages of type `32`-`255` related to unknown channels.
+  - when sending `error`:
+    - MUST fail the channel(s) referred to by the error message.
+    - MAY set `channel_id` to all zero to indicate all channels.
+  - when sending `warning`:
+    - MAY set `channel_id` to all zero if the warning is not related to a specific channel.
+  - MAY close the connection after sending.
   - MAY send an empty `data` field.
   - when failure was caused by an invalid signature check:
     - SHOULD include the raw, hex-encoded transaction in reply to a `funding_created`, `funding_signed`, `closing_signed`, or `commitment_signed` message.
-  - when `channel_id` is 0:
-    - MUST fail all channels with the receiving node.
-    - MUST close the connection.
-  - MUST set `len` equal to the length of `data`.
 
 The receiving node:
   - upon receiving `error`:
-    - MUST fail the channel referred to by the error message, if that channel is with the sending node.
-  - if no existing channel is referred to by the message:
+    - if `channel_id` is all zero:
+      - MUST fail all channels with the sending node.
+    - otherwise:
+      - MUST fail the channel referred to by `channel_id`, if that channel is with the sending node.
+  - upon receiving `warning`:
+    - SHOULD log the message for later diagnosis.
+    - MAY disconnect.
+    - MAY reconnect after some delay to retry.
+    - MAY attempt `shutdown` if permitted at this point.
+  - if no existing channel is referred to by `channel_id`:
     - MUST ignore the message.
-  - MUST truncate `len` to the remainder of the packet (if it's larger).
   - if `data` is not composed solely of printable ASCII characters (For reference: the printable character set includes byte values 32 through 126, inclusive):
     - SHOULD NOT print out `data` verbatim.
 
@@ -351,6 +387,11 @@ There are unrecoverable errors that require an abort of conversations;
 if the connection is simply dropped, then the peer may retry the
 connection. It's also useful to describe protocol violations for
 diagnosis, as this indicates that one peer has a bug.
+
+On the other hand, overuse of error messages has lead to
+implementations ignoring them (to avoid an otherwise expensive channel
+break), so the "warning" message was added to allow some degree of
+retry or recovery for spurious errors.
 
 It may be wise not to distinguish errors in production settings, lest
 it leak information — hence, the optional `data` field.
@@ -387,9 +428,8 @@ A node sending a `ping` message:
   - MUST NOT set `ignored` to sensitive data such as secrets or portions of initialized
 memory.
   - if it doesn't receive a corresponding `pong`:
-    - MAY terminate the network connection,
+    - MAY close the network connection,
       - and MUST NOT fail the channels in this case.
-  - SHOULD NOT send `ping` messages more often than once every 30 seconds.
 
 A node sending a `pong` message:
   - SHOULD set `ignored` to 0s.
@@ -397,7 +437,6 @@ A node sending a `pong` message:
  memory.
 
 A node receiving a `ping` message:
-  - SHOULD fail the channels if it has received significantly in excess of one `ping` per 30 seconds.
   - if `num_pong_bytes` is less than 65532:
     - MUST respond by sending a `pong` message, with `byteslen` equal to `num_pong_bytes`.
   - otherwise (`num_pong_bytes` is **not** less than 65532):
@@ -405,7 +444,7 @@ A node receiving a `ping` message:
 
 A node receiving a `pong` message:
   - if `byteslen` does not correspond to any `ping`'s `num_pong_bytes` value it has sent:
-    - MAY fail the channels.
+    - MAY close the connection.
 
 ### Rationale
 
@@ -671,7 +710,7 @@ The following tests assume that two separate TLV namespaces exist: n1 and n2.
 
 The n1 namespace supports the following TLV types:
 
-1. tlvs: `n1`
+1. `tlv_stream`: `n1`
 2. types:
    1. type: 1 (`tlv1`)
    2. data:
@@ -690,7 +729,7 @@ The n1 namespace supports the following TLV types:
 
 The n2 namespace supports the following TLV types:
 
-1. tlvs: `n2`
+1. `tlv_stream`: `n2`
 2. types:
    1. type: 0 (`tlv1`)
    2. data:
@@ -911,13 +950,13 @@ message. The base `init` message (without extensions) for these examples is
 The following `init` messages are valid:
 
 - `0x001000000000`: no extension provided
-- `0x00100000000001012a030104`: the extension contains two _odd_ TLV records (with types `0x01` and `0x03`)
+- `0x001000000000c9012acb0104`: the extension contains two unknown _odd_ TLV records (with types `0xc9` and `0xcb`)
 
 The following `init` messages are invalid:
 
 - `0x00100000000001`: the extension is present but truncated
-- `0x00100000000002012a`: the extension contains unknown _even_ TLV records (assuming that TLV type `0x02` is unknown)
-- `0x001000000000010101010102`: the extension TLV stream is invalid (duplicate TLV record type `0x01`)
+- `0x001000000000ca012a`: the extension contains unknown _even_ TLV records (assuming that TLV type `0xca` is unknown)
+- `0x001000000000c90101c90102`: the extension TLV stream is invalid (duplicate TLV record type `0xc9`)
 
 Note that when messages are signed, the _extension_ is part of the signed bytes.
 Nodes should store the _extension_ bytes even if they don't understand them to

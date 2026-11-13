@@ -1,20 +1,17 @@
 #ifndef LIGHTNING_LIGHTNINGD_MEMDUMP_H
 #define LIGHTNING_LIGHTNINGD_MEMDUMP_H
 #include "config.h"
-#include <ccan/short_types/short_types.h>
-#include <stdbool.h>
 
 struct command;
-struct htable;
-struct strmap;
+struct leak_detect;
 struct subd;
+struct subd_req;
 
-void opening_memleak_done(struct command *cmd, struct subd *leaker);
-void peer_memleak_done(struct command *cmd, struct subd *leaker);
+/* Start a leak request: decrements num_outstanding_requests when freed. */
+void start_leak_request(const struct subd_req *req,
+			struct leak_detect *leak_detect);
 
-/* Remove any pointers inside this strmap (which is opaque to memleak). */
-#define memleak_remove_strmap(memtable, strmap) \
-	memleak_remove_strmap_((memtable), tcon_unwrap(strmap))
-void memleak_remove_strmap_(struct htable *memtable, const struct strmap *m);
+/* Yep, found a leak in this subd. */
+void report_subd_memleak(struct leak_detect *leak_detect, struct subd *leaker);
 
 #endif /* LIGHTNING_LIGHTNINGD_MEMDUMP_H */

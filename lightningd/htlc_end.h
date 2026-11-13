@@ -2,12 +2,9 @@
 #define LIGHTNING_LIGHTNINGD_HTLC_END_H
 #include "config.h"
 #include <ccan/htable/htable_type.h>
-#include <ccan/short_types/short_types.h>
 #include <ccan/time/time.h>
-#include <common/amount.h>
 #include <common/htlc_state.h>
 #include <common/sphinx.h>
-#include <wire/onion_wire.h>
 
 /* We look up HTLCs by channel & id */
 struct htlc_key {
@@ -50,11 +47,20 @@ struct htlc_in {
         struct timeabs received_time;
 
 	/* If it was blinded. */
-	struct pubkey *blinding;
-	/* Only set if blinding != NULL */
-	struct secret blinding_ss;
+	struct pubkey *path_key;
 	/* true if we supplied the preimage */
 	bool *we_filled;
+	/* true if we immediately fail the htlc (too much dust) */
+	bool fail_immediate;
+
+	/* A simple text annotation shown in `listpeers` */
+	char *status;
+
+	/* The decoded onion payload after hooks processed it. */
+	struct onion_payload *payload;
+
+	/* Incommimg extra update_add_htlc_tlv tlvs */
+	struct tlv_field *extra_tlvs;
 };
 
 struct htlc_out {
@@ -85,14 +91,27 @@ struct htlc_out {
 	/* Is this a locally-generated payment?  Implies ->in is NULL. */
 	bool am_origin;
 
+	/* Amount of fees that this out htlc pays (if am_origin);
+	 * otherwise fees collected by routing this out */
+	struct amount_msat fees;
+
 	/* If am_origin, this is the partid of the payment. */
 	u64 partid;
+
+	/* Is this is part of a group of HTLCs, which group is it? */
+	u64 groupid;
 
 	/* Where it's from, if not going to us. */
 	struct htlc_in *in;
 
-	/* Blinding to send alongside, if any. */
-	struct pubkey *blinding;
+	/* Path_Key to send alongside, if any. */
+	struct pubkey *path_key;
+
+	/* Timer we use in case they don't add an HTLC in a timely manner. */
+	struct oneshot *timeout;
+
+	/* Extra tlvs that are extended to the update_add_htlc_tlvs */
+	struct tlv_field *extra_tlvs;
 };
 
 static inline const struct htlc_key *keyof_htlc_in(const struct htlc_in *in)
@@ -119,11 +138,11 @@ static inline bool htlc_out_eq(const struct htlc_out *out,
 }
 
 
-HTABLE_DEFINE_TYPE(struct htlc_in, keyof_htlc_in, hash_htlc_key, htlc_in_eq,
-		   htlc_in_map);
+HTABLE_DEFINE_NODUPS_TYPE(struct htlc_in, keyof_htlc_in, hash_htlc_key, htlc_in_eq,
+			  htlc_in_map);
 
-HTABLE_DEFINE_TYPE(struct htlc_out, keyof_htlc_out, hash_htlc_key, htlc_out_eq,
-		   htlc_out_map);
+HTABLE_DEFINE_NODUPS_TYPE(struct htlc_out, keyof_htlc_out, hash_htlc_key, htlc_out_eq,
+			  htlc_out_map);
 
 struct htlc_in *find_htlc_in(const struct htlc_in_map *map,
 			     const struct channel *channel,
@@ -143,9 +162,10 @@ struct htlc_in *new_htlc_in(const tal_t *ctx,
 			    struct amount_msat msat, u32 cltv_expiry,
 			    const struct sha256 *payment_hash,
 			    const struct secret *shared_secret TAKES,
-			    const struct pubkey *blinding TAKES,
-			    const struct secret *blinding_ss,
-			    const u8 *onion_routing_packet);
+			    const struct pubkey *path_key TAKES,
+			    const u8 *onion_routing_packet,
+			    const struct tlv_field *extra_tlvs TAKES,
+			    bool fail_immediate);
 
 /* You need to set the ID, then connect_htlc_out this! */
 struct htlc_out *new_htlc_out(const tal_t *ctx,
@@ -154,9 +174,12 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 			      u32 cltv_expiry,
 			      const struct sha256 *payment_hash,
 			      const u8 *onion_routing_packet,
-			      const struct pubkey *blinding,
+			      const struct pubkey *path_key,
+			      const struct tlv_field *extra_tlvs,
 			      bool am_origin,
+			      struct amount_msat final_msat,
 			      u64 partid,
+			      u64 groupid,
 			      struct htlc_in *in);
 
 void connect_htlc_in(struct htlc_in_map *map, struct htlc_in *hin);

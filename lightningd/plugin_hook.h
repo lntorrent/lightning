@@ -2,11 +2,7 @@
 #define LIGHTNING_LIGHTNINGD_PLUGIN_HOOK_H
 
 #include "config.h"
-#include <ccan/autodata/autodata.h>
-#include <ccan/tal/tal.h>
-#include <ccan/typesafe_cb/typesafe_cb.h>
-#include <common/json_stream.h>
-#include <lightningd/lightningd.h>
+#include <common/json_parse_simple.h>
 #include <lightningd/plugin.h>
 
 /**
@@ -49,11 +45,22 @@ struct plugin_hook {
 	void (*final_cb)(void *arg);
 
 	/* To send the payload to the plugin */
-	void (*serialize_payload)(void *src, struct json_stream *dest);
+	void (*serialize_payload)(void *src, struct json_stream *dest,
+				  struct plugin *plugin);
+
+	/* Type of filters we allow (JSMN_UNDEFINED means none) */
+	jsmntype_t filter_type;
 
 	/* Which plugins have registered this hook? This is a `tal_arr`
 	 * initialized at creation. */
 	struct hook_instance **hooks;
+
+	/* Reference count for using the hook right now */
+	size_t num_users;
+
+	/* If someone was using the hooks while we were trying to update,
+	 * we put the hook here for later use. */
+	struct hook_instance **new_hooks;
 };
 AUTODATA_TYPE(hooks, struct plugin_hook);
 
@@ -63,7 +70,11 @@ AUTODATA_TYPE(hooks, struct plugin_hook);
  * Returns true if callback called immediately, otherwise false if it's
  * still waiting on a plugin response.
  */
-bool plugin_hook_call_(struct lightningd *ld, const struct plugin_hook *hook,
+bool plugin_hook_call_(struct lightningd *ld,
+		       struct plugin_hook *hook,
+		       const char *strfilterfield TAKES,
+		       u64 intfilterfield,
+		       const char *cmd_id TAKES,
 		       tal_t *cb_arg STEALS);
 
 /* Generic deserialize_cb: returns true iff 'result': 'continue' */
@@ -75,11 +86,25 @@ bool plugin_hook_continue(void *arg, const char *buffer, const jsmntok_t *toks);
  * the method-name is correct for the call.
  */
 /* FIXME: Find a way to avoid back-to-back declaration and definition */
-#define PLUGIN_HOOK_CALL_DEF(name, cb_arg_type)				       \
+#define PLUGIN_HOOK_CALL_DEF_NOFILTER(name, cb_arg_type)				       \
 	UNNEEDED static inline bool plugin_hook_call_##name(                   \
-	    struct lightningd *ld, cb_arg_type cb_arg STEALS)                  \
+		struct lightningd *ld, const char *cmd_id TAKES, cb_arg_type cb_arg STEALS) \
 	{                                                                      \
-		return plugin_hook_call_(ld, &name##_hook_gen, cb_arg);        \
+		return plugin_hook_call_(ld, &name##_hook_gen, NULL, 0, cmd_id, cb_arg); \
+	}
+
+#define PLUGIN_HOOK_CALL_DEF_STRFILTER(name, cb_arg_type)				       \
+	UNNEEDED static inline bool plugin_hook_call_##name(                   \
+		struct lightningd *ld, const char *strfilterfield, const char *cmd_id TAKES, cb_arg_type cb_arg STEALS) \
+	{                                                                      \
+		return plugin_hook_call_(ld, &name##_hook_gen, strfilterfield, 0, cmd_id, cb_arg); \
+	}
+
+#define PLUGIN_HOOK_CALL_DEF_INTFILTER(name, cb_arg_type)				       \
+	UNNEEDED static inline bool plugin_hook_call_##name(                   \
+		struct lightningd *ld, u64 intfilterfield, const char *cmd_id TAKES, cb_arg_type cb_arg STEALS) \
+	{                                                                      \
+		return plugin_hook_call_(ld, &name##_hook_gen, NULL, intfilterfield, cmd_id, cb_arg); \
 	}
 
 /* Typechecked registration of a plugin hook. We check that the
@@ -90,28 +115,45 @@ bool plugin_hook_continue(void *arg, const char *buffer, const jsmntok_t *toks);
  * response_cb function accepts the deserialized response format and
  * an arbitrary extra argument used to maintain context.
  */
-#define REGISTER_PLUGIN_HOOK(name, deserialize_cb, final_cb,                   \
-			     serialize_payload, cb_arg_type)		       \
+#define REGISTER_PLUGIN_HOOK2(name, filter_type, deserialize_cb, final_cb,     \
+			     serialize_payload, cb_arg_type)                   \
 	struct plugin_hook name##_hook_gen = {                                 \
 	    stringify(name),                                                   \
 	    typesafe_cb_cast(                                                  \
 		bool (*)(void *, const char *, const jsmntok_t *),             \
 		bool (*)(cb_arg_type, const char *, const jsmntok_t *),        \
 		deserialize_cb),                                               \
+	    typesafe_cb_cast(void (*)(void *STEALS),                           \
+			     void (*)(cb_arg_type STEALS), final_cb),          \
 	    typesafe_cb_cast(                                                  \
-		void (*)(void *STEALS),	                                       \
-		void (*)(cb_arg_type STEALS),                                  \
-		final_cb),                                                     \
-	    typesafe_cb_cast(void (*)(void *, struct json_stream *),           \
-			     void (*)(cb_arg_type, struct json_stream *),      \
-			     serialize_payload),                               \
-	    NULL, /* .plugins */                                               \
+		void (*)(void *, struct json_stream *, struct plugin *),       \
+		void (*)(cb_arg_type, struct json_stream *, struct plugin *),  \
+		serialize_payload),                                            \
+	    (filter_type),						       \
+ 	    NULL, /* .plugins */                                               \
 	};                                                                     \
-	AUTODATA(hooks, &name##_hook_gen);                                     \
-	PLUGIN_HOOK_CALL_DEF(name, cb_arg_type)
+	AUTODATA(hooks, &name##_hook_gen)
 
-struct plugin_hook *plugin_hook_register(struct plugin *plugin,
-					 const char *method);
+#define REGISTER_PLUGIN_HOOK(name, deserialize_cb, final_cb,		\
+			      serialize_payload, cb_arg_type)		\
+	REGISTER_PLUGIN_HOOK2(name, JSMN_UNDEFINED, deserialize_cb, final_cb, serialize_payload, cb_arg_type); \
+	PLUGIN_HOOK_CALL_DEF_NOFILTER(name, cb_arg_type)
+
+#define REGISTER_PLUGIN_HOOK_STRFILTER(name, deserialize_cb, final_cb,		\
+				       serialize_payload, cb_arg_type) \
+	REGISTER_PLUGIN_HOOK2(name, JSMN_STRING, deserialize_cb, final_cb, serialize_payload, cb_arg_type) \
+	PLUGIN_HOOK_CALL_DEF_STRFILTER(name, cb_arg_type)
+
+#define REGISTER_PLUGIN_HOOK_INTFILTER(name, deserialize_cb, final_cb,		\
+				       serialize_payload, cb_arg_type) \
+	REGISTER_PLUGIN_HOOK2(name, JSMN_PRIMITIVE, deserialize_cb, final_cb, serialize_payload, cb_arg_type) \
+	PLUGIN_HOOK_CALL_DEF_INTFILTER(name, cb_arg_type)
+
+/* Returns the error, or NULL and populates *plugin_hook */
+const char *plugin_hook_register(struct plugin *plugin,
+				 const char *method,
+				 const char *buf, const jsmntok_t *filterstok,
+				 struct plugin_hook **plugin_hook);
 
 /* Special sync plugin hook for db. */
 void plugin_hook_db_sync(struct db *db);
@@ -124,6 +166,7 @@ void plugin_hook_add_deps(struct plugin_hook *hook,
 			  const jsmntok_t *after);
 
 /* Returns array of plugins which cannot be ordered (empty on success) */
-struct plugin **plugin_hooks_make_ordered(const tal_t *ctx);
+struct plugin **plugin_hooks_make_ordered(const tal_t *ctx,
+					  struct logger *log);
 
 #endif /* LIGHTNING_LIGHTNINGD_PLUGIN_HOOK_H */

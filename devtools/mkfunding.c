@@ -6,17 +6,14 @@
  *
  * lightning/devtools/mkfunding 16835ac8c154b616baac524163f41fb0c4f82c7b972ad35d4d6f18d854f6856b 3 0.03btc 253 16c5027616e940d1e72b4c172557b3b799a93c0582f924441174ea556aadd01c 0000000000000000000000000000000000000000000000000000000000000050 0000000000000000000000000000000000000000000000000000000000000060
  */
-#include <bitcoin/address.h>
+#include "config.h"
 #include <bitcoin/script.h>
-#include <bitcoin/tx.h>
 #include <ccan/err/err.h>
 #include <ccan/str/hex/hex.h>
-#include <common/amount.h>
 #include <common/derive_basepoints.h>
 #include <common/initial_commit_tx.h>
-#include <common/keyset.h>
+#include <common/setup.h>
 #include <common/status.h>
-#include <common/type_to_string.h>
 #include <common/utxo.h>
 #include <stdio.h>
 
@@ -45,8 +42,8 @@ static struct bitcoin_tx *tx_spending_utxo(const tal_t *ctx,
 	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, num_output,
 					   nlocktime);
 
-	assert(!utxo->is_p2sh);
-	bitcoin_tx_add_input(tx, &utxo->txid, utxo->outnum,
+	assert(utxo->utxotype != UTXO_P2SH_P2WPKH);
+	bitcoin_tx_add_input(tx, &utxo->outpoint,
 			     nsequence, NULL, utxo->amount,
 			     utxo->scriptPubkey, NULL);
 
@@ -89,7 +86,7 @@ int main(int argc, char *argv[])
 	struct bitcoin_txid txid;
 	u8 **witnesses;
 
-	setup_locale();
+	common_setup(argv[0]);
 	chainparams = chainparams_for_network("bitcoin");
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY |
@@ -98,15 +95,15 @@ int main(int argc, char *argv[])
 	if (argc != 1 + 7)
 		errx(1, "Usage: mkfunding <input-txid> <input-txout> <input-amount> <feerate-per-kw> <input-privkey> <local-funding-privkey> <remote-funding-privkey>");
 
-	input.is_p2sh = false;
+	input.utxotype = UTXO_P2WPKH;
 	input.close_info = NULL;
 
 	argnum = 1;
 	if (!bitcoin_txid_from_hex(argv[argnum],
-				   strlen(argv[argnum]), &input.txid))
+				   strlen(argv[argnum]), &input.outpoint.txid))
 		errx(1, "Bad input-txid");
 	argnum++;
-	input.outnum = atoi(argv[argnum++]);
+	input.outpoint.n = atoi(argv[argnum++]);
 	if (!parse_amount_sat(&input.amount, argv[argnum], strlen(argv[argnum])))
 		errx(1, "Bad input-amount");
 	argnum++;
@@ -143,8 +140,11 @@ int main(int argc, char *argv[])
 	fee = amount_tx_fee(feerate_per_kw, weight);
 	if (!amount_sat_sub(&funding_amount, input.amount, fee))
 		errx(1, "Input %s can't afford fee %s",
-		     type_to_string(NULL, struct amount_sat, &input.amount),
-		     type_to_string(NULL, struct amount_sat, &fee));
+		     fmt_amount_sat(NULL, input.amount),
+		     fmt_amount_sat(NULL, fee));
+
+	/* Find the P2WPKH script from input pubkey */
+	input.scriptPubkey = scriptpubkey_p2wpkh(NULL, &inputkey);
 
 	/* No change output, so we don't need a bip32 base. */
 	tx = funding_tx(NULL, &input, funding_amount,
@@ -164,13 +164,14 @@ int main(int argc, char *argv[])
 		printf("\t%s\n", tal_hex(NULL, witnesses[i]));
 	printf("# ]\n");
  	printf("# funding amount: %s\n",
-	       type_to_string(NULL, struct amount_sat, &funding_amount));
+	       fmt_amount_sat(NULL, funding_amount));
 
 	bitcoin_txid(tx, &txid);
  	printf("# funding txid: %s\n",
-	       type_to_string(NULL, struct bitcoin_txid, &txid));
+	       fmt_bitcoin_txid(NULL, &txid));
 
 	printf("tx: %s\n", tal_hex(NULL, linearize_tx(NULL, tx)));
+	common_shutdown();
 
 	return 0;
 }

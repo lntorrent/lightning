@@ -3,17 +3,11 @@
 #define LIGHTNING_COMMON_INITIAL_CHANNEL_H
 #include "config.h"
 
-#include <bitcoin/pubkey.h>
-#include <bitcoin/shadouble.h>
 #include <bitcoin/tx.h>
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
-#include <common/amount.h>
 #include <common/channel_config.h>
 #include <common/channel_id.h>
 #include <common/derive_basepoints.h>
 #include <common/htlc.h>
-#include <stdbool.h>
 
 struct signature;
 struct added_htlc;
@@ -22,8 +16,19 @@ struct fulfilled_htlc;
 
 /* View from each side */
 struct channel_view {
-	/* How much is owed to each side (includes pending changes) */
+	/* How much is owed to each side (includes pending changes).
+	 * The index of `owed` array is always relative to the machine
+	 * this code is running on, so REMOTE is always the other machine
+	 * and LOCAL is always this machine (regardless of view).
+	 *
+	 * For example:
+	 * view[REMOTE].owed[REMOTE] == view[LOCAL].owed[REMOTE]
+	 * view[REMOTE].owed[LOCAL] == view[LOCAL].owed[LOCAL]
+	 */
 	struct amount_msat owed[NUM_SIDES];
+	/* Lowest splice relative change amount of all candidate splices.
+	 * This will be 0 or negative -- never positive. */
+	s64 lowest_splice_amnt[NUM_SIDES];
 };
 
 struct channel {
@@ -32,14 +37,13 @@ struct channel {
 	struct channel_id cid;
 
 	/* Funding txid and output. */
-	struct bitcoin_txid funding_txid;
-	unsigned int funding_txout;
+	struct bitcoin_outpoint funding;
 
 	/* Keys used to spend funding tx. */
 	struct pubkey funding_pubkey[NUM_SIDES];
 
 	/* satoshis in from commitment tx */
-	struct amount_sat funding;
+	struct amount_sat funding_sats;
 
 	/* confirmations needed for locking funding */
 	u32 minimum_depth;
@@ -62,24 +66,32 @@ struct channel {
 	/* Fee changes, some which may be in transit */
 	struct fee_states *fee_states;
 
+	/* Blockheight changes, some which may be in transit
+	 * (option_will_fund)*/
+	struct height_states *blockheight_states;
+
 	/* What it looks like to each side. */
 	struct channel_view view[NUM_SIDES];
 
-	/* Is this using option_static_remotekey? */
-	bool option_static_remotekey;
+	/* Features which apply to this channel. */
+	struct channel_type *type;
 
-	/* Is this using option_anchor_outputs? */
-	bool option_anchor_outputs;
+	/* Are we using big channels? */
+	bool option_wumbo;
+
+	/* When the lease expires for the funds in this channel */
+	u32 lease_expiry;
 };
 
 /**
  * new_initial_channel: Given initial fees and funding, what is initial state?
  * @ctx: tal context to allocate return value from.
  * @cid: The channel's id.
- * @funding_txid: The commitment transaction id.
- * @funding_txout: The commitment transaction output number.
+ * @funding: The commitment transaction id/outnum
  * @minimum_depth: The minimum confirmations needed for funding transaction.
- * @funding_satoshis: The commitment transaction amount.
+ * @height_states: The blockheight update states.
+ * @lease_expiry: Block the lease expires.
+ * @funding_sats: The commitment transaction amount.
  * @local_msatoshi: The amount for the local side (remainder goes to remote)
  * @fee_states: The fee update states.
  * @local: local channel configuration
@@ -88,18 +100,19 @@ struct channel {
  * @remote_basepoints: remote basepoints.
  * @local_fundingkey: local funding key
  * @remote_fundingkey: remote funding key
- * @option_static_remotekey: was this created with option_static_remotekey?
- * @option_anchor_outputs: was this created with option_anchor_outputs?
+ * @type: type for this channel
+ * @option_wumbo: has peer currently negotiated wumbo?
  * @opener: which side initiated it.
  *
  * Returns channel, or NULL if malformed.
  */
 struct channel *new_initial_channel(const tal_t *ctx,
 				    const struct channel_id *cid,
-				    const struct bitcoin_txid *funding_txid,
-				    unsigned int funding_txout,
+				    const struct bitcoin_outpoint *funding,
 				    u32 minimum_depth,
-				    struct amount_sat funding,
+				    const struct height_states *height_states TAKES,
+				    u32 lease_expiry,
+				    struct amount_sat funding_sats,
 				    struct amount_msat local_msatoshi,
 				    const struct fee_states *fee_states TAKES,
 				    const struct channel_config *local,
@@ -108,8 +121,8 @@ struct channel *new_initial_channel(const tal_t *ctx,
 				    const struct basepoints *remote_basepoints,
 				    const struct pubkey *local_funding_pubkey,
 				    const struct pubkey *remote_funding_pubkey,
-				    bool option_static_remotekey,
-				    bool option_anchor_outputs,
+				    const struct channel_type *type TAKES,
+				    bool option_wumbo,
 				    enum side opener);
 
 /**
@@ -133,6 +146,17 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				      struct wally_tx_output *direct_outputs[NUM_SIDES],
 				      char** err_reason);
 
+/* channel_update_funding: Changes the funding for the channel and updates the
+ * balance by the difference between `old_local_funding_msatoshi` and
+ * `new_local_funding_msatoshi`.
+ *
+ * Returns NULL on success or an error on failure.
+ */
+const char *channel_update_funding(struct channel *channel,
+				   const struct bitcoin_outpoint *funding,
+				   struct amount_sat funding_sats,
+				   s64 splice_amnt);
+
 /**
  * channel_feerate: Get fee rate for this side of channel.
  * @channel: The channel
@@ -140,4 +164,26 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
  */
 u32 channel_feerate(const struct channel *channel, enum side side);
 
+/**
+ * channel_blockheight: Get blockheight for this side of channel.
+ * @channel: The channel
+ * @side: the side
+ */
+u32 channel_blockheight(const struct channel *channel, enum side side);
+
+/* What can we upgrade to?  (Returns NULL if none). */
+struct channel_type *channel_upgradable_type(const tal_t *ctx,
+					     const struct channel *channel);
+
+/* What channel type do we want? */
+struct channel_type *channel_desired_type(const tal_t *ctx,
+					  const struct channel *channel);
+
+/* Convenience for querying channel->type */
+bool channel_has(const struct channel *channel, int feature);
+
+/* Convenience for querying either anchor_outputs or anchors_zero_fee_htlc_tx */
+bool channel_has_anchors(const struct channel *channel);
+
+char *fmt_channel(const tal_t *ctx, const struct channel *channel);
 #endif /* LIGHTNING_COMMON_INITIAL_CHANNEL_H */

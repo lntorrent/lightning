@@ -1,28 +1,18 @@
 #include "config.h"
-#include <arpa/inet.h>
-#include <assert.h>
-#include <ccan/err/err.h>
-#include <ccan/io/io.h>
 #include <ccan/rbuf/rbuf.h>
 #include <ccan/read_write_all/read_write_all.h>
-#include <ccan/str/hex/hex.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/str/str.h>
 #include <common/base64.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/wireaddr.h>
 #include <connectd/tor_autoservice.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <lightningd/log.h>
 #include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <unistd.h>
-#include <wire/wire.h>
 
+int tor_service_fd = -1;
 
 static void *buf_resize(struct membuf *mb, void *buf, size_t len)
 {
@@ -96,7 +86,6 @@ static void discard_remaining_response(struct rbuf *rbuf)
 static struct wireaddr *make_onion(const tal_t *ctx,
 				   struct rbuf *rbuf,
 				   const struct wireaddr *local,
-				   bool use_v3_autotor,
 				   u16 port)
 {
 	char *line;
@@ -111,28 +100,21 @@ static struct wireaddr *make_onion(const tal_t *ctx,
 		if (!strstarts(line, "VERSION Tor="))
 			continue;
 
-		if (use_v3_autotor)
-			if (strstr(line, "\"0.0") ||
-				strstr(line, "\"0.1") ||
-				strstr(line, "\"0.2") ||
-				strstr(line, "\"0.3")) {
-						use_v3_autotor = false;
-						status_unusual("Autotor: fallback to try a V2 onion service, your Tor version is smaller than 0.4.x.x");
-			}
-	};
-
-	if (!use_v3_autotor) {
-		tor_send_cmd(rbuf,
-		     tal_fmt(tmpctx, "ADD_ONION NEW:RSA1024 Port=%d,%s Flags=DiscardPK,Detach",
-			     port, fmt_wireaddr(tmpctx, local)));
-	} else {
-		tor_send_cmd(rbuf,
-		     tal_fmt(tmpctx, "ADD_ONION NEW:ED25519-V3 Port=%d,%s Flags=DiscardPK,Detach",
-			     port, fmt_wireaddr(tmpctx, local)));
+		if (strstr(line, "\"0.0") ||
+		    strstr(line, "\"0.1") ||
+		    strstr(line, "\"0.2") ||
+		    strstr(line, "\"0.3")) {
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Autotor: your Tor version is smaller than 0.4.x.x");
+		}
 	}
 
+	tor_send_cmd(rbuf,
+		     tal_fmt(tmpctx, "ADD_ONION NEW:ED25519-V3 Port=%d,%s Flags=DiscardPK,Detach",
+			     port, fmt_wireaddr(tmpctx, local)));
+
 	while ((line = tor_response_line(rbuf)) != NULL) {
-		const char *name;
+		const char *name, *err;
 
 		if (!strstarts(line, "ServiceID="))
 			continue;
@@ -143,9 +125,10 @@ static struct wireaddr *make_onion(const tal_t *ctx,
 
 		name = tal_fmt(tmpctx, "%s.onion", line);
 		onion = tal(ctx, struct wireaddr);
-		if (!parse_wireaddr(name, onion, local->port, false, NULL))
+		err = parse_wireaddr(tmpctx, name, local->port, NULL, onion);
+		if (err)
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Tor gave bad onion name '%s'", name);
+				      "Tor gave bad onion name '%s': %s", name, err);
 		status_info("New autotor service onion address: \"%s:%d\" bound from extern port:%d", name, local->port, port);
 		discard_remaining_response(rbuf);
 		return onion;
@@ -156,7 +139,7 @@ static struct wireaddr *make_onion(const tal_t *ctx,
 
 static struct wireaddr *make_fixed_onion(const tal_t *ctx,
 				   struct rbuf *rbuf,
-				   const struct wireaddr *local, const u8 *blob, u16 port)
+				   const struct wireaddr *local, const char *blob, u16 port)
 {
 	char *line;
 	struct wireaddr *onion;
@@ -169,7 +152,7 @@ static struct wireaddr *make_fixed_onion(const tal_t *ctx,
 			 blob64, port, fmt_wireaddr(tmpctx, local)));
 
 	while ((line = tor_response_line_wfail(rbuf))) {
-		const char *name;
+		const char *name, *err;
 		if (strstarts(line, "Onion address collision"))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Tor address in use");
@@ -183,9 +166,10 @@ static struct wireaddr *make_fixed_onion(const tal_t *ctx,
 
 		name = tal_fmt(tmpctx, "%s.onion", line);
 		onion = tal(ctx, struct wireaddr);
-		if (!parse_wireaddr(name, onion, local->port, false, NULL))
+		err = parse_wireaddr(tmpctx, name, port, false, onion);
+		if (err)
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Tor gave bad onion name '%s'", name);
+				      "Tor gave bad onion name '%s': %s", name, err);
 		#ifdef SUPERVERBOSE
 		 status_info("Static Tor service onion address: \"%s:%d,%s\"from blob %s base64 %s ",
 						name, port ,fmt_wireaddr(tmpctx, local), blob ,blob64);
@@ -217,7 +201,7 @@ static void negotiate_auth(struct rbuf *rbuf, const char *tor_password)
 	tor_send_cmd(rbuf, "PROTOCOLINFO 1");
 
 	while ((line = tor_response_line(rbuf)) != NULL) {
-		const char *p;
+		char *p;
 
 		if (!strstarts(line, "AUTH METHODS="))
 			continue;
@@ -248,18 +232,15 @@ static void negotiate_auth(struct rbuf *rbuf, const char *tor_password)
 
 			/* If we can't access this, try other methods */
 			cookiefile = tal_strdup(tmpctx, p);
-			contents = grab_file(tmpctx, p);
+			contents = grab_file_raw(tmpctx, p);
 			if (!contents) {
 				cookiefileerrno = errno;
 				continue;
 			}
-			assert(tal_count(contents) != 0);
 			discard_remaining_response(rbuf);
 			tor_send_cmd(rbuf,
 				     tal_fmt(tmpctx, "AUTHENTICATE %s",
-					     tal_hexstr(tmpctx,
-							contents,
-							tal_count(contents)-1)));
+					     tal_hex(tmpctx, contents)));
 			discard_remaining_response(rbuf);
 			return;
 		}
@@ -275,50 +256,33 @@ static void negotiate_auth(struct rbuf *rbuf, const char *tor_password)
 		      "Tor protocolinfo did not give auth");
 }
 
-/* We need to have a bound address we can tell Tor to connect to */
-const struct wireaddr *
-find_local_address(const struct wireaddr_internal *bindings)
-{
-	for (size_t i = 0; i < tal_count(bindings); i++) {
-		if (bindings[i].itype != ADDR_INTERNAL_WIREADDR)
-			continue;
-		if (bindings[i].u.wireaddr.type != ADDR_TYPE_IPV4
-		    && bindings[i].u.wireaddr.type != ADDR_TYPE_IPV6)
-			continue;
-		return &bindings[i].u.wireaddr;
-	}
-	status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		      "No local address found to tell Tor to connect to");
-}
-
 struct wireaddr *tor_autoservice(const tal_t *ctx,
 				 const struct wireaddr_internal *tor_serviceaddr,
 				 const char *tor_password,
-				 const struct wireaddr_internal *bindings,
-				 const bool use_v3_autotor)
+				 const struct wireaddr *laddr)
 {
 	int fd;
-	const struct wireaddr *laddr;
 	struct wireaddr *onion;
 	struct addrinfo *ai_tor;
 	struct rbuf rbuf;
 	char *buffer;
 
-	laddr = find_local_address(bindings);
 	ai_tor = wireaddr_to_addrinfo(tmpctx, &tor_serviceaddr->u.torservice.address);
 
 	fd = socket(ai_tor->ai_family, SOCK_STREAM, 0);
 	if (fd < 0)
-		err(1, "Creating stream socket for Tor");
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Creating stream socket for Tor");
 
 	if (connect(fd, ai_tor->ai_addr, ai_tor->ai_addrlen) != 0)
-		err(1, "Connecting stream socket to Tor service");
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Connecting stream socket to Tor service");
 
 	buffer = tal_arr(tmpctx, char, rbuf_good_size(fd));
 	rbuf_init(&rbuf, fd, buffer, tal_count(buffer), buf_resize);
 
 	negotiate_auth(&rbuf, tor_password);
-	onion = make_onion(ctx, &rbuf, laddr, use_v3_autotor, tor_serviceaddr->u.torservice.port);
+	onion = make_onion(ctx, &rbuf, laddr, tor_serviceaddr->u.torservice.port);
 
 	/*on the other hand we can stay connected until ln finish to keep onion alive and then vanish */
 	//because when we run with Detach flag as we now do every start of LN creates a new addr while the old
@@ -333,7 +297,7 @@ struct wireaddr *tor_autoservice(const tal_t *ctx,
 struct wireaddr *tor_fixed_service(const tal_t *ctx,
 				 const struct wireaddr_internal *tor_serviceaddr,
 				 const char *tor_password,
-				 const u8 *blob,
+				 const char *blob,
 				 const struct wireaddr *bind,
 				 const u8 index)
 {
@@ -349,10 +313,12 @@ struct wireaddr *tor_fixed_service(const tal_t *ctx,
 
 	fd = socket(ai_tor->ai_family, SOCK_STREAM, 0);
 	if (fd < 0)
-		err(1, "Creating stream socket for Tor");
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Creating stream socket for Tor");
 
 	if (connect(fd, ai_tor->ai_addr, ai_tor->ai_addrlen) != 0)
-		err(1, "Connecting stream socket to Tor service");
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Connecting stream socket to Tor service");
 
 	buffer = tal_arr(tmpctx, char, rbuf_good_size(fd));
 	rbuf_init(&rbuf, fd, buffer, tal_count(buffer), buf_resize);
@@ -366,5 +332,6 @@ struct wireaddr *tor_fixed_service(const tal_t *ctx,
 	* read_partial to keep it open until LN drops
 	* DO NOT CLOSE FD TO KEEP ADDRESS ALIVE AS WE DO NOT DETACH WITH STATIC ADDRESS
 	*/
+	tor_service_fd = fd;
 	return onion;
 }

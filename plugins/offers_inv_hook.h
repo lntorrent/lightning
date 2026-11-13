@@ -3,9 +3,10 @@
 #include "config.h"
 #include <plugins/libplugin.h>
 
-/* We got an onionmessage with an invoice!  replytok could be NULL. */
+/* We got an onionmessage with an invoice!  reply_path could be NULL. */
 struct command_result *handle_invoice(struct command *cmd,
-				      const char *buf,
-				      const jsmntok_t *invtok,
-				      const jsmntok_t *replytok);
+				      const u8 *invbin,
+				      struct blinded_path *reply_path STEALS,
+				      const struct secret *secret);
+
 #endif /* LIGHTNING_PLUGINS_OFFERS_INV_HOOK_H */

@@ -1,15 +1,13 @@
-#include "privkey.h"
-#include "pubkey.h"
-#include "script.h"
-#include "shadouble.h"
-#include "signature.h"
-#include "tx.h"
+#include "config.h"
 #include <assert.h>
+#include <bitcoin/privkey.h>
 #include <bitcoin/psbt.h>
-#include <ccan/cast/cast.h>
+#include <bitcoin/pubkey.h>
+#include <bitcoin/signature.h>
+#include <bitcoin/tx.h>
 #include <ccan/mem/mem.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
+#include <secp256k1_schnorrsig.h>
 #include <wire/wire.h>
 
 #undef DEBUG
@@ -94,6 +92,8 @@ static bool sig_has_low_r(const secp256k1_ecdsa_signature* sig)
 	return compact_sig[0] < 0x80;
 }
 
+bool dev_no_signature_grind = false;
+
 void sign_hash(const struct privkey *privkey,
 	       const struct sha256_double *h,
 	       secp256k1_ecdsa_signature *s)
@@ -106,8 +106,12 @@ void sign_hash(const struct privkey *privkey,
 		ok = secp256k1_ecdsa_sign(secp256k1_ctx,
 					  s,
 					  h->sha.u.u8,
-					  privkey->secret.data, NULL, extra_entropy);
+					  privkey->secret.data, NULL,
+					  dev_no_signature_grind ? NULL
+					  : extra_entropy);
 		((u32 *)extra_entropy)[0]++;
+		if (dev_no_signature_grind)
+			break;
 	} while (!sig_has_low_r(s));
 
 	assert(ok);
@@ -207,8 +211,8 @@ bool check_tx_sig(const struct bitcoin_tx *tx, size_t input_num,
 	}
 	assert(input_num < tx->wtx->num_inputs);
 
-	dump_tx("check_tx_sig", tx, input_num, script, key, &hash);
 	bitcoin_tx_hash_for_sig(tx, input_num, script, sig->sighash_type, &hash);
+	dump_tx("check_tx_sig", tx, input_num, script, key, &hash);
 
 	ret = check_signed_hash(&hash, &sig->s, key);
 	if (!ret)
@@ -318,7 +322,7 @@ bool signature_from_der(const u8 *der, size_t len, struct bitcoin_signature *sig
 	return true;
 }
 
-char *fmt_signature(const tal_t *ctx, const secp256k1_ecdsa_signature *sig)
+char *fmt_secp256k1_ecdsa_signature(const tal_t *ctx, const secp256k1_ecdsa_signature *sig)
 {
 	u8 der[72];
 	size_t len = 72;
@@ -328,17 +332,15 @@ char *fmt_signature(const tal_t *ctx, const secp256k1_ecdsa_signature *sig)
 
 	return tal_hexstr(ctx, der, len);
 }
-REGISTER_TYPE_TO_STRING(secp256k1_ecdsa_signature, fmt_signature);
 
-static char *bitcoin_signature_to_hexstr(const tal_t *ctx,
-					 const struct bitcoin_signature *sig)
+char *fmt_bitcoin_signature(const tal_t *ctx,
+			    const struct bitcoin_signature *sig)
 {
 	u8 der[73];
 	size_t len = signature_to_der(der, sig);
 
 	return tal_hexstr(ctx, der, len);
 }
-REGISTER_TYPE_TO_STRING(bitcoin_signature, bitcoin_signature_to_hexstr);
 
 void fromwire_bitcoin_signature(const u8 **cursor, size_t *max,
 				struct bitcoin_signature *sig)
@@ -372,8 +374,6 @@ char *fmt_bip340sig(const tal_t *ctx, const struct bip340sig *bip340sig)
 	return tal_hexstr(ctx, bip340sig->u8, sizeof(bip340sig->u8));
 }
 
-REGISTER_TYPE_TO_HEXSTR(bip340sig);
-
 /* BIP-340:
  *
  * This proposal suggests to include the tag by prefixing the hashed
@@ -404,3 +404,27 @@ void bip340_sighash_init(struct sha256_ctx *sctx,
 	sha256_update(sctx, &taghash, sizeof(taghash));
 }
 
+
+bool check_schnorr_sig(const struct sha256 *hash,
+		       const secp256k1_pubkey *pubkey,
+		       const struct bip340sig *sig)
+{
+	/* FIXME: uuuugly!  There's no non-xonly verify function. */
+	u8 raw[PUBKEY_CMPR_LEN];
+	size_t outlen = sizeof(raw);
+	secp256k1_xonly_pubkey xonly_pubkey;
+
+	if (!secp256k1_ec_pubkey_serialize(secp256k1_ctx, raw, &outlen,
+					   pubkey,
+					   SECP256K1_EC_COMPRESSED))
+		abort();
+	assert(outlen == PUBKEY_CMPR_LEN);
+	if (!secp256k1_xonly_pubkey_parse(secp256k1_ctx, &xonly_pubkey, raw+1))
+		abort();
+
+ 	return secp256k1_schnorrsig_verify(secp256k1_ctx,
+ 					   sig->u8,
+ 					   hash->u.u8,
+ 					   sizeof(hash->u.u8),
+					   &xonly_pubkey) == 1;
+}

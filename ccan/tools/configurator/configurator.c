@@ -137,11 +137,14 @@ static const struct test base_tests[] = {
 	  "DEFINES_FUNC", NULL, NULL,
 	  "static int __attribute__((const)) func(int x) { return x; }" },
 	{ "HAVE_ATTRIBUTE_DEPRECATED", "__attribute__((deprecated)) support",
-	  "DEFINES_FUNC", NULL, NULL,
-	  "static int __attribute__((deprecated)) func(int x) { return x; }" },
+	  "OUTSIDE_MAIN", NULL, NULL,
+	  "int __attribute__((deprecated)) depr(int x);" },
 	{ "HAVE_ATTRIBUTE_NONNULL", "__attribute__((nonnull)) support",
 	  "DEFINES_FUNC", NULL, NULL,
 	  "static char *__attribute__((nonnull)) func(char *p) { return p; }" },
+	{ "HAVE_ATTRIBUTE_RETURNS_NONNULL", "__attribute__((returns_nonnull)) support",
+	  "DEFINES_FUNC", NULL, NULL,
+	  "static const char *__attribute__((returns_nonnull)) func(void) { return \"hi\"; }" },
 	{ "HAVE_ATTRIBUTE_SENTINEL", "__attribute__((sentinel)) support",
 	  "DEFINES_FUNC", NULL, NULL,
 	  "static int __attribute__((sentinel)) func(int i, ...) { return i; }" },
@@ -194,7 +197,7 @@ static const struct test base_tests[] = {
 	  "return __builtin_clzll(1) == (sizeof(long long)*8 - 1) ? 0 : 1;" },
 	{ "HAVE_BUILTIN_CTZ", "__builtin_ctz support",
 	  "INSIDE_MAIN", NULL, NULL,
-	  "return __builtin_ctz(1 << (sizeof(int)*8 - 1)) == (sizeof(int)*8 - 1) ? 0 : 1;" },
+	  "return __builtin_ctz(1U << (sizeof(int)*8 - 1)) == (sizeof(int)*8 - 1) ? 0 : 1;" },
 	{ "HAVE_BUILTIN_CTZL", "__builtin_ctzl support",
 	  "INSIDE_MAIN", NULL, NULL,
 	  "return __builtin_ctzl(1UL << (sizeof(long)*8 - 1)) == (sizeof(long)*8 - 1) ? 0 : 1;" },
@@ -393,6 +396,9 @@ static const struct test base_tests[] = {
 	{ "HAVE_STATEMENT_EXPR", "statement expression support",
 	  "INSIDE_MAIN", NULL, NULL,
 	  "return ({ int x = argc; x == argc ? 0 : 1; });" },
+	{ "HAVE_STATIC_ASSERT", "_Static_assert support",
+	  "INSIDE_MAIN", NULL, NULL,
+	  "_Static_assert(1, \"OK\"); return 0;" },
 	{ "HAVE_SYS_FILIO_H", "<sys/filio.h>",
 	  "OUTSIDE_MAIN", NULL, NULL, /* Solaris needs this for FIONREAD */
 	  "#include <sys/filio.h>\n" },
@@ -410,7 +416,7 @@ static const struct test base_tests[] = {
 	  "#include <string.h>\n"
 	  "int main(int argc, char *argv[]) {\n"
 	  "	(void)argc;\n"
-	  "     char pad[sizeof(int *) * 1];\n"
+	  "     char pad[sizeof(int) + 1];\n"
 	  "	memcpy(pad, argv[0], sizeof(pad));\n"
 	  "	int *x = (int *)pad, *y = (int *)(pad + 1);\n"
 	  "	return *x == *y;\n"
@@ -468,7 +474,7 @@ static const struct test base_tests[] = {
 	  "#include <stddef.h>\n"
 	  "#include <ucontext.h>\n"
 	  "static int worked = 0;\n"
-	  "static char stack[1024];\n"
+	  "static char stack[8192];\n"
 	  "static ucontext_t a, b;\n"
 	  "static void fn(void *p, void *q) {\n"
 	  "	void *cp = &worked;\n"
@@ -494,6 +500,43 @@ static const struct test base_tests[] = {
 	  "static bool func(void) {\n"
 	  "	return __builtin_cpu_supports(\"mmx\");\n"
 	  "}"
+	},
+	{ "HAVE_CLOSEFROM", "closefrom() offered by system",
+	  "DEFINES_EVERYTHING", NULL, NULL,
+	  "#include <stdlib.h>\n"
+	  "#include <unistd.h>\n"
+	  "int main(void) {\n"
+	  "    closefrom(STDERR_FILENO + 1);\n"
+	  "    return 0;\n"
+	  "}\n"
+	},
+	{ "HAVE_F_CLOSEM", "F_CLOSEM defined for fctnl.",
+	  "DEFINES_EVERYTHING", NULL, NULL,
+	  "#include <fcntl.h>\n"
+	  "#include <unistd.h>\n"
+	  "int main(void) {\n"
+	  "    int res = fcntl(STDERR_FILENO + 1, F_CLOSEM, 0);\n"
+	  "    return res < 0;\n"
+	  "}\n"
+	},
+	{ "HAVE_NR_CLOSE_RANGE", "close_range syscall available as __NR_close_range.",
+	  "DEFINES_EVERYTHING", NULL, NULL,
+	  "#include <limits.h>\n"
+	  "#include <sys/syscall.h>\n"
+	  "#include <unistd.h>\n"
+	  "int main(void) {\n"
+	  "    int res = syscall(__NR_close_range, STDERR_FILENO + 1, INT_MAX, 0);\n"
+	  "    return res < 0;\n"
+	  "}\n"
+	},
+	{ "HAVE_F_MAXFD", "F_MAXFD defined for fcntl.",
+	  "DEFINES_EVERYTHING", NULL, NULL,
+	  "#include <fcntl.h>\n"
+	  "#include <unistd.h>\n"
+	  "int main(void) {\n"
+	  "    int res = fcntl(0, F_MAXFD);\n"
+	  "    return res < 0;\n"
+	  "}\n"
 	},
 };
 
@@ -757,14 +800,12 @@ static bool run_test(const char *cmd, const char *wrapper, struct test *test)
 		/* We run INSIDE_MAIN tests for sanity checking. */
 		if (strstr(test->style, "EXECUTE")
 		    || strstr(test->style, "INSIDE_MAIN")) {
-			char *cmd = malloc(strlen(wrapper) + strlen(" ." DIR_SEP OUTPUT_FILE) + 1);
+			char *runcmd = malloc(strlen(wrapper) + strlen(" ." DIR_SEP OUTPUT_FILE) + 1);
 
-			strcpy(cmd, wrapper);
-			strcat(cmd, " ." DIR_SEP OUTPUT_FILE);
-			output = run(cmd, &status);
-			if (wrapper) {
-				free(cmd);
-			}
+			strcpy(runcmd, wrapper);
+			strcat(runcmd, " ." DIR_SEP OUTPUT_FILE);
+			output = run(runcmd, &status);
+			free(runcmd);
 			if (!strstr(test->style, "EXECUTE") && status != 0)
 				c12r_errx(EXIT_BAD_TEST,
 					  "Test for %s failed with %i:\n%s",

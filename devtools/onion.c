@@ -2,24 +2,16 @@
 #include <assert.h>
 #include <ccan/mem/mem.h>
 #include <ccan/opt/opt.h>
-#include <ccan/read_write_all/read_write_all.h>
-#include <ccan/short_types/short_types.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/str/str.h>
-#include <common/amount.h>
 #include <common/ecdh.h>
-#include <common/json.h>
-#include <common/json_helpers.h>
-#include <common/onion.h>
+#include <common/json_parse.h>
+#include <common/onion_encode.h>
 #include <common/sphinx.h>
 #include <common/utils.h>
 #include <common/version.h>
 #include <err.h>
-#include <secp256k1.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
 
 /* We don't actually use this, but common/onion needs it */
 void ecdh(const struct pubkey *point, struct secret *ss)
@@ -44,7 +36,8 @@ static void do_generate(int argc, char **argv,
 
 	memset(&session_key, 'A', sizeof(struct secret));
 
-	sp = sphinx_path_new_with_key(ctx, assocdata, &session_key);
+	sp = sphinx_path_new_with_key(ctx, assocdata, tal_bytelen(assocdata),
+				      &session_key);
 	sphinx_path_set_rendezvous(sp, rvnode_id);
 
 	for (int i = 0; i < num_hops; i++) {
@@ -76,30 +69,24 @@ static void do_generate(int argc, char **argv,
 
 			if (!data)
 				errx(1, "bad hex after / in %s", argv[1 + i]);
-			sphinx_add_hop(sp, &path[i], data);
+			sphinx_add_hop_has_length(sp, &path[i], data);
 		} else {
 			struct short_channel_id scid;
 			struct amount_msat amt;
-			bool use_tlv = streq(argv[1 + i] + klen, "/tlv");
 
 			/* FIXME: support secret and and total_msat */
 			memset(&scid, i, sizeof(scid));
 			amt = amount_msat(i);
 			if (i == num_hops - 1)
-				sphinx_add_hop(sp, &path[i],
+				sphinx_add_hop_has_length(sp, &path[i],
 					       take(onion_final_hop(NULL,
-								    use_tlv,
 								    amt, i, amt,
-								    NULL, NULL,
-								    NULL)));
+								    NULL, NULL)));
 			else
-				sphinx_add_hop(sp, &path[i],
+				sphinx_add_hop_has_length(sp, &path[i],
 					       take(onion_nonfinal_hop(NULL,
-								       use_tlv,
 								       &scid,
-								       amt, i,
-								       NULL,
-								       NULL)));
+								       amt, i)));
 		}
 	}
 
@@ -130,7 +117,7 @@ static struct route_step *decode_with_privkey(const tal_t *ctx, const u8 *onion,
 	if (!hex_decode(hexprivkey, strlen(hexprivkey), &seckey, sizeof(seckey)))
 		errx(1, "Invalid private key hex '%s'", hexprivkey);
 
-	packet = parse_onionpacket(tmpctx, onion, TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE), &why_bad);
+	packet = parse_onionpacket(tmpctx, onion, tal_bytelen(onion), &why_bad);
 
 	if (!packet)
 		errx(1, "Error parsing message: %s", onion_wire_name(why_bad));
@@ -139,7 +126,7 @@ static struct route_step *decode_with_privkey(const tal_t *ctx, const u8 *onion,
 		errx(1, "Error creating shared secret.");
 
 	step = process_onionpacket(ctx, packet, &shared_secret, assocdata,
-				   tal_bytelen(assocdata), true);
+				   tal_bytelen(assocdata));
 	return step;
 
 }
@@ -147,21 +134,22 @@ static struct route_step *decode_with_privkey(const tal_t *ctx, const u8 *onion,
 static void do_decode(int argc, char **argv, const u8 *assocdata)
 {
 	const tal_t *ctx = talz(NULL, tal_t);
-	u8 serialized[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)];
+	u8 *serialized;
 	struct route_step *step;
 
 	if (argc != 4)
 		opt_usage_exit_fail("Expect an filename and privkey with 'decode' method");
 
 	/* "-" means stdin, which is NULL for grab_file */
-	char *hextemp = grab_file(ctx, streq(argv[2], "-") ? NULL : argv[2]);
+	char *hextemp = grab_file_str(ctx, streq(argv[2], "-") ? NULL : argv[2]);
 	size_t hexlen = strlen(hextemp);
 
 	// trim trailing whitespace
-	while (isspace(hextemp[hexlen-1]))
+	while (cisspace(hextemp[hexlen-1]))
 		hexlen--;
 
-	if (!hex_decode(hextemp, hexlen, serialized, sizeof(serialized))) {
+	serialized = tal_hexdata(hextemp, hextemp, hexlen);
+	if (!serialized) {
 		errx(1, "Invalid onion hex '%s'", hextemp);
 	}
 
@@ -188,9 +176,9 @@ static char *opt_set_ad(const char *arg, u8 **assocdata)
 	return NULL;
 }
 
-static void opt_show_ad(char buf[OPT_SHOW_LEN], u8 *const *assocdata)
+static bool opt_show_ad(char *buf, size_t len, u8 *const *assocdata)
 {
-	hex_encode(*assocdata, tal_bytelen(*assocdata), buf, OPT_SHOW_LEN);
+	return hex_encode(*assocdata, tal_bytelen(*assocdata), buf, len);
 }
 
 static char *opt_set_node_id(const char *arg, struct node_id *node_id)
@@ -205,7 +193,7 @@ static char *opt_set_node_id(const char *arg, struct node_id *node_id)
 static void runtest(const char *filename)
 {
 	const tal_t *ctx = tal(NULL, u8);
-	char *buffer = grab_file(ctx, filename);
+	char *buffer = grab_file_str(ctx, filename);
 	const jsmntok_t *toks, *session_key_tok, *associated_data_tok, *gentok,
 		*hopstok, *hop, *payloadtok, *pubkeytok, *typetok, *oniontok, *decodetok;
 	const u8 *associated_data, *session_key_raw, *payload, *serialized, *onion;
@@ -231,32 +219,19 @@ static void runtest(const char *filename)
 	associated_data = json_tok_bin_from_hex(ctx, buffer, associated_data_tok);
 	session_key_raw = json_tok_bin_from_hex(ctx, buffer, session_key_tok);
 	memcpy(&session_key, session_key_raw, sizeof(session_key));
-	path = sphinx_path_new_with_key(ctx, associated_data, &session_key);
+	path = sphinx_path_new_with_key(ctx, associated_data, tal_bytelen(associated_data),
+					&session_key);
 
 	/* Unpack the hops and build up the path */
 	hopstok = json_get_member(buffer, gentok, "hops");
 	json_for_each_arr(i, hop, hopstok) {
-		u8 *full;
-		size_t prepended;
-
 		payloadtok = json_get_member(buffer, hop, "payload");
 		typetok = json_get_member(buffer, hop, "type");
 		pubkeytok = json_get_member(buffer, hop, "pubkey");
 		payload = json_tok_bin_from_hex(ctx, buffer, payloadtok);
 		json_to_pubkey(buffer, pubkeytok, &pubkey);
-		if (!typetok || json_tok_streq(buffer, typetok, "legacy")) {
-			/* Legacy has a single 0 prepended as "realm" byte */
-			full = tal_arrz(ctx, u8, 33);
-			memcpy(full + 1, payload, tal_bytelen(payload));
-		} else {
-			/* TLV has length prepended */
-			full = tal_arr(ctx, u8, 0);
-			towire_bigsize(&full, tal_bytelen(payload));
-			prepended = tal_bytelen(full);
-			tal_resize(&full, prepended + tal_bytelen(payload));
-			memcpy(full + prepended, payload, tal_bytelen(payload));
-		}
-		sphinx_add_hop(path, &pubkey, full);
+		assert(json_tok_streq(buffer, typetok, "tlv"));
+		sphinx_add_hop(path, &pubkey, take(payload));
 	}
 	res = create_onionpacket(ctx, path, ROUTING_INFO_SIZE, &shared_secrets);
 	serialized = serialize_onionpacket(ctx, res);
@@ -268,8 +243,7 @@ static void runtest(const char *filename)
 
 	if (oniontok) {
 		onion = json_tok_bin_from_hex(ctx, buffer, oniontok);
-		if (!memeq(onion, tal_bytelen(onion), serialized,
-			   tal_bytelen(serialized)))
+		if (!tal_arr_eq(onion, serialized))
 			errx(1,
 			     "Generated does not match the expected onion: \n"
 			     "generated: %s\n"
@@ -281,20 +255,12 @@ static void runtest(const char *filename)
 	decodetok = json_get_member(buffer, toks, "decode");
 
 	json_for_each_arr(i, hop, decodetok) {
-		enum onion_payload_type type;
-		bool valid;
-
 		hexprivkey = json_strdup(ctx, buffer, hop);
 		printf("Processing at hop %zu\n", i);
 		step = decode_with_privkey(ctx, serialized, hexprivkey, associated_data);
 		serialized = serialize_onionpacket(ctx, step->next);
 		if (!serialized)
 			errx(1, "Error serializing message.");
-		onion_payload_length(step->raw_payload,
-				     tal_bytelen(step->raw_payload),
-				     true, &valid, &type);
-		assert(valid);
-		printf("  Type: %d\n", type);
 		printf("  Payload: %s\n", tal_hex(ctx, step->raw_payload));
 		printf("  Next onion: %s\n", tal_hex(ctx, serialized));
 		printf("  Next HMAC: %s\n",
@@ -337,7 +303,7 @@ static void decompress(char *hexprivkey, char *hexonion)
 		errx(1,
 		     "Could not generate shared secret from ephemeral key %s "
 		     "and private key %s",
-		     pubkey_to_hexstr(NULL, &ephkey), hexprivkey);
+		     fmt_pubkey(NULL, &ephkey), hexprivkey);
 
 	onion = sphinx_decompress(NULL, tinyonion, &shared_secret);
 	if (onion == NULL)

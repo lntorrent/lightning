@@ -5,12 +5,8 @@
 #include "bitcoin/privkey.h"
 #include "bitcoin/pubkey.h"
 
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
 #include <common/hmac.h>
-#include <secp256k1.h>
-#include <sodium/randombytes.h>
-#include <wire/onion_wire.h>
+#include <wire/onion_wiregen.h>
 
 struct node_id;
 
@@ -57,35 +53,10 @@ enum route_next_case {
  */
 struct sphinx_path;
 
-/* BOLT #4:
- *
- * ## Legacy `hop_data` payload format
- *
- * The `hop_data` format is identified by a single `0x00`-byte length,
- * for backward compatibility.  Its payload is defined as:
- *
- * 1. type: `hop_data` (for `realm` 0)
- * 2. data:
- *    * [`short_channel_id`:`short_channel_id`]
- *    * [`u64`:`amt_to_forward`]
- *    * [`u32`:`outgoing_cltv_value`]
- *    * [`12*byte`:`padding`]
- */
-struct hop_data_legacy {
-	u8 realm;
-	struct short_channel_id channel_id;
-	struct amount_msat amt_forward;
-	u32 outgoing_cltv;
-};
-
-/*
- * All the necessary information to generate a valid onion for this hop on a
- * sphinx path. The payload is preserialized in order since the onion
- * generation is payload agnostic. */
+/* A single hop, to be encrypted into an onion */
 struct sphinx_hop {
 	struct pubkey pubkey;
 	const u8 *raw_payload;
-	struct hmac hmac;
 };
 
 struct route_step {
@@ -132,16 +103,17 @@ bool onion_shared_secret(
  * @hoppayload: the per-hop payload destined for the processing node.
  * @assocdata: associated data to commit to in HMACs
  * @assocdatalen: length of the assocdata
- * @has_realm: used for HTLCs, where first byte 0 is magical.
  */
 struct route_step *process_onionpacket(
 	const tal_t * ctx,
 	const struct onionpacket *packet,
 	const struct secret *shared_secret,
 	const u8 *assocdata,
-	const size_t assocdatalen,
-	bool has_realm
-	);
+	const size_t assocdatalen);
+
+struct route_step *process_onionmsg_packet(const tal_t *ctx,
+					   const struct onionpacket *packet,
+					   const struct secret *shared_secret);
 
 /**
  * serialize_onionpacket - Serialize an onionpacket to a buffer.
@@ -197,7 +169,9 @@ struct onionreply *wrap_onionreply(const tal_t *ctx,
  * @shared_secrets: shared secrets from the forward path
  * @numhops: path length and number of shared_secrets provided
  * @reply: the incoming reply
- * @origin_index: the index in the path where the reply came from (-1 if unknown)
+ * @origin_index: the index in the path where the reply came from (-1 if unknown).
+ *     On success this is always in [0, numhops). Dummy-hop HMAC matches are
+ *     ignored so they cannot be reported as a route position.
  *
  * Reverses create_onionreply and wrap_onionreply.
  */
@@ -214,7 +188,8 @@ u8 *unwrap_onionreply(const tal_t *ctx,
  * passed to `create_onionpacket` to generate the packet.
  */
 struct sphinx_path *sphinx_path_new(const tal_t *ctx,
-				    const u8 *associated_data);
+				    const u8 *associated_data,
+				    size_t associated_data_len);
 
 /**
  * Create a new empty sphinx_path with a given `session_key`.
@@ -224,13 +199,30 @@ struct sphinx_path *sphinx_path_new(const tal_t *ctx,
  */
 struct sphinx_path *sphinx_path_new_with_key(const tal_t *ctx,
 					     const u8 *associated_data,
+					     size_t associated_data_len,
 					     const struct secret *session_key);
 
 /**
- * Add a payload hop to the path.
+ * Add a payload hop to the path (already has length prepended).
+ *
+ * Fails if length actually isn't prepended!
+ */
+bool sphinx_add_hop_has_length(struct sphinx_path *path, const struct pubkey *pubkey,
+			       const u8 *payload TAKES);
+
+/**
+ * Prepend length to payload and add: for onionmessage, any size is OK,
+ * for HTLC onions tal_bytelen(payload) must be > 1.
  */
 void sphinx_add_hop(struct sphinx_path *path, const struct pubkey *pubkey,
 		    const u8 *payload TAKES);
+
+/**
+ * Do not use, function is cursed.
+ */
+void sphinx_add_v0_hop(struct sphinx_path *path, const struct pubkey *pubkey,
+		       const struct short_channel_id *scid,
+		       struct amount_msat forward, u32 outgoing_cltv);
 
 /**
  * Compute the size of the serialized payloads.
@@ -280,9 +272,10 @@ u8 *sphinx_compressed_onion_serialize(
 struct sphinx_compressed_onion *
 sphinx_compressed_onion_deserialize(const tal_t *ctx, const u8 *src);
 
-#if DEVELOPER
 /* Override to force us to reject valid onion packets */
 extern bool dev_fail_process_onionpacket;
-#endif
+
+/* Override to set custom onion error lengths. */
+extern unsigned dev_onion_reply_length;
 
 #endif /* LIGHTNING_COMMON_SPHINX_H */

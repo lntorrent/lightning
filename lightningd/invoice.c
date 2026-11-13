@@ -1,95 +1,114 @@
-#include "invoice.h"
+#include "config.h"
+#include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/json_escape/json_escape.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
-#include <common/amount.h>
-#include <common/bech32.h>
-#include <common/bolt11.h>
+#include <common/blindedpath.h>
 #include <common/bolt11_json.h>
-#include <common/bolt12.h>
+#include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
-#include <common/configdir.h>
-#include <common/features.h>
+#include <common/clock_time.h>
 #include <common/json_command.h>
-#include <common/json_helpers.h>
-#include <common/jsonrpc_errors.h>
-#include <common/overflows.h>
-#include <common/param.h>
+#include <common/randbytes.h>
 #include <common/random_select.h>
 #include <common/timeout.h>
-#include <common/utils.h>
-#include <errno.h>
-#include <gossipd/gossipd_wiregen.h>
 #include <hsmd/hsmd_wiregen.h>
-#include <inttypes.h>
 #include <lightningd/channel.h>
 #include <lightningd/hsm_control.h>
-#include <lightningd/json.h>
-#include <lightningd/jsonrpc.h>
-#include <lightningd/lightningd.h>
-#include <lightningd/log.h>
+#include <lightningd/invoice.h>
 #include <lightningd/notification.h>
-#include <lightningd/options.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/routehint.h>
-#include <lightningd/subd.h>
-#include <sodium/randombytes.h>
-#include <wire/wire_sync.h>
+#include <wallet/invoices.h>
+#include <wallet/walletrpc.h>
 
-static const char *invoice_status_str(const struct invoice_details *inv)
+const char *invoice_status_str(enum invoice_status state)
 {
-	if (inv->state == PAID)
+	switch (state) {
+	case PAID:
 		return "paid";
-	if (inv->state == EXPIRED)
+	case EXPIRED:
 		return "expired";
-	return "unpaid";
+	case UNPAID:
+		return "unpaid";
+	}
+	abort();
 }
 
-static void json_add_invoice(struct json_stream *response,
-			     const struct invoice_details *inv)
+static void json_add_invoice_fields(struct json_stream *response,
+				    const struct invoice_details *inv)
 {
 	json_add_escaped_string(response, "label", inv->label);
-	json_add_invstring(response, inv->invstring);
+	if (inv->invstring)
+		json_add_invstring(response, inv->invstring);
 	json_add_sha256(response, "payment_hash", &inv->rhash);
 	if (inv->msat)
-		json_add_amount_msat_compat(response, *inv->msat,
-					    "msatoshi", "amount_msat");
-	json_add_string(response, "status", invoice_status_str(inv));
+		json_add_amount_msat(response, "amount_msat", *inv->msat);
+	json_add_string(response, "status", invoice_status_str(inv->state));
 	if (inv->state == PAID) {
 		json_add_u64(response, "pay_index", inv->pay_index);
-		json_add_amount_msat_compat(response, inv->received,
-					    "msatoshi_received",
-					    "amount_received_msat");
+		json_add_amount_msat(response,
+				     "amount_received_msat", inv->received);
 		json_add_u64(response, "paid_at", inv->paid_timestamp);
+		if (inv->paid_outpoint) {
+			json_object_start(response, "paid_outpoint");
+			json_add_txid(response, "txid", &inv->paid_outpoint->txid);
+			json_add_num(response, "outnum", inv->paid_outpoint->n);
+			json_object_end(response);
+		}
 		json_add_preimage(response, "payment_preimage", &inv->r);
 	}
 	if (inv->description)
 		json_add_string(response, "description", inv->description);
 
 	json_add_u64(response, "expires_at", inv->expiry_time);
-	if (inv->local_offer_id)
+	if (inv->local_offer_id) {
+		const char *fail;
+		struct tlv_invoice *tinv;
+
 		json_add_sha256(response, "local_offer_id", inv->local_offer_id);
+
+		/* Everyone loves seeing their own payer notes!
+		 * Well: they will.  Trust me. */
+		tinv = invoice_decode(tmpctx,
+				      inv->invstring, strlen(inv->invstring),
+				      NULL, NULL, &fail);
+		if (tinv && tinv->invreq_payer_note)
+			json_add_stringn(response, "invreq_payer_note",
+					 tinv->invreq_payer_note,
+					 tal_bytelen(tinv->invreq_payer_note));
+	}
+	json_add_u64(response, "created_index", inv->created_index);
+	if (inv->updated_index)
+		json_add_u64(response, "updated_index", inv->updated_index);
 }
 
-static struct command_result *tell_waiter(struct command *cmd,
-					  const struct invoice *inv)
+static void json_add_invoice(struct json_stream *response,
+			     const char *fieldname,
+			     const struct invoice_details *inv)
+{
+	json_object_start(response, fieldname);
+	json_add_invoice_fields(response, inv);
+	json_object_end(response);
+}
+
+static struct command_result *tell_waiter(struct command *cmd, u64 inv_dbid)
 {
 	struct json_stream *response;
 	const struct invoice_details *details;
 
-	details = wallet_invoice_details(cmd, cmd->ld->wallet, *inv);
+	details = invoices_get_details(cmd, cmd->ld->wallet->invoices, inv_dbid);
 	if (details->state == PAID) {
 		response = json_stream_success(cmd);
-		json_add_invoice(response, details);
+		json_add_invoice_fields(response, details);
 		return command_success(cmd, response);
 	} else {
 		response = json_stream_fail(cmd, INVOICE_EXPIRED_DURING_WAIT,
 					    "invoice expired during wait");
-		json_add_invoice(response, details);
+		json_add_invoice_fields(response, details);
 		json_object_end(response);
 		return command_failed(cmd, response);
 	}
@@ -100,10 +119,10 @@ static void tell_waiter_deleted(struct command *cmd)
 	was_pending(command_fail(cmd, LIGHTNINGD,
 				 "Invoice deleted during wait"));
 }
-static void wait_on_invoice(const struct invoice *invoice, void *cmd)
+static void wait_on_invoice(const u64 *inv_dbid, void *cmd)
 {
-	if (invoice)
-		tell_waiter((struct command *) cmd, invoice);
+	if (inv_dbid)
+		tell_waiter((struct command *) cmd, *inv_dbid);
 	else
 		tell_waiter_deleted((struct command *) cmd);
 }
@@ -127,31 +146,7 @@ static void invoice_secret(const struct preimage *payment_preimage,
 
 	sha256(&secret, modified.r,
 	       ARRAY_SIZE(modified.r) * sizeof(*modified.r));
-	BUILD_ASSERT(sizeof(secret.u.u8) == sizeof(payment_secret->data));
-	memcpy(payment_secret->data, secret.u.u8, sizeof(secret.u.u8));
-}
-
-/* FIXME: This is a hack.  The real secret should be a signature of some
- * onion key, using the payer_id */
-static void invoice_secret_bolt12(struct lightningd *ld,
-				  const char *invstring,
-				  struct secret *payment_secret)
-{
-	char *fail;
-	struct tlv_invoice *inv;
-	struct sha256 merkle;
-
-	inv = invoice_decode(tmpctx, invstring, strlen(invstring),
-			     NULL, NULL, &fail);
-	if (!inv) {
-		log_broken(ld->log, "Unable to decode our invoice %s",
-			   invstring);
-		return;
-	}
-
-	merkle_tlv(inv->fields, &merkle);
-	BUILD_ASSERT(sizeof(*payment_secret) == sizeof(merkle));
-	memcpy(payment_secret, &merkle, sizeof(merkle));
+	CROSS_TYPE_ASSIGNMENT(&payment_secret->data, &secret.u.u8);
 }
 
 struct invoice_payment_hook_payload {
@@ -160,6 +155,8 @@ struct invoice_payment_hook_payload {
 	struct htlc_set *set;
 	/* What invoice it's trying to pay. */
 	const struct json_escape *label;
+	/* Outpoint that pays the invoice, if paid on chain. */
+	struct bitcoin_outpoint *outpoint;
 	/* Amount it's offering. */
 	struct amount_msat msat;
 	/* Preimage we'll give it if succeeds. */
@@ -167,16 +164,50 @@ struct invoice_payment_hook_payload {
 	/* FIXME: Include raw payload! */
 };
 
+static void invoice_payment_add_tlvs(struct json_stream *stream,
+				     struct htlc_set *hset)
+{
+	struct htlc_in *hin;
+	const struct tlv_payload *tlvs;
+	assert(tal_count(hset->inpays) > 0);
+
+	/* Only do this if it's actually an HTLC */
+	if ((void *)hset->inpays[0]->fail != (void *)local_fail_in_htlc)
+		return;
+
+	/* Pick the first HTLC as representative for the entire set. */
+	hin = hset->inpays[0]->arg;
+
+	tlvs = hin->payload->tlv;
+
+	json_array_start(stream, "extratlvs");
+
+	for (size_t i = 0; i < tal_count(tlvs->fields); i++) {
+		struct tlv_field *field = &tlvs->fields[i];
+		/* If we have metadata attached it is not an extra TLV field. */
+		if (field->meta == NULL) {
+			json_object_start(stream, NULL);
+			json_add_u64(stream, "type", field->numtype);
+			json_add_num(stream, "length", field->length);
+			json_add_hex_talarr(stream, "value", field->value);
+			json_object_end(stream);
+		}
+	}
+	json_array_end(stream);
+}
+
 static void
 invoice_payment_serialize(struct invoice_payment_hook_payload *payload,
-			  struct json_stream *stream)
+			  struct json_stream *stream,
+			  struct plugin *plugin)
 {
 	json_object_start(stream, "payment");
 	json_add_escaped_string(stream, "label", payload->label);
 	json_add_preimage(stream, "preimage", &payload->preimage);
-	json_add_string(stream, "msat",
-			type_to_string(tmpctx, struct amount_msat,
-				       &payload->msat));
+	json_add_amount_msat(stream, "msat", payload->msat);
+
+	if (payload->ld->developer && payload->set)
+		invoice_payment_add_tlvs(stream, payload->set);
 	json_object_end(stream); /* .payment */
 }
 
@@ -189,15 +220,15 @@ static void invoice_payload_remove_set(struct htlc_set *set,
 	payload->set = NULL;
 }
 
+/* Returns magic value to send generic incorrect_or_unknown_payment_details */
 static const u8 *hook_gives_failmsg(const tal_t *ctx,
 				    struct lightningd *ld,
-				    const struct htlc_in *hin,
 				    const char *buffer,
 				    const jsmntok_t *toks)
 {
 	const jsmntok_t *resulttok;
 	const jsmntok_t *t;
-	unsigned int val;
+	const u8 *failmsg;
 
 	/* No plugin registered on hook at all? */
 	if (!buffer)
@@ -208,59 +239,31 @@ static const u8 *hook_gives_failmsg(const tal_t *ctx,
 		if (json_tok_streq(buffer, resulttok, "continue")) {
 			return NULL;
 		} else if (json_tok_streq(buffer, resulttok, "reject")) {
-			return failmsg_incorrect_or_unknown(ctx, ld, hin);
+			/* htlc_set_fail makes this a per-htlc
+			 * incorrect_or_unknown_payment_details */
+			return tal_arr(ctx, u8, 0);
 		} else
 			fatal("Invalid invoice_payment hook result: %.*s",
 			      toks[0].end - toks[0].start, buffer);
 	}
 
 	t = json_get_member(buffer, toks, "failure_message");
-	if (t) {
-		const u8 *failmsg = json_tok_bin_from_hex(ctx, buffer, t);
-		if (!failmsg)
-			fatal("Invalid invoice_payment_hook failure_message: %.*s",
-			      toks[0].end - toks[1].start, buffer);
-		return failmsg;
-	}
-
-	if (!deprecated_apis)
-		return NULL;
-
-	t = json_get_member(buffer, toks, "failure_code");
 	if (!t) {
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
-			log_unusual(ld->log,
-				    "Plugin did not return object with "
-				    "'result' or 'failure_message' fields.  "
-				    "This is now deprecated and you should "
-				    "return {'result': 'continue' } or "
-				    "{'result': 'reject'} or "
-				    "{'failure_message'... instead.");
-		}
-		return failmsg_incorrect_or_unknown(ctx, ld, hin);
+		fatal("Missing failure_message in invoice_payment hook result: %.*s",
+		      toks[0].end - toks[0].start, buffer);
 	}
 
-	if (!json_to_number(buffer, t, &val))
-		fatal("Invalid invoice_payment_hook failure_code: %.*s",
+	failmsg = json_tok_bin_from_hex(ctx, buffer, t);
+	if (!failmsg)
+		fatal("Invalid invoice_payment_hook failure_message: %.*s",
 		      toks[0].end - toks[1].start, buffer);
-
-	if (val == WIRE_TEMPORARY_NODE_FAILURE)
-		return towire_temporary_node_failure(ctx);
-	if (val != WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS)
-		log_broken(hin->key.channel->log,
-			   "invoice_payment hook returned failcode %u,"
-			   " changing to incorrect_or_unknown_payment_details",
-			   val);
-
-	return failmsg_incorrect_or_unknown(ctx, ld, hin);
+	return failmsg;
 }
 
 static void
 invoice_payment_hooks_done(struct invoice_payment_hook_payload *payload STEALS)
 {
-	struct invoice invoice;
+	u64 inv_dbid;
 	struct lightningd *ld = payload->ld;
 
 	tal_del_destructor2(payload->set, invoice_payload_remove_set, payload);
@@ -269,27 +272,29 @@ invoice_payment_hooks_done(struct invoice_payment_hook_payload *payload STEALS)
 
 	/* If invoice gets paid meanwhile (plugin responds out-of-order?) then
 	 * we can also fail */
-	if (!wallet_invoice_find_by_label(ld->wallet, &invoice, payload->label)) {
-		htlc_set_fail(payload->set, take(failmsg_incorrect_or_unknown(
-							 NULL, ld, payload->set->htlcs[0])));
+	if (!invoices_find_by_label(ld->wallet->invoices, &inv_dbid, payload->label)) {
+		if (payload->set)
+			htlc_set_fail(payload->set, NULL);
 		return;
 	}
 
 	/* Paid or expired in the meantime. */
-	if (!wallet_invoice_resolve(ld->wallet, invoice, payload->msat)) {
-		htlc_set_fail(payload->set, take(failmsg_incorrect_or_unknown(
-							 NULL, ld, payload->set->htlcs[0])));
+	if (!invoices_resolve(ld->wallet->invoices, inv_dbid, payload->msat,
+			      payload->label, payload->outpoint)) {
+		if (payload->set)
+			htlc_set_fail(payload->set, NULL);
 		return;
 	}
 
 	log_info(ld->log, "Resolved invoice '%s' with amount %s in %zu htlcs",
 		 payload->label->s,
-		 type_to_string(tmpctx, struct amount_msat, &payload->msat),
-		 tal_count(payload->set->htlcs));
-	htlc_set_fulfill(payload->set, &payload->preimage);
+		 fmt_amount_msat(tmpctx, payload->msat),
+		 payload->set ? tal_count(payload->set->inpays) : 0);
+	if (payload->set)
+		htlc_set_fulfill(payload->set, &payload->preimage);
 
-	notify_invoice_payment(ld, payload->msat, payload->preimage,
-			       payload->label);
+	notify_invoice_payment(ld, payload->msat, &payload->preimage,
+			       payload->label, payload->outpoint);
 }
 
 static bool
@@ -301,18 +306,19 @@ invoice_payment_deserialize(struct invoice_payment_hook_payload *payload,
 	const u8 *failmsg;
 
 	/* If peer dies or something, this can happen. */
-	if (!payload->set) {
+	if (!payload->set && !payload->outpoint) {
 		log_debug(ld->log, "invoice '%s' paying htlc_in has gone!",
 			  payload->label->s);
 		return false;
 	}
 
-	/* Did we have a hook result? */
-	failmsg = hook_gives_failmsg(NULL, ld,
-				     payload->set->htlcs[0], buffer, toks);
-	if (failmsg) {
-		htlc_set_fail(payload->set, take(failmsg));
-		return false;
+	if (payload->set) {
+		/* Did we have a hook result? */
+		failmsg = hook_gives_failmsg(NULL, ld, buffer, toks);
+		if (failmsg) {
+			htlc_set_fail(payload->set, take(failmsg));
+			return false;
+		}
 	}
 	return true;
 }
@@ -328,10 +334,13 @@ invoice_check_payment(const tal_t *ctx,
 		      struct lightningd *ld,
 		      const struct sha256 *payment_hash,
 		      const struct amount_msat msat,
-		      const struct secret *payment_secret)
+		      const struct amount_msat *expected_msat_override,
+		      const struct secret *payment_secret,
+		      const char **err)
 {
-	struct invoice invoice;
+	u64 inv_dbid;
 	const struct invoice_details *details;
+	bool bolt12_payment;
 
 	/* BOLT #4:
 	 *  - if the payment hash has already been paid:
@@ -342,17 +351,19 @@ invoice_check_payment(const tal_t *ctx,
 	 *    - MUST fail the HTLC.
 	 *    - MUST return an `incorrect_or_unknown_payment_details` error.
 	 */
-	if (!wallet_invoice_find_unpaid(ld->wallet, &invoice, payment_hash)) {
-		log_debug(ld->log, "Unknown paid invoice %s",
-			  type_to_string(tmpctx, struct sha256, payment_hash));
-		if (wallet_invoice_find_by_rhash(ld->wallet, &invoice, payment_hash)) {
-			log_debug(ld->log, "ALREADY paid invoice %s",
-				  type_to_string(tmpctx, struct sha256, payment_hash));
+	if (!invoices_find_unpaid(ld->wallet->invoices, &inv_dbid, payment_hash)) {
+		if (invoices_find_by_rhash(ld->wallet->invoices, &inv_dbid, payment_hash)) {
+			*err = tal_fmt(ctx, "Already paid or expired invoice %s",
+				       fmt_sha256(tmpctx, payment_hash));
+		} else {
+			*err = tal_fmt(ctx, "Unknown invoice %s",
+				       fmt_sha256(tmpctx, payment_hash));
 		}
 		return NULL;
 	}
 
-	details = wallet_invoice_details(ctx, ld->wallet, invoice);
+	details = invoices_get_details(ctx, ld->wallet->invoices, inv_dbid);
+	bolt12_payment = details->invstring && strstarts(details->invstring, "lni1");
 
 	/* BOLT #4:
 	 *  - if the `payment_secret` doesn't match the expected value for that
@@ -360,24 +371,32 @@ invoice_check_payment(const tal_t *ctx,
 	 *     present:
 	 *    - MUST fail the HTLC.
 	 */
-	if (feature_is_set(details->features, COMPULSORY_FEATURE(OPT_VAR_ONION))
+	/* For BOLT12: we stash path_secret in this field if it's of
+	 * correct length, so it must be present */
+	if ((feature_is_set(details->features, COMPULSORY_FEATURE(OPT_VAR_ONION))
+	     || bolt12_payment)
 	    && !payment_secret) {
-		log_debug(ld->log, "Attept to pay %s without secret",
-			  type_to_string(tmpctx, struct sha256, &details->rhash));
+		*err = tal_fmt(ctx, "Attempt to pay %s without secret",
+			       fmt_sha256(tmpctx, &details->rhash));
 		return tal_free(details);
 	}
 
 	if (payment_secret) {
 		struct secret expected;
 
-		if (details->invstring && strstarts(details->invstring, "lni1"))
-			invoice_secret_bolt12(ld, details->invstring, &expected);
-		else
+		/* FIXME: BOLT 12 should require a *real* secret: a signature of the
+		 * request using the payer_id key.  This just means they've
+		 * *seen* the invoice! */
+		if (bolt12_payment) {
+			bolt12_path_secret(&ld->invoicesecret_base,
+					   payment_hash,
+					   &expected);
+		} else
 			invoice_secret(&details->r, &expected);
 		if (!secret_eq_consttime(payment_secret, &expected)) {
-			log_debug(ld->log, "Attept to pay %s with wrong secret",
-				  type_to_string(tmpctx, struct sha256,
-						 &details->rhash));
+			*err = tal_fmt(ctx, "Attempt to pay %s with wrong %ssecret",
+				       fmt_sha256(tmpctx, &details->rhash),
+				       bolt12_payment ? "path_" : "payment_");
 			return tal_free(details);
 		}
 	}
@@ -392,22 +411,24 @@ invoice_check_payment(const tal_t *ctx,
 	if (details->msat != NULL) {
 		struct amount_msat twice;
 
-		if (amount_msat_less(msat, *details->msat)) {
-			log_debug(ld->log, "Attept to pay %s with amount %s < %s",
-				  type_to_string(tmpctx, struct sha256,
-						 &details->rhash),
-				  type_to_string(tmpctx, struct amount_msat, &msat),
-				  type_to_string(tmpctx, struct amount_msat, details->msat));
+		/* Override the expected amount. */
+		struct amount_msat expected_msat =
+			expected_msat_override ? *expected_msat_override : *details->msat;
+
+		if (amount_msat_less(msat, expected_msat)) {
+			*err = tal_fmt(ctx, "Attempt to pay %s with amount %s < %s",
+				       fmt_sha256(tmpctx, &details->rhash),
+				       fmt_amount_msat(tmpctx, msat),
+				       fmt_amount_msat(tmpctx, expected_msat));
 			return tal_free(details);
 		}
 
-		if (amount_msat_add(&twice, *details->msat, *details->msat)
+		if (amount_msat_add(&twice, expected_msat, expected_msat)
 		    && amount_msat_greater(msat, twice)) {
-			log_debug(ld->log, "Attept to pay %s with amount %s > %s",
-				  type_to_string(tmpctx, struct sha256,
-						 &details->rhash),
-				  type_to_string(tmpctx, struct amount_msat, details->msat),
-				  type_to_string(tmpctx, struct amount_msat, &twice));
+			*err = tal_fmt(ctx, "Attempt to pay %s with amount %s > %s",
+				       fmt_sha256(tmpctx, &details->rhash),
+				       fmt_amount_msat(tmpctx, msat),
+				       fmt_amount_msat(tmpctx, twice));
 			/* BOLT #4:
 			 *
 			 * - if the amount paid is more than twice the amount
@@ -422,19 +443,24 @@ invoice_check_payment(const tal_t *ctx,
 
 void invoice_try_pay(struct lightningd *ld,
 		     struct htlc_set *set,
-		     const struct invoice_details *details)
+		     const struct invoice_details *details,
+		     struct amount_msat msat,
+		     const struct bitcoin_outpoint *outpoint)
 {
 	struct invoice_payment_hook_payload *payload;
 
 	payload = tal(NULL, struct invoice_payment_hook_payload);
 	payload->ld = ld;
 	payload->label = tal_steal(payload, details->label);
-	payload->msat = set->so_far;
 	payload->preimage = details->r;
+	payload->msat = msat;
 	payload->set = set;
-	tal_add_destructor2(set, invoice_payload_remove_set, payload);
+	payload->outpoint = tal_dup_or_null(payload, struct bitcoin_outpoint, outpoint);
 
-	plugin_hook_call_invoice_payment(ld, payload);
+	// set is NULL if invoice is being paid on-chain
+	if (payload->set)
+		tal_add_destructor2(set, invoice_payload_remove_set, payload);
+	plugin_hook_call_invoice_payment(ld, NULL, payload);
 }
 
 static bool hsm_sign_b11(const u5 *u5bytes,
@@ -442,12 +468,10 @@ static bool hsm_sign_b11(const u5 *u5bytes,
 			 secp256k1_ecdsa_recoverable_signature *rsig,
 			 struct lightningd *ld)
 {
-	u8 *msg = towire_hsmd_sign_invoice(NULL, u5bytes, hrpu8);
+	const u8 *msg;
 
-	if (!wire_sync_write(ld->hsm_fd, take(msg)))
-		fatal("Could not write to HSM: %s", strerror(errno));
-
-	msg = wire_sync_read(tmpctx, ld->hsm_fd);
+	msg = hsm_sync_req(tmpctx, ld,
+			   take(towire_hsmd_sign_invoice(NULL, u5bytes, hrpu8)));
         if (!fromwire_hsmd_sign_invoice_reply(msg, rsig))
 		fatal("HSM gave bad sign_invoice_reply %s",
 		      tal_hex(msg, msg));
@@ -459,17 +483,14 @@ static void hsm_sign_b12_invoice(struct lightningd *ld,
 				 struct tlv_invoice *invoice)
 {
 	struct sha256 merkle;
-	u8 *msg;
+	const u8 *msg;
 
 	assert(!invoice->signature);
 
  	merkle_tlv(invoice->fields, &merkle);
 	msg = towire_hsmd_sign_bolt12(NULL, "invoice", "signature", &merkle, NULL);
 
-	if (!wire_sync_write(ld->hsm_fd, take(msg)))
-		fatal("Could not write to HSM: %s", strerror(errno));
-
-	msg = wire_sync_read(tmpctx, ld->hsm_fd);
+	msg = hsm_sync_req(tmpctx, ld, take(msg));
 	invoice->signature = tal(invoice, struct bip340sig);
         if (!fromwire_hsmd_sign_bolt12_reply(msg, invoice->signature))
 		fatal("HSM gave bad sign_invoice_reply %s",
@@ -516,7 +537,7 @@ static struct route_info **select_inchan(const tal_t *ctx,
 					 const struct routehint_candidate
 					 *candidates)
 {
-	/* BOLT11 struct wants an array of arrays (can provide multiple routes) */
+	/* BOLT-11 struct wants an array of arrays (can provide multiple routes) */
 	struct route_info **r = NULL;
 	double total_weight = 0.0;
 
@@ -550,20 +571,19 @@ static struct route_info **select_inchan(const tal_t *ctx,
 		if (!amount_sat_add(&cumulative_reserve,
 				    candidates[i].c->our_config.channel_reserve,
 				    candidates[i].c->channel_info.their_config.channel_reserve)
-			|| !amount_sat_to_msat(&capacity, candidates[i].c->funding)
-			|| !amount_msat_sub_sat(&capacity, capacity, cumulative_reserve)) {
+		    || !amount_sat_to_msat(&capacity, candidates[i].c->funding_sats)
+		    || !amount_msat_deduct_sat(&capacity, cumulative_reserve)) {
 			log_broken(ld->log, "Channel %s capacity overflow!",
-					type_to_string(tmpctx, struct short_channel_id, candidates[i].c->scid));
+					fmt_short_channel_id(tmpctx, *candidates[i].c->scid));
 			continue;
 		}
 
 		/* We don't want a 0 probability if 0 excess; it might be the
 		 * only one!  So bump it by 1 msat */
-		if (!amount_msat_add(&excess, excess, AMOUNT_MSAT(1))) {
+		if (!amount_msat_accumulate(&excess, AMOUNT_MSAT(1))) {
 			log_broken(ld->log, "Channel %s excess overflow!",
-				   type_to_string(tmpctx,
-						  struct short_channel_id,
-						  candidates[i].c->scid));
+				   fmt_short_channel_id(tmpctx,
+							*candidates[i].c->scid));
 			continue;
 		}
 		excess_frac = amount_msat_ratio(excess, capacity);
@@ -580,13 +600,17 @@ static struct route_info **select_inchan(const tal_t *ctx,
 
 static int cmp_rr_number(const struct routehint_candidate *a,
 			 const struct routehint_candidate *b,
-			 void *unused)
+			 struct lightningd *ld)
 {
-	/* They're unique, so can't be equal */
 	if (a->c->rr_number > b->c->rr_number)
 		return 1;
-	assert(a->c->rr_number < b->c->rr_number);
-	return -1;
+	if (a->c->rr_number < b->c->rr_number)
+		return -1;
+
+	/* They're unique, so can't be equal */
+	log_broken(ld->log, "Two equal candidates %p and %p, channels %p and %p, rr_number %"PRIu64" and %"PRIu64,
+		   a, b, a->c, b->c, a->c->rr_number, b->c->rr_number);
+	return 0;
 }
 
 /** select_inchan_mpp
@@ -602,8 +626,7 @@ static struct route_info **select_inchan_mpp(const tal_t *ctx,
 					     struct lightningd *ld,
 					     struct amount_msat amount_needed,
 					     struct routehint_candidate
-					     *candidates,
-					     bool *warning_mpp_capacity)
+					     *candidates)
 {
 	/* The total amount we have gathered for incoming channels.  */
 	struct amount_msat gathered;
@@ -614,19 +637,18 @@ static struct route_info **select_inchan_mpp(const tal_t *ctx,
 	routehints = tal_arr(ctx, struct route_info *, 0);
 
 	/* Sort by rr_number, so we get fresh channels. */
-	asort(candidates, tal_count(candidates), cmp_rr_number, NULL);
+	asort(candidates, tal_count(candidates), cmp_rr_number, ld);
 	for (size_t i = 0; i < tal_count(candidates); i++) {
 		if (amount_msat_greater_eq(gathered, amount_needed))
 			break;
 
 		/* Add to current routehints set.  */
-		if (!amount_msat_add(&gathered, gathered, candidates[i].capacity)) {
+		if (!amount_msat_accumulate(&gathered, candidates[i].capacity)) {
 			log_broken(ld->log,
 				   "Gathered channel capacity overflow: "
 				   "%s + %s",
-				   type_to_string(tmpctx, struct amount_msat, &gathered),
-				   type_to_string(tmpctx, struct amount_msat,
-						  &candidates[i].capacity));
+				   fmt_amount_msat(tmpctx, gathered),
+				   fmt_amount_msat(tmpctx, candidates[i].capacity));
 			continue;
 		}
 		tal_arr_expand(&routehints,
@@ -636,8 +658,24 @@ static struct route_info **select_inchan_mpp(const tal_t *ctx,
 		candidates[i].c->rr_number = ld->rr_counter++;
 	}
 
-	/* Check if we gathered enough.  */
-	*warning_mpp_capacity = amount_msat_less(gathered, amount_needed);
+	return routehints;
+}
+
+static struct route_info **select_inchan_all(const tal_t *ctx,
+					     struct lightningd *ld,
+					     struct routehint_candidate
+					     *candidates)
+{
+	struct route_info **routehints;
+
+	log_debug(ld->log, "Selecting all %zu candidates",
+		  tal_count(candidates));
+
+	routehints = tal_arr(ctx, struct route_info *, tal_count(candidates));
+	for (size_t i = 0; i < tal_count(candidates); i++) {
+		routehints[i] = tal_dup(routehints, struct route_info,
+					candidates[i].r);
+	}
 
 	return routehints;
 }
@@ -654,157 +692,294 @@ struct invoice_info {
 	struct bolt11 *b11;
 	struct json_escape *label;
 	struct chanhints *chanhints;
+	bool custom_fallbacks;
 };
 
-static void gossipd_incoming_channels_reply(struct subd *gossipd,
-					    const u8 *msg,
-					    const int *fs,
-					    struct invoice_info *info)
+/* Add routehints based on listincoming results: NULL means success. */
+static struct command_result *
+add_routehints(struct invoice_info *info,
+	       const char *buffer,
+	       const jsmntok_t *toks,
+	       bool *warning_mpp,
+	       bool *warning_capacity,
+	       bool *warning_deadends,
+	       bool *warning_offline,
+	       bool *warning_private_unused)
 {
-	struct json_stream *response;
-	struct invoice invoice;
-	char *b11enc;
-	const struct invoice_details *details;
-	struct wallet *wallet = info->cmd->ld->wallet;
 	const struct chanhints *chanhints = info->chanhints;
-
-	struct routehint_candidate *candidates;
-	struct amount_msat offline_amt;
-	bool warning_mpp = false;
-	bool warning_mpp_capacity = false;
-	bool deadends;
 	bool node_unpublished;
+	struct amount_msat avail_capacity, deadend_capacity, offline_capacity,
+		private_capacity;
+	struct routehint_candidate *candidates;
+	struct amount_msat total, needed;
 
-	candidates = routehint_candidates(tmpctx, info->cmd->ld, msg,
-					  chanhints ? chanhints->expose_all_private : false,
+	/* Dev code can force routes. */
+	if (info->b11->routes) {
+	       *warning_mpp = *warning_capacity = *warning_deadends
+		       = *warning_offline = *warning_private_unused
+		       = false;
+		return NULL;
+	}
+
+	candidates = routehint_candidates(tmpctx, info->cmd->ld,
+					  buffer, toks,
+					  chanhints ? &chanhints->expose_all_private : NULL,
 					  chanhints ? chanhints->hints : NULL,
 					  &node_unpublished,
-					  &deadends,
-					  &offline_amt);
+					  &avail_capacity,
+					  &private_capacity,
+					  &deadend_capacity,
+					  &offline_capacity);
 
 	/* If they told us to use scids and we couldn't, fail. */
 	if (tal_count(candidates) == 0
 	    && chanhints && tal_count(chanhints->hints) != 0) {
-		was_pending(command_fail(info->cmd,
-					 INVOICE_HINTS_GAVE_NO_ROUTES,
-					 "None of those hints were suitable local channels"));
-		return;
+		return command_fail(info->cmd,
+				    INVOICE_HINTS_GAVE_NO_ROUTES,
+				    "None of those hints were suitable local channels");
 	}
 
-	if (tal_count(info->b11->routes) == 0) {
-		struct amount_msat needed;
-		needed = info->b11->msat ? *info->b11->msat : AMOUNT_MSAT(1);
+	needed = info->b11->msat ? *info->b11->msat : AMOUNT_MSAT(1);
 
-		/* If we are not completely unpublished, try with reservoir
-		 * sampling first.
-		 *
-		 * Why do we not do this if we are completely unpublished?
-		 * Because it is possible that multiple invoices will, by
-		 * chance, select the same channel as routehint.
-		 * This single channel might not be able to accept all the
-		 * incoming payments on all the invoices generated.
-		 * If we were published, that is fine because the payer can
-		 * fall back to just attempting to route directly.
-		 * But if we were unpublished, the only way for the payer to
-		 * reach us would be via the routehints we provide, so we
-		 * should make an effort to avoid overlapping incoming
-		 * channels, which is done by select_inchan_mpp.
-		 */
-		if (!node_unpublished)
-			info->b11->routes = select_inchan(info->b11,
-							  info->cmd->ld,
-							  needed,
-							  candidates);
-		/* If we are completely unpublished, or if the above reservoir
-		 * sampling fails, select channels by round-robin.  */
-		if (tal_count(info->b11->routes) == 0) {
-			info->b11->routes = select_inchan_mpp(info->b11,
-							      info->cmd->ld,
-							      needed,
-							      candidates,
-							      &warning_mpp_capacity);
-			warning_mpp = (tal_count(info->b11->routes) > 1);
+	/* --payment-fronting-node means use all candidates. */
+	if (tal_count(info->cmd->ld->fronting_nodes))
+		info->b11->routes = select_inchan_all(info->b11, info->cmd->ld, candidates);
+
+	/* If we are not completely unpublished, try with reservoir
+	 * sampling first.
+	 *
+	 * Why do we not do this if we are completely unpublished?
+	 * Because it is possible that multiple invoices will, by
+	 * chance, select the same channel as routehint.
+	 * This single channel might not be able to accept all the
+	 * incoming payments on all the invoices generated.
+	 * If we were published, that is fine because the payer can
+	 * fall back to just attempting to route directly.
+	 * But if we were unpublished, the only way for the payer to
+	 * reach us would be via the routehints we provide, so we
+	 * should make an effort to avoid overlapping incoming
+	 * channels, which is done by select_inchan_mpp.
+	 */
+	else if (!node_unpublished)
+		info->b11->routes = select_inchan(info->b11,
+						  info->cmd->ld,
+						  needed,
+						  candidates);
+
+	/* If we are completely unpublished, or if the above reservoir
+	 * sampling fails, select channels by round-robin.  */
+	if (tal_count(info->b11->routes) == 0) {
+		info->b11->routes = select_inchan_mpp(info->b11,
+						      info->cmd->ld,
+						      needed,
+						      candidates);
+		*warning_mpp = (tal_count(info->b11->routes) > 1);
+	} else {
+		*warning_mpp = false;
+	}
+
+	log_debug(info->cmd->ld->log, "needed = %s, avail_capacity = %s, private_capacity = %s, offline_capacity = %s, deadend_capacity = %s",
+		  fmt_amount_msat(tmpctx, needed),
+		  fmt_amount_msat(tmpctx, avail_capacity),
+		  fmt_amount_msat(tmpctx, private_capacity),
+		  fmt_amount_msat(tmpctx, offline_capacity),
+		  fmt_amount_msat(tmpctx, deadend_capacity));
+
+	if (!amount_msat_add(&total, avail_capacity, offline_capacity)
+	    || !amount_msat_accumulate(&total, deadend_capacity)
+	    || !amount_msat_accumulate(&total, private_capacity))
+		fatal("Cannot add %s + %s + %s + %s",
+		      fmt_amount_msat(tmpctx, avail_capacity),
+		      fmt_amount_msat(tmpctx, offline_capacity),
+		      fmt_amount_msat(tmpctx, deadend_capacity),
+		      fmt_amount_msat(tmpctx, private_capacity));
+
+	/* If we literally didn't have capacity at all, warn. */
+	*warning_capacity = amount_msat_greater_eq(needed, total);
+
+	/* We only warn about these if we didn't have capacity and
+	 * they would have helped. */
+	*warning_offline = false;
+	*warning_deadends = false;
+	*warning_private_unused = false;
+	if (amount_msat_greater(needed, avail_capacity)) {
+		struct amount_msat tot;
+
+		/* We didn't get enough: would offline have helped? */
+		if (!amount_msat_add(&tot, avail_capacity, offline_capacity))
+			abort();
+		if (amount_msat_greater_eq(tot, needed)) {
+			*warning_offline = true;
+			goto done;
+		}
+
+		/* Hmm, what about deadends? */
+		if (!amount_msat_accumulate(&tot, deadend_capacity))
+			abort();
+		if (amount_msat_greater_eq(tot, needed)) {
+			*warning_deadends = true;
+			goto done;
+		}
+
+		/* What about private channels? */
+		if (!amount_msat_accumulate(&tot, private_capacity))
+			abort();
+		if (amount_msat_greater_eq(tot, needed)) {
+			*warning_private_unused = true;
+			goto done;
 		}
 	}
+
+done:
+	return NULL;
+}
+
+static struct command_result *
+invoice_complete(struct invoice_info *info,
+		 bool warning_no_listincoming,
+		 bool warning_mpp,
+		 bool warning_capacity,
+		 bool warning_deadends,
+		 bool warning_offline,
+		 bool warning_private_unused)
+{
+	struct json_stream *response;
+	u64 inv_dbid;
+	char *b11enc;
+	const struct invoice_details *details;
+	struct secret payment_secret;
+	struct wallet *wallet = info->cmd->ld->wallet;
 
 	b11enc = bolt11_encode(info, info->b11, false,
 			       hsm_sign_b11, info->cmd->ld);
 
 	/* Check duplicate preimage (unlikely unless they specified it!) */
-	if (wallet_invoice_find_by_rhash(wallet,
-					 &invoice, &info->b11->payment_hash)) {
-		was_pending(command_fail(info->cmd,
-					 INVOICE_PREIMAGE_ALREADY_EXISTS,
-					 "preimage already used"));
-		return;
+	if (invoices_find_by_rhash(wallet->invoices,
+				   &inv_dbid, &info->b11->payment_hash)) {
+		return command_fail(info->cmd,
+				    INVOICE_PREIMAGE_ALREADY_EXISTS,
+				    "preimage already used");
 	}
 
-	if (!wallet_invoice_create(wallet,
-				   &invoice,
-				   info->b11->msat,
-				   info->label,
-				   info->b11->expiry,
-				   b11enc,
-				   info->b11->description,
-				   info->b11->features,
-				   &info->payment_preimage,
-				   &info->b11->payment_hash,
-				   NULL)) {
-		was_pending(command_fail(info->cmd, INVOICE_LABEL_ALREADY_EXISTS,
-					 "Duplicate label '%s'",
-					 info->label->s));
-		return;
+	if (!invoices_create(wallet->invoices,
+			     &inv_dbid,
+			     info->b11->msat,
+			     info->label,
+			     info->b11->expiry,
+			     b11enc,
+			     info->b11->description,
+			     info->b11->features,
+			     &info->payment_preimage,
+			     &info->b11->payment_hash,
+			     NULL)) {
+		return command_fail(info->cmd, INVOICE_LABEL_ALREADY_EXISTS,
+				    "Duplicate label '%s'",
+				    info->label->s);
+	}
+
+	if (info->cmd->ld->unified_invoices && info->b11->fallbacks && !info->custom_fallbacks) {
+		for (size_t i = 0; i < tal_count(info->b11->fallbacks); i++) {
+			const u8 *fallback_script = info->b11->fallbacks[i];
+			invoices_create_fallback(wallet->invoices, inv_dbid, fallback_script);
+		}
 	}
 
 	/* Get details */
-	details = wallet_invoice_details(info, wallet, invoice);
+	details = invoices_get_details(info, wallet->invoices, inv_dbid);
 
 	response = json_stream_success(info->cmd);
 	json_add_sha256(response, "payment_hash", &details->rhash);
 	json_add_u64(response, "expires_at", details->expiry_time);
 	json_add_string(response, "bolt11", details->invstring);
+	invoice_secret(&details->r, &payment_secret);
+	json_add_secret(response, "payment_secret", &payment_secret);
+	json_add_u64(response, "created_index", details->created_index);
 
 	notify_invoice_creation(info->cmd->ld, info->b11->msat,
-				info->payment_preimage, info->label);
+				&info->payment_preimage, info->label, NULL);
 
-	/* Warn if there's not sufficient incoming capacity. */
-	if (tal_count(info->b11->routes) == 0) {
-		log_unusual(info->cmd->ld->log,
-			    "invoice: insufficient incoming capacity for %s%s",
-			    info->b11->msat
-			    ? type_to_string(tmpctx, struct amount_msat,
-					     info->b11->msat)
-			    : "0",
-			    amount_msat_greater(offline_amt, AMOUNT_MSAT(0))
-			    ? " (among currently connected peers)" : "");
-
-		if (amount_msat_greater(offline_amt, AMOUNT_MSAT(0))) {
-			json_add_string(response, "warning_offline",
-					"No channel with a peer that is currently connected"
-					" has sufficient incoming capacity");
-		} else if (deadends) {
-			json_add_string(response, "warning_deadends",
-					"No channel with a peer that is not a dead end");
-		} else if (tal_count(candidates) == 0) {
-			json_add_string(response, "warning_capacity",
-					"No channels");
-		} else {
-			json_add_string(response, "warning_capacity",
-					"No channel with a peer that has sufficient incoming capacity");
-		}
-	}
-
+	if (warning_no_listincoming)
+		json_add_string(response, "warning_listincoming",
+				"No listincoming command available, cannot add routehints to invoice");
 	if (warning_mpp)
 		json_add_string(response, "warning_mpp",
-				"The invoice might only be payable by MPP-capable payers.");
-	if (warning_mpp_capacity)
-		json_add_string(response, "warning_mpp_capacity",
-				"The total incoming capacity is still insufficient even if the payer had MPP capability.");
+				"The invoice is only payable by MPP-capable payers.");
+	if (warning_capacity)
+		json_add_string(response, "warning_capacity",
+				"Insufficient incoming channel capacity to pay invoice");
 
-	was_pending(command_success(info->cmd, response));
+	if (warning_deadends)
+		json_add_string(response, "warning_deadends",
+				"Insufficient incoming capacity, once dead-end peers were excluded");
+
+	if (warning_offline)
+		json_add_string(response, "warning_offline",
+				"Insufficient incoming capacity, once offline peers were excluded");
+
+	if (warning_private_unused)
+		json_add_string(response, "warning_private_unused",
+				"Insufficient incoming capacity, once private channels were excluded (try exposeprivatechannels=true?)");
+
+	if (info->cmd->ld->unified_invoices && info->custom_fallbacks)
+		json_add_string(response, "warning_custom_fallbacks",
+				"WARNING: Not tracking on-chain payments for custom fallback addresses");
+
+	return command_success(info->cmd, response);
 }
 
-#if DEVELOPER
+/* Return from "listincoming". */
+static void listincoming_done(const char *buffer,
+			      const jsmntok_t *toks,
+			      const jsmntok_t *idtok UNUSED,
+			      struct invoice_info *info)
+{
+	struct command_result *ret;
+	bool warning_mpp, warning_capacity, warning_deadends, warning_offline, warning_private_unused;
+
+	ret = add_routehints(info, buffer, toks,
+			     &warning_mpp,
+			     &warning_capacity,
+			     &warning_deadends,
+			     &warning_offline,
+			     &warning_private_unused);
+	if (ret)
+		return;
+
+	invoice_complete(info,
+			 false,
+			 warning_mpp,
+			 warning_capacity,
+			 warning_deadends,
+			 warning_offline,
+			 warning_private_unused);
+}
+
+void invoice_check_onchain_payment(struct lightningd *ld,
+				   const u8 *scriptPubKey,
+				   struct amount_sat sat,
+				   const struct bitcoin_outpoint *outpoint)
+{
+	u64 inv_dbid;
+	const struct invoice_details *details;
+	struct amount_msat msat;
+	if (!amount_sat_to_msat(&msat, sat))
+		abort();
+	/* Does this onchain payment fulfill an invoice? */
+	if(!invoices_find_by_fallback_script(ld->wallet->invoices, &inv_dbid, scriptPubKey)) {
+		return;
+	}
+
+	details = invoices_get_details(tmpctx, ld->wallet->invoices, inv_dbid);
+
+	/* details->msat is NULL if they specified "any": any amount will do. */
+	if (details->msat && amount_msat_less(msat, *details->msat)) {
+		// notify_underpaid_onchain_invoice();
+		return;
+	}
+
+	invoice_try_pay(ld, NULL, details, msat, outpoint);
+}
+
 /* Since this is a dev-only option, we will crash if dev-routes is not
  * an array-of-arrays-of-correct-items. */
 static struct route_info *unpack_route(const tal_t *ctx,
@@ -858,7 +1033,6 @@ static struct route_info **unpack_routes(const tal_t *ctx,
 
 	return routes;
 }
-#endif /* DEVELOPER */
 
 static struct command_result *param_positive_msat_or_any(struct command *cmd,
 							 const char *name,
@@ -872,58 +1046,11 @@ static struct command_result *param_positive_msat_or_any(struct command *cmd,
 	}
 	*msat = tal(cmd, struct amount_msat);
 	if (parse_amount_msat(*msat, buffer + tok->start, tok->end - tok->start)
-	    && !amount_msat_eq(**msat, AMOUNT_MSAT(0)))
+	    && !amount_msat_is_zero(**msat))
 		return NULL;
 
 	return command_fail_badparam(cmd, name, buffer, tok,
 				     "should be positive msat or 'any'");
-}
-
-/* Parse time with optional suffix, return seconds */
-static struct command_result *param_time(struct command *cmd, const char *name,
-					 const char *buffer,
-					 const jsmntok_t *tok,
-					 uint64_t **secs)
-{
-	/* We need to manipulate this, so make copy */
-	jsmntok_t timetok = *tok;
-	u64 mul;
-	char s;
-	struct {
-		char suffix;
-		u64 mul;
-	} suffixes[] = {
-		{ 's', 1 },
-		{ 'm', 60 },
-		{ 'h', 60*60 },
-		{ 'd', 24*60*60 },
-		{ 'w', 7*24*60*60 } };
-
-	mul = 1;
-	if (timetok.end == timetok.start)
-		s = '\0';
-	else
-		s = buffer[timetok.end - 1];
-	for (size_t i = 0; i < ARRAY_SIZE(suffixes); i++) {
-		if (s == suffixes[i].suffix) {
-			mul = suffixes[i].mul;
-			timetok.end--;
-			break;
-		}
-	}
-
-	*secs = tal(cmd, uint64_t);
-	if (json_to_u64(buffer, &timetok, *secs)) {
-		if (mul_overflows_u64(**secs, mul)) {
-			return command_fail_badparam(cmd, name, buffer, tok,
-						     "value too large");
-		}
-		**secs *= mul;
-		return NULL;
-	}
-
-	return command_fail_badparam(cmd, name, buffer, tok,
-				     "should be a number with optional {s,m,h,d,w} suffix");
 }
 
 static struct command_result *param_chanhints(struct command *cmd,
@@ -939,12 +1066,11 @@ static struct command_result *param_chanhints(struct command *cmd,
 	/* Could be simply "true" or "false" */
 	if (json_to_bool(buffer, tok, &boolhint)) {
 		(*chanhints)->expose_all_private = boolhint;
-		(*chanhints)->hints
-			= tal_arr(*chanhints, struct short_channel_id, 0);
+		(*chanhints)->hints = NULL;
 		return NULL;
 	}
 
-	(*chanhints)->expose_all_private = false;
+	(*chanhints)->expose_all_private = true;
 	/* Could be a single short_channel_id or an array */
 	if (tok->type == JSMN_ARRAY) {
 		size_t i;
@@ -998,54 +1124,71 @@ static struct command_result *json_invoice(struct command *cmd,
 	struct secret payment_secret;
 	struct preimage *preimage;
 	u32 *cltv;
-#if DEVELOPER
-	const jsmntok_t *routes;
-#endif
+	struct jsonrpc_request *req;
+	struct plugin *plugin;
+	bool *hashonly;
+	const size_t inv_max_label_len = 128;
+	const jsmntok_t *dev_routes;
 
 	info = tal(cmd, struct invoice_info);
 	info->cmd = cmd;
 
-	if (!param(cmd, buffer, params,
-		   p_req("msatoshi", param_positive_msat_or_any, &msatoshi_val),
-		   p_req("label", param_label, &info->label),
-		   p_req("description", param_escaped_string, &desc_val),
-		   p_opt_def("expiry", param_time, &expiry, 3600*24*7),
-		   p_opt("fallbacks", param_array, &fallbacks),
-		   p_opt("preimage", param_preimage, &preimage),
-		   p_opt("exposeprivatechannels", param_chanhints,
-			 &info->chanhints),
-		   p_opt_def("cltv", param_number, &cltv,
-			     cmd->ld->config.cltv_final),
-#if DEVELOPER
-		   p_opt("dev-routes", param_array, &routes),
-#endif
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("amount_msat", param_positive_msat_or_any, &msatoshi_val),
+			 p_req("label", param_label, &info->label),
+			 p_req("description", param_escaped_string, &desc_val),
+			 p_opt_def("expiry", param_u64, &expiry, 3600*24*7),
+			 p_opt("fallbacks", param_array, &fallbacks),
+			 p_opt("preimage", param_preimage, &preimage),
+			 p_opt("exposeprivatechannels", param_chanhints,
+			       &info->chanhints),
+			 p_opt_def("cltv", param_number, &cltv,
+				   cmd->ld->config.cltv_final),
+			 p_opt_def("deschashonly", param_bool, &hashonly, false),
+			 p_opt("dev-routes", param_array, &dev_routes),
+			 NULL))
 		return command_param_failed();
 
-	if (strlen(info->label->s) > INVOICE_MAX_LABEL_LEN) {
+	if (dev_routes && !cmd->ld->developer)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Label '%s' over %u bytes", info->label->s,
-				    INVOICE_MAX_LABEL_LEN);
+				    "dev-routes requires --developer");
+
+	/* Two hard limits on how far in the future an invoice can expire:
+	 * push_varlen_field() can only encode up to 60 bits (larger values
+	 * abort the daemon in bolt11_encode()), and the invoice expiration
+	 * timer overflows its u64 nanosecond-based grain count far below
+	 * that, leaving the expiry check looping forever.  2^32 seconds
+	 * (~136 years) keeps a wide margin under both. */
+	if (*expiry >= (u64)1 << 32)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "expiry must be below 2^32 seconds"
+				    " (~136 years)");
+
+	if (strlen(info->label->s) > inv_max_label_len) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Label '%s' over %zu bytes", info->label->s, inv_max_label_len);
 	}
 
-	if (strlen(desc_val) >= BOLT11_FIELD_BYTE_LIMIT) {
+	if (strlen(desc_val) > BOLT11_FIELD_BYTE_LIMIT && !*hashonly) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Descriptions greater than %d bytes "
-				    "not yet supported "
+				    "Description greater than %d bytes "
+				    "invalid "
 				    "(description length %zu)",
 				    BOLT11_FIELD_BYTE_LIMIT,
 				    strlen(desc_val));
 	}
 
-	if (msatoshi_val
-	    && amount_msat_greater(*msatoshi_val, chainparams->max_payment)) {
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "msatoshi cannot exceed %s",
-				    type_to_string(tmpctx, struct amount_msat,
-						   &chainparams->max_payment));
-	}
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
 
+	info->custom_fallbacks = false;
 	if (fallbacks) {
+		info->custom_fallbacks = true;
+		if (cmd->ld->unified_invoices) {
+			log_info(cmd->ld->log,
+				 "WARNING: Not tracking on-chain payments "
+				 "for custom fallback addresses");
+		}
 		size_t i;
 		const jsmntok_t *t;
 
@@ -1057,14 +1200,25 @@ static struct command_result *json_invoice(struct command *cmd,
 			if (r)
 				return r;
 		}
+	} else if (cmd->ld->unified_invoices) {
+		struct pubkey pubkey;
+		const u8 *p2tr;
+
+		fallback_scripts = tal_arr(cmd, const u8 *, 1);
+
+		if (!newaddr_inner(cmd, &pubkey, ADDR_P2TR))
+			return command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
+
+		p2tr = scriptpubkey_p2tr(fallback_scripts, &pubkey);
+		fallback_scripts[0] = p2tr;
 	}
 
 	if (preimage)
 		info->payment_preimage = *preimage;
 	else
 		/* Generate random secret preimage. */
-		randombytes_buf(&info->payment_preimage,
-				sizeof(info->payment_preimage));
+		randbytes(&info->payment_preimage,
+			    sizeof(info->payment_preimage));
 	/* Generate preimage hash. */
 	sha256(&rhash, &info->payment_preimage, sizeof(info->payment_preimage));
 	/* Generate payment secret. */
@@ -1072,81 +1226,110 @@ static struct command_result *json_invoice(struct command *cmd,
 
 	info->b11 = new_bolt11(info, msatoshi_val);
 	info->b11->chain = chainparams;
-	info->b11->timestamp = time_now().ts.tv_sec;
+	info->b11->timestamp = clock_time().ts.tv_sec;
 	info->b11->payment_hash = rhash;
-	info->b11->receiver_id = cmd->ld->id;
+	info->b11->receiver_id = cmd->ld->our_nodeid;
 	info->b11->min_final_cltv_expiry = *cltv;
 	info->b11->expiry = *expiry;
 	info->b11->description = tal_steal(info->b11, desc_val);
-	info->b11->description_hash = NULL;
+	/* BOLT #11:
+	 * * `h` (23): `data_length` 52. 256-bit description of purpose of payment (SHA256).
+	 */
+	/* BOLT #11:
+	 *
+	 * A writer:
+	 *...
+	 *    - MUST include either exactly one `d` or exactly one `h` field.
+	 */
+	if (*hashonly) {
+		info->b11->description_hash = tal(info->b11, struct sha256);
+		sha256(info->b11->description_hash, desc_val, strlen(desc_val));
+	} else
+		info->b11->description_hash = NULL;
 	info->b11->payment_secret = tal_dup(info->b11, struct secret,
 					    &payment_secret);
+	/* BOLT #11:
+	 *
+	 * A writer:
+	 *   - MUST set the `9` field to a feature vector compliant with the
+	 *     [BOLT 9 origin node requirements](09-features.md#requirements).
+	 */
 	info->b11->features = tal_dup_talarr(info->b11, u8,
 					     cmd->ld->our_features
 					     ->bits[BOLT11_FEATURE]);
 
-#if DEVELOPER
-	info->b11->routes = unpack_routes(info->b11, buffer, routes);
-#else
-	info->b11->routes = NULL;
-#endif
+	info->b11->routes = unpack_routes(info->b11, buffer, dev_routes);
+
 	if (fallback_scripts)
 		info->b11->fallbacks = tal_steal(info->b11, fallback_scripts);
 
-	subd_req(cmd, cmd->ld->gossip,
-		 take(towire_gossipd_get_incoming_channels(NULL)),
-		 -1, 0, gossipd_incoming_channels_reply, info);
+	/* We can't generate routehints without listincoming. */
+	plugin = find_plugin_for_command(cmd->ld, "listincoming");
+	if (!plugin) {
+		return invoice_complete(info, true,
+					false, false, false, false, false);
+	}
 
+	req = jsonrpc_request_start(info, "listincoming",
+				    cmd->id,
+				    command_logger(cmd),
+				    NULL, listincoming_done,
+				    info);
+	jsonrpc_request_end(req);
+	plugin_request_send(plugin, req);
 	return command_still_pending(cmd);
 }
 
 static const struct json_command invoice_command = {
 	"invoice",
-	"payment",
 	json_invoice,
-	"Create an invoice for {msatoshi} with {label} "
-	"and {description} with optional {expiry} seconds "
-	"(default 1 week), optional {fallbacks} address list"
-	"(default empty list) and optional {preimage} "
-	"(default autogenerated)"};
+};
 AUTODATA(json_command, &invoice_command);
 
 static void json_add_invoices(struct json_stream *response,
 			      struct wallet *wallet,
 			      const struct json_escape *label,
-			      const struct sha256 *payment_hash)
+			      const struct sha256 *payment_hash,
+			      const struct sha256 *local_offer_id,
+			      const enum wait_index *listindex,
+			      u64 liststart,
+			      const u32 *listlimit)
 {
-	struct invoice_iterator it;
 	const struct invoice_details *details;
-	struct invoice invoice;
+	u64 inv_dbid;
 
 	/* Don't iterate entire db if we're just after one. */
 	if (label) {
-		if (wallet_invoice_find_by_label(wallet, &invoice, label)) {
+		if (invoices_find_by_label(wallet->invoices, &inv_dbid, label)) {
 			details =
-			    wallet_invoice_details(response, wallet, invoice);
-			json_object_start(response, NULL);
-			json_add_invoice(response, details);
-			json_object_end(response);
+			    invoices_get_details(tmpctx, wallet->invoices, inv_dbid);
+			json_add_invoice(response, NULL, details);
 		}
 	} else if (payment_hash != NULL) {
-		if (wallet_invoice_find_by_rhash(wallet, &invoice,
+		if (invoices_find_by_rhash(wallet->invoices, &inv_dbid,
 						 payment_hash)) {
-			json_object_start(response, NULL);
-			json_add_invoice(
-			    response,
-			    wallet_invoice_details(response, wallet, invoice));
-			json_object_end(response);
+			details =
+			    invoices_get_details(tmpctx, wallet->invoices, inv_dbid);
+			json_add_invoice(response, NULL, details);
 		}
-
 	} else {
-		memset(&it, 0, sizeof(it));
-		while (wallet_invoice_iterate(wallet, &it)) {
-			details = wallet_invoice_iterator_deref(response,
-								wallet, &it);
-			json_object_start(response, NULL);
-			json_add_invoice(response, details);
-			json_object_end(response);
+		struct db_stmt *stmt;
+
+		for (stmt = invoices_first(wallet->invoices,
+					   listindex, liststart, listlimit,
+					   &inv_dbid);
+		     stmt;
+		     stmt = invoices_next(wallet->invoices, stmt, &inv_dbid)) {
+			details = invoices_get_details(tmpctx,
+						       wallet->invoices, inv_dbid);
+			/* FIXME: db can filter this better! */
+			if (local_offer_id) {
+				if (!details->local_offer_id
+				    || !sha256_eq(local_offer_id,
+						  details->local_offer_id))
+					continue;
+			}
+			json_add_invoice(response, NULL, details);
 		}
 	}
 }
@@ -1160,44 +1343,74 @@ static struct command_result *json_listinvoices(struct command *cmd,
 	struct json_stream *response;
 	struct wallet *wallet = cmd->ld->wallet;
 	const char *invstring;
-	struct sha256 *payment_hash;
-	char *fail;
-	struct bolt11 *b11;
+	struct sha256 *payment_hash, *offer_id;
+	enum wait_index *listindex;
+	u64 *liststart;
+	u32 *listlimit;
+	const char *fail;
 
-	if (!param(cmd, buffer, params,
-		   p_opt("label", param_label, &label),
-		   p_opt("invstring", param_string, &invstring),
-		   p_opt("payment_hash", param_sha256, &payment_hash),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_opt("label", param_label, &label),
+			 p_opt("invstring", param_invstring, &invstring),
+			 p_opt("payment_hash", param_sha256, &payment_hash),
+			 p_opt("offer_id", param_sha256, &offer_id),
+			 p_opt("index", param_index, &listindex),
+			 p_opt_def("start", param_u64, &liststart, 0),
+			 p_opt("limit", param_u32, &listlimit),
+			 NULL))
 		return command_param_failed();
 
-	if ((label && invstring) || (label && payment_hash) ||
-	    (invstring && payment_hash)) {
+	/* Yeah, I wasn't sure about this style either.  It's curt though! */
+	if (!!label + !!invstring + !!payment_hash + !!offer_id > 1) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Can only specify one of"
-				    " {label}, {invstring} or {payment_hash}");
+				    " {label}, {invstring}, {payment_hash}"
+				    " or {offer_id}");
+	}
+	if (*liststart != 0 && !listindex) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Can only specify {start} with {index}");
+	}
+	if (listlimit && !listindex) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Can only specify {limit} with {index}");
 	}
 
 	/* Extract the payment_hash from the invoice. */
 	if (invstring != NULL) {
+		struct bolt11 *b11;
 		b11 = bolt11_decode(cmd, invstring, cmd->ld->our_features, NULL,
 				    NULL, &fail);
-		payment_hash = &b11->payment_hash;
+		if (b11)
+			payment_hash = &b11->payment_hash;
+		else {
+			struct tlv_invoice *b12
+				= invoice_decode(tmpctx, invstring,
+						 strlen(invstring),
+						 cmd->ld->our_features, NULL,
+						 &fail);
+			if (!b12 || !b12->invoice_payment_hash) {
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "Invalid invstring");
+			}
+			payment_hash = b12->invoice_payment_hash;
+		}
 	}
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
 
 	response = json_stream_success(cmd);
 	json_array_start(response, "invoices");
-	json_add_invoices(response, wallet, label, payment_hash);
+	json_add_invoices(response, wallet, label, payment_hash, offer_id,
+			  listindex, *liststart, listlimit);
 	json_array_end(response);
 	return command_success(cmd, response);
 }
 
 static const struct json_command listinvoices_command = {
 	"listinvoices",
-	"payment",
 	json_listinvoices,
-	"Show invoice matching {label}, {invstring} or {payment_hash} (or all, if "
-	"no query parameter specified)"
 };
 AUTODATA(json_command, &listinvoices_command);
 
@@ -1206,28 +1419,30 @@ static struct command_result *json_delinvoice(struct command *cmd,
 					      const jsmntok_t *obj UNNEEDED,
 					      const jsmntok_t *params)
 {
-	struct invoice i;
-	const struct invoice_details *details;
+	u64 inv_dbid;
+	struct invoice_details *details;
 	struct json_stream *response;
 	const char *status, *actual_status;
 	struct json_escape *label;
 	struct wallet *wallet = cmd->ld->wallet;
+	bool *deldesc;
 
-	if (!param(cmd, buffer, params,
-		   p_req("label", param_label, &label),
-		   p_req("status", param_string, &status),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("label", param_label, &label),
+			 p_req("status", param_string, &status),
+			 p_opt_def("desconly", param_bool, &deldesc, false),
+			 NULL))
 		return command_param_failed();
 
-	if (!wallet_invoice_find_by_label(wallet, &i, label)) {
+	if (!invoices_find_by_label(wallet->invoices, &inv_dbid, label)) {
 		return command_fail(cmd, INVOICE_NOT_FOUND, "Unknown invoice");
 	}
 
-	details = wallet_invoice_details(cmd, cmd->ld->wallet, i);
+	details = invoices_get_details(cmd, cmd->ld->wallet->invoices, inv_dbid);
 
 	/* This is time-sensitive, so only call once; otherwise error msg
 	 * might not make sense if it changed! */
-	actual_status = invoice_status_str(details);
+	actual_status = invoice_status_str(details->state);
 	if (!streq(actual_status, status)) {
 		struct json_stream *js;
 		js = json_stream_fail(cmd, INVOICE_STATUS_UNEXPECTED,
@@ -1240,51 +1455,49 @@ static struct command_result *json_delinvoice(struct command *cmd,
 		return command_failed(cmd, js);
 	}
 
-	if (!wallet_invoice_delete(wallet, i)) {
-		log_broken(cmd->ld->log,
-			   "Error attempting to remove invoice %"PRIu64,
-			   i.id);
-		/* FIXME: allocate a generic DATABASE_ERROR code.  */
-		return command_fail(cmd, LIGHTNINGD, "Database error");
+	if (*deldesc) {
+		if (!details->description)
+			return command_fail(cmd, INVOICE_NO_DESCRIPTION,
+					    "Invoice description already removed");
+
+		if (command_check_only(cmd))
+			return command_check_done(cmd);
+
+		if (!invoices_delete_description(wallet->invoices, inv_dbid,
+						 details->label, details->description)) {
+			log_broken(cmd->ld->log,
+				   "Error attempting to delete description of invoice %"PRIu64,
+				   inv_dbid);
+			/* FIXME: allocate a generic DATABASE_ERROR code.  */
+			return command_fail(cmd, LIGHTNINGD, "Database error");
+		}
+		details->description = tal_free(details->description);
+	} else {
+		if (command_check_only(cmd))
+			return command_check_done(cmd);
+
+		if (!invoices_delete(wallet->invoices, inv_dbid,
+				     details->state,
+				     details->label,
+				     details->invstring)) {
+			log_broken(cmd->ld->log,
+				   "Error attempting to remove invoice %"PRIu64,
+				   inv_dbid);
+			/* FIXME: allocate a generic DATABASE_ERROR code.  */
+			return command_fail(cmd, LIGHTNINGD, "Database error");
+		}
 	}
 
 	response = json_stream_success(cmd);
-	json_add_invoice(response, details);
+	json_add_invoice_fields(response, details);
 	return command_success(cmd, response);
 }
 
 static const struct json_command delinvoice_command = {
 	"delinvoice",
-	"payment",
 	json_delinvoice,
-	"Delete unpaid invoice {label} with {status}",
 };
 AUTODATA(json_command, &delinvoice_command);
-
-static struct command_result *json_delexpiredinvoice(struct command *cmd,
-						     const char *buffer,
-						     const jsmntok_t *obj UNNEEDED,
-						     const jsmntok_t *params)
-{
-	u64 *maxexpirytime;
-
-	if (!param(cmd, buffer, params,
-		   p_opt_def("maxexpirytime", param_u64, &maxexpirytime,
-				 time_now().ts.tv_sec),
-		   NULL))
-		return command_param_failed();
-
-	wallet_invoice_delete_expired(cmd->ld->wallet, *maxexpirytime);
-
-	return command_success(cmd, json_stream_success(cmd));
-}
-static const struct json_command delexpiredinvoice_command = {
-	"delexpiredinvoice",
-	"payment",
-	json_delexpiredinvoice,
-	"Delete all expired invoices that expired as of given {maxexpirytime} (a UNIX epoch time), or all expired invoices if not specified"
-};
-AUTODATA(json_command, &delexpiredinvoice_command);
 
 static struct command_result *json_waitanyinvoice(struct command *cmd,
 						  const char *buffer,
@@ -1317,8 +1530,8 @@ static struct command_result *json_waitanyinvoice(struct command *cmd,
 	fixme_ignore(command_still_pending(cmd));
 
 	/* Find next paid invoice. */
-	wallet_invoice_waitany(cmd, wallet, *pay_index,
-			       &wait_on_invoice, (void*) cmd);
+	invoices_waitany(cmd, wallet->invoices, *pay_index,
+			 &wait_on_invoice, (void*) cmd);
 
 	return command_its_complicated("wallet_invoice_waitany might complete"
 				       " immediately, but we also call it as a"
@@ -1329,10 +1542,7 @@ static struct command_result *json_waitanyinvoice(struct command *cmd,
 
 static const struct json_command waitanyinvoice_command = {
 	"waitanyinvoice",
-	"payment",
 	json_waitanyinvoice,
-	"Wait for the next invoice to be paid, after {lastpay_index} (if supplied).  "
-	"If {timeout} seconds is reached while waiting, fail with an error."
 };
 AUTODATA(json_command, &waitanyinvoice_command);
 
@@ -1346,29 +1556,32 @@ static struct command_result *json_waitinvoice(struct command *cmd,
 					       const jsmntok_t *obj UNNEEDED,
 					       const jsmntok_t *params)
 {
-	struct invoice i;
+	u64 inv_dbid;
 	const struct invoice_details *details;
 	struct wallet *wallet = cmd->ld->wallet;
 	struct json_escape *label;
 
-	if (!param(cmd, buffer, params,
-		   p_req("label", param_label, &label),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("label", param_label, &label),
+			 NULL))
 		return command_param_failed();
 
-	if (!wallet_invoice_find_by_label(wallet, &i, label)) {
+	if (!invoices_find_by_label(wallet->invoices, &inv_dbid, label)) {
 		return command_fail(cmd, LIGHTNINGD, "Label not found");
 	}
-	details = wallet_invoice_details(cmd, cmd->ld->wallet, i);
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	details = invoices_get_details(cmd, cmd->ld->wallet->invoices, inv_dbid);
 
 	/* If paid or expired return immediately */
 	if (details->state == PAID || details->state == EXPIRED) {
-		return tell_waiter(cmd, &i);
+		return tell_waiter(cmd, inv_dbid);
 	} else {
 		/* There is an unpaid one matching, let's wait... */
 		fixme_ignore(command_still_pending(cmd));
-		wallet_invoice_waitone(cmd, wallet, i,
-				       &wait_on_invoice, (void *) cmd);
+		invoices_waitone(cmd, wallet->invoices, inv_dbid,
+				 &wait_on_invoice, (void *) cmd);
 		return command_its_complicated("wallet_invoice_waitone might"
 					       " complete immediately");
 	}
@@ -1376,66 +1589,84 @@ static struct command_result *json_waitinvoice(struct command *cmd,
 
 static const struct json_command waitinvoice_command = {
 	"waitinvoice",
-	"payment",
 	json_waitinvoice,
-	"Wait for an incoming payment matching the invoice with {label}, or if the invoice expires"
 };
 AUTODATA(json_command, &waitinvoice_command);
-
-static struct command_result *json_decodepay(struct command *cmd,
-					     const char *buffer,
-					     const jsmntok_t *obj UNNEEDED,
-					     const jsmntok_t *params)
-{
-	struct bolt11 *b11;
-	struct json_stream *response;
-	const char *str, *desc;
-	char *fail;
-
-	if (!param(cmd, buffer, params,
-		   p_req("bolt11", param_string, &str),
-		   p_opt("description", param_string, &desc),
-		   NULL))
-		return command_param_failed();
-
-	b11 = bolt11_decode(cmd, str, cmd->ld->our_features, desc, NULL,
-			    &fail);
-
-	if (!b11) {
-		return command_fail(cmd, LIGHTNINGD, "Invalid bolt11: %s", fail);
-	}
-
-	response = json_stream_success(cmd);
-	json_add_bolt11(response, b11);
-	return command_success(cmd, response);
-}
-
-static const struct json_command decodepay_command = {
-	"decodepay",
-	"payment",
-	json_decodepay,
-	"Decode {bolt11}, using {description} if necessary"
-};
-AUTODATA(json_command, &decodepay_command);
 
 /* If we fail because it exists, we also return the clashing invoice */
 static struct command_result *fail_exists(struct command *cmd,
 					  const struct json_escape *label)
 {
 	struct json_stream *data;
-	struct invoice invoice;
+	u64 inv_dbid;
 	struct wallet *wallet = cmd->ld->wallet;
 
 	data = json_stream_fail(cmd, INVOICE_LABEL_ALREADY_EXISTS,
 				"Duplicate label");
-	if (!wallet_invoice_find_by_label(wallet, &invoice, label))
+	if (!invoices_find_by_label(wallet->invoices, &inv_dbid, label))
 		fatal("Duplicate invoice %s not found any more?",
 		      label->s);
 
-	json_add_invoice(data, wallet_invoice_details(cmd, wallet, invoice));
+	json_add_invoice_fields(data,
+				invoices_get_details(cmd, wallet->invoices, inv_dbid));
 	json_object_end(data);
 
 	return command_failed(cmd, data);
+}
+
+/* This is only if we're a public node; otherwise, the offers plugin
+ * will have populated a real blinded path */
+static void add_stub_blindedpath(const tal_t *ctx,
+				 struct lightningd *ld,
+				 struct tlv_invoice *inv)
+{
+	struct blinded_path *path;
+	struct privkey path_key;
+	struct tlv_encrypted_data_tlv *tlv;
+
+	path = tal(NULL, struct blinded_path);
+	sciddir_or_pubkey_from_pubkey(&path->first_node_id, &ld->our_pubkey);
+	randbytes(&path_key, sizeof(path_key));
+	if (!pubkey_from_privkey(&path_key, &path->first_path_key))
+		abort();
+	path->path = tal_arr(path, struct blinded_path_hop *, 1);
+	path->path[0] = tal(path->path, struct blinded_path_hop);
+
+	/* A message in a bottle to ourselves: match it with
+	 * the invoice: we assume the payment_hash is unique! */
+	tlv = tlv_encrypted_data_tlv_new(tmpctx);
+	tlv->path_id = bolt12_path_id(inv,
+				      &ld->invoicesecret_base,
+				      inv->invoice_payment_hash);
+
+	path->path[0]->encrypted_recipient_data
+		= encrypt_tlv_encrypted_data(path->path[0],
+					     &path_key,
+					     &path->first_node_id.pubkey,
+					     tlv,
+					     NULL,
+					     &path->path[0]->blinded_node_id);
+
+	inv->invoice_paths = tal_arr(inv, struct blinded_path *, 1);
+	inv->invoice_paths[0] = tal_steal(inv->invoice_paths, path);
+
+	/* BOLT #12:
+	 *  - MUST include `invoice_paths` containing one or more paths to the node.
+	 *  - MUST specify `invoice_paths` in order of most-preferred to least-preferred if it has a preference.
+	 *  - MUST include `invoice_blindedpay` with exactly one `blinded_payinfo` for each `blinded_path` in `paths`, in order.
+	 */
+	inv->invoice_blindedpay = tal_arr(inv, struct blinded_payinfo *, 1);
+	inv->invoice_blindedpay[0] = tal(inv->invoice_blindedpay,
+					 struct blinded_payinfo);
+	inv->invoice_blindedpay[0]->fee_base_msat = 0;
+	inv->invoice_blindedpay[0]->fee_proportional_millionths = 0;
+	inv->invoice_blindedpay[0]->cltv_expiry_delta = ld->config.cltv_final;
+	inv->invoice_blindedpay[0]->htlc_minimum_msat = AMOUNT_MSAT(0);
+	inv->invoice_blindedpay[0]->htlc_maximum_msat = AMOUNT_MSAT(21000000 * MSAT_PER_BTC);
+	inv->invoice_blindedpay[0]->features = NULL;
+
+	/* Recalc ->fields */
+	tlv_update_fields(inv, tlv_invoice, &inv->fields);
 }
 
 static struct command_result *json_createinvoice(struct command *cmd,
@@ -1446,27 +1677,44 @@ static struct command_result *json_createinvoice(struct command *cmd,
 	const char *invstring;
 	struct json_escape *label;
 	struct preimage *preimage;
-	struct invoice invoice;
+	u64 inv_dbid;
 	struct sha256 payment_hash;
 	struct json_stream *response;
 	struct bolt11 *b11;
 	struct sha256 hash;
-	u5 *sig;
+	const u5 *sig;
 	bool have_n;
-	char *fail;
+	const char *fail;
 
-	if (!param(cmd, buffer, params,
-		   p_req("invstring", param_string, &invstring),
-		   p_req("label", param_label, &label),
-		   p_req("preimage", param_preimage, &preimage),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("invstring", param_invstring, &invstring),
+			 p_req("label", param_label, &label),
+			 p_req("preimage", param_preimage, &preimage),
+			 NULL))
 		return command_param_failed();
 
 	sha256(&payment_hash, preimage, sizeof(*preimage));
+
+	/* invoices_create() only catches duplicate labels (reported via
+	 * fail_exists() below), but payment_hash is UNIQUE in the db too. */
+	if (!invoices_find_by_label(cmd->ld->wallet->invoices, &inv_dbid, label)
+	    && invoices_find_by_rhash(cmd->ld->wallet->invoices,
+				      &inv_dbid, &payment_hash))
+		return command_fail(cmd, INVOICE_PREIMAGE_ALREADY_EXISTS,
+				    "preimage already used");
+
 	b11 = bolt11_decode_nosig(cmd, invstring, cmd->ld->our_features,
 				  NULL, chainparams, &hash, &sig, &have_n,
 				  &fail);
 	if (b11) {
+		/* Same bound as the invoice RPC: past 60 bits
+		 * bolt11_encode() below aborts, and the expiry timer
+		 * overflows its u64 nanosecond grain far below that. */
+		if (b11->expiry >= (u64)1 << 32)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "expiry must be below 2^32 seconds"
+					    " (~136 years)");
+
 		/* This adds the signature */
 		char *b11enc = bolt11_encode(cmd, b11, have_n,
 					     hsm_sign_b11, cmd->ld);
@@ -1483,105 +1731,301 @@ static struct command_result *json_createinvoice(struct command *cmd,
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "Incorrect preimage");
 
-		if (!wallet_invoice_create(cmd->ld->wallet,
-					   &invoice,
-					   b11->msat,
-					   label,
-					   b11->expiry,
-					   b11enc,
-					   b11->description,
-					   b11->features,
-					   preimage,
-					   &payment_hash,
-					   NULL))
+		if (command_check_only(cmd))
+			return command_check_done(cmd);
+
+		if (!invoices_create(cmd->ld->wallet->invoices,
+				     &inv_dbid,
+				     b11->msat,
+				     label,
+				     b11->expiry,
+				     b11enc,
+				     b11->description,
+				     b11->features,
+				     preimage,
+				     &payment_hash,
+				     NULL))
 			return fail_exists(cmd, label);
 
-		notify_invoice_creation(cmd->ld, b11->msat, *preimage, label);
+		notify_invoice_creation(cmd->ld, b11->msat, preimage, label, NULL);
 	} else {
 		struct tlv_invoice *inv;
-		struct sha256 *local_offer_id;
+		struct sha256 offer_id, *local_offer_id;
+		char *b12enc;
+		struct amount_msat msat;
+		const char *desc;
+		u32 expiry;
+		enum offer_status status;
 
-		inv = invoice_decode_nosig(cmd, invstring, strlen(invstring),
-					   cmd->ld->our_features, chainparams,
-					   &fail);
-		if (inv) {
-			char *b12enc;
-			struct amount_msat msat;
-			const char *desc;
-			u32 expiry;
-			enum offer_status status;
-
-			if (inv->signature)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "invoice already signed");
-			hsm_sign_b12_invoice(cmd->ld, inv);
-			b12enc = invoice_encode(cmd, inv);
-
-			if (inv->offer_id
-			    && wallet_offer_find(tmpctx, cmd->ld->wallet,
-						 inv->offer_id, NULL, &status)) {
-				if (!offer_status_active(status))
-					return command_fail(cmd, INVOICE_OFFER_INACTIVE,
-							    "offer not active");
-				local_offer_id = inv->offer_id;
-			} else
-				local_offer_id = NULL;
-
-			if (inv->amount)
-				msat = amount_msat(*inv->amount);
-
-			if (inv->relative_expiry)
-				expiry = *inv->relative_expiry;
-			else
-				expiry = BOLT12_DEFAULT_REL_EXPIRY;
-
-			if (!inv->payment_hash)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "Missing payment_hash in invoice");
-			if (!sha256_eq(&payment_hash, inv->payment_hash))
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Incorrect preimage");
-
-			if (!inv->description)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "Missing description in invoice");
-			desc = tal_strndup(cmd,
-					   cast_signed(char *, inv->description),
-					   tal_bytelen(inv->description));
-
-			if (!wallet_invoice_create(cmd->ld->wallet,
-						   &invoice,
-						   inv->amount ? &msat : NULL,
-						   label,
-						   expiry,
-						   b12enc,
-						   desc,
-						   inv->features,
-						   preimage,
-						   &payment_hash,
-						   local_offer_id))
-				return fail_exists(cmd, label);
-
-			notify_invoice_creation(cmd->ld,
-						inv->amount ? &msat : NULL,
-						*preimage, label);
-		} else
+		inv = invoice_decode_minimal(cmd, invstring, strlen(invstring),
+					     cmd->ld->our_features, chainparams,
+					     &fail);
+		if (!inv)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "Unparsable invoice '%s': %s",
 					    invstring, fail);
+
+		/* BOLT #12:
+		 * A writer of an invoice:
+		 *...
+		 *   - MUST include `invoice_paths` containing one or more paths
+		 *    to the node.
+		 */
+		/* If they don't create a blinded path, add a simple one so we
+		 * can recognize payments (bolt12 doesn't use
+		 * payment_secret) */
+		if (!inv->invoice_paths)
+			add_stub_blindedpath(cmd, cmd->ld, inv);
+
+		if (inv->signature)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "invoice already signed");
+		hsm_sign_b12_invoice(cmd->ld, inv);
+		b12enc = invoice_encode(cmd, inv);
+
+		if (inv->offer_issuer_id || inv->offer_paths) {
+			invoice_offer_id(inv, &offer_id);
+			if (wallet_offer_find(tmpctx, cmd->ld->wallet,
+					      &offer_id, NULL, &status, NULL)) {
+				if (!offer_status_active(status))
+					return command_fail(cmd,
+							    INVOICE_OFFER_INACTIVE,
+							    "offer not active");
+				local_offer_id = &offer_id;
+			} else
+				local_offer_id = NULL;
+		} else
+			local_offer_id = NULL;
+
+		/* BOLT #12:
+		 * A writer of an invoice:
+		 *...
+		 * - MUST set `invoice_amount` to the minimum amount it will
+		 *   accept, in units of the minimal lightning-payable unit
+		 *   (e.g. milli-satoshis for bitcoin) for `invreq_chain`.
+		 */
+		if (!inv->invoice_amount)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Missing invoice_amount in invoice");
+		msat = amount_msat(*inv->invoice_amount);
+
+		if (inv->invoice_relative_expiry)
+			expiry = *inv->invoice_relative_expiry;
+		else
+			expiry = BOLT12_DEFAULT_REL_EXPIRY;
+
+		if (!inv->invoice_payment_hash)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Missing payment_hash in invoice");
+		if (!sha256_eq(&payment_hash, inv->invoice_payment_hash))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Incorrect preimage");
+
+		if (command_check_only(cmd))
+			return command_check_done(cmd);
+
+		if (inv->offer_description)
+			desc = tal_strndup(cmd,
+					   inv->offer_description,
+					   tal_bytelen(inv->offer_description));
+		else
+			desc = NULL;
+
+		if (!invoices_create(cmd->ld->wallet->invoices,
+				     &inv_dbid,
+				     &msat,
+				     label,
+				     expiry,
+				     b12enc,
+				     desc,
+				     inv->invoice_features,
+				     preimage,
+				     &payment_hash,
+				     local_offer_id))
+			return fail_exists(cmd, label);
+
+		notify_invoice_creation(cmd->ld, &msat, preimage, label, local_offer_id);
 	}
 
 	response = json_stream_success(cmd);
-	json_add_invoice(response,
-			 wallet_invoice_details(cmd, cmd->ld->wallet, invoice));
+	json_add_invoice_fields(response,
+				invoices_get_details(cmd, cmd->ld->wallet->invoices,
+						     inv_dbid));
 	return command_success(cmd, response);
 }
 
 static const struct json_command createinvoice_command = {
 	"createinvoice",
-	"payment",
 	json_createinvoice,
-	"Lowlevel command to sign and create invoice {invstring}, resolved with {preimage}, using unique {label}."
 };
 
 AUTODATA(json_command, &createinvoice_command);
+
+static struct command_result *json_preapproveinvoice(struct command *cmd,
+						     const char *buffer,
+						     const jsmntok_t *obj UNNEEDED,
+						     const jsmntok_t *params)
+{
+	const char *invstring;
+	struct json_stream *response;
+	bool approved;
+	u8 *req;
+	const u8 *msg;
+
+	if (!param_check(cmd, buffer, params,
+			 /* FIXME: parameter should be invstring now */
+			 p_req("bolt11", param_invstring, &invstring),
+		   NULL))
+		return command_param_failed();
+
+	/* Old version didn't have `bool check_only` at end */
+	if (!hsm_capable(cmd->ld, WIRE_HSMD_PREAPPROVE_INVOICE_CHECK)) {
+		/* We can't just check this, so "succeed".  Log message for
+		 * tests though */
+		if (command_check_only(cmd)) {
+			log_debug(cmd->ld->log, "hsmd too old to check preapprove");
+			return command_check_done(cmd);
+		}
+		req = towire_hsmd_preapprove_invoice(NULL, invstring);
+	} else {
+		req = towire_hsmd_preapprove_invoice_check(NULL, invstring,
+							   command_check_only(cmd));
+	}
+
+	msg = hsm_sync_req(tmpctx, cmd->ld, take(req));
+
+	/* These are identical, but use separate numbers for clarity */
+        if (!fromwire_hsmd_preapprove_invoice_reply(msg, &approved)
+	    && !fromwire_hsmd_preapprove_invoice_check_reply(msg, &approved)) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "HSM gave bad preapprove_invoice_reply %s", tal_hex(msg, msg));
+	}
+
+	if (!approved)
+		return command_fail(cmd, PAY_INVOICE_PREAPPROVAL_DECLINED, "invoice was declined");
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	response = json_stream_success(cmd);
+	return command_success(cmd, response);
+}
+
+static const struct json_command preapproveinvoice_command = {
+	"preapproveinvoice",
+	json_preapproveinvoice,
+};
+AUTODATA(json_command, &preapproveinvoice_command);
+
+static struct command_result *json_preapprovekeysend(struct command *cmd,
+						     const char *buffer,
+						     const jsmntok_t *obj UNNEEDED,
+						     const jsmntok_t *params)
+{
+	struct node_id *destination;
+	struct sha256 *payment_hash;
+	struct amount_msat *amount;
+	struct json_stream *response;
+	bool approved;
+	const u8 *msg;
+	u8 *req;
+
+	if (!param_check(cmd, buffer, params,
+			 p_req("destination", param_node_id, &destination),
+			 p_req("payment_hash", param_sha256, &payment_hash),
+			 p_req("amount_msat", param_msat, &amount),
+			 NULL))
+		return command_param_failed();
+
+	if (!hsm_capable(cmd->ld, WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK)) {
+		/* We can't just check this, so "succeed".  Log message for
+		 * tests though */
+		if (command_check_only(cmd)) {
+			log_debug(cmd->ld->log, "hsmd too old to check preapprove");
+			return command_check_done(cmd);
+		}
+		req = towire_hsmd_preapprove_keysend(NULL, destination, payment_hash, *amount);
+	} else {
+		req = towire_hsmd_preapprove_keysend_check(NULL, destination, payment_hash,
+							   *amount, command_check_only(cmd));
+	}
+
+	msg = hsm_sync_req(tmpctx, cmd->ld, take(req));
+
+	/* These are identical, but use separate numbers for clarity */
+        if (!fromwire_hsmd_preapprove_keysend_reply(msg, &approved)
+	    && !fromwire_hsmd_preapprove_keysend_check_reply(msg, &approved)) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "HSM gave bad preapprove_keysend_reply %s", tal_hex(msg, msg));
+	}
+
+	if (!approved)
+		return command_fail(cmd, PAY_KEYSEND_PREAPPROVAL_DECLINED, "keysend was declined");
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	response = json_stream_success(cmd);
+	return command_success(cmd, response);
+}
+
+static const struct json_command preapprovekeysend_command = {
+	"preapprovekeysend",
+	json_preapprovekeysend,
+};
+AUTODATA(json_command, &preapprovekeysend_command);
+
+static struct command_result *json_signinvoice(struct command *cmd,
+						 const char *buffer,
+						 const jsmntok_t *obj UNNEEDED,
+						 const jsmntok_t *params)
+{
+	const char *invstring;
+	struct json_stream *response;
+	struct bolt11 *b11;
+	struct sha256 hash;
+	const u5 *sig;
+	bool have_n;
+	const char *fail;
+
+	if (!param_check(cmd, buffer, params,
+			 p_req("invstring", param_invstring, &invstring),
+			 NULL))
+		return command_param_failed();
+
+	b11 = bolt11_decode_nosig(cmd, invstring, cmd->ld->our_features,
+				  NULL, chainparams, &hash, &sig, &have_n,
+				  &fail);
+
+	if (!b11)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Unparsable invoice '%s': %s",
+				    invstring, fail);
+
+	/* This adds the signature */
+	char *b11enc = bolt11_encode(cmd, b11, have_n,
+				     hsm_sign_b11, cmd->ld);
+
+        /* BOLT #11:
+         * A writer:
+         *...
+         *    - MUST include either exactly one `d` or exactly one `h` field.
+         */
+	if (!b11->description && !b11->description_hash)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Missing description in invoice");
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	response = json_stream_success(cmd);
+	json_add_invstring(response, b11enc);
+	return command_success(cmd, response);
+}
+
+static const struct json_command signinvoice_command = {
+	"signinvoice",
+	json_signinvoice,
+};
+
+AUTODATA(json_command, &signinvoice_command);

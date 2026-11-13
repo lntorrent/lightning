@@ -1,7 +1,7 @@
-#include <tests/fuzz/libfuzz.h>
+#include "config.h"
 
-#include <ccan/tal/tal.h>
 #include <common/descriptor_checksum.h>
+#include <tests/fuzz/libfuzz.h>
 
 void init(int *argc, char ***argv)
 {

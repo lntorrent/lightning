@@ -1,110 +1,222 @@
-c-lightning Documentation
-=========================
+Core Lightning Documentation
+============================
 
 .. toctree::
    :maxdepth: 1
-   :caption: User Documentation
+   :caption: Main Documentation
 
-   INSTALL.md
-   TOR.md
-   FAQ <FAQ.md>
-   Backups <BACKUP.md>
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Integrator Documentation
-
-   Writing plugins <PLUGINS.md>
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Developer Documentation
-
-   HACKING.md
-   Coding Style Guideline <STYLE.md>
-   MAKING-RELEASES.md
-   CHANGELOG.md
+   https://docs.corelightning.org/docs
 
 .. toctree::
    :maxdepth: 1
    :caption: Manpages
 
-   lightning-addgossip <lightning-addgossip.7.md>
-   lightning-autocleaninvoice <lightning-autocleaninvoice.7.md>
-   lightning-check <lightning-check.7.md>
-   lightning-checkmessage <lightning-checkmessage.7.md>
+ .. block_start manpages
+   addgossip <addgossip.7.md>
+   addpsbtoutput <addpsbtoutput.7.md>
+   askrene-age <askrene-age.7.md>
+   askrene-bias-channel <askrene-bias-channel.7.md>
+   askrene-bias-node <askrene-bias-node.7.md>
+   askrene-create-channel <askrene-create-channel.7.md>
+   askrene-create-layer <askrene-create-layer.7.md>
+   askrene-disable-node <askrene-disable-node.7.md>
+   askrene-inform-channel <askrene-inform-channel.7.md>
+   askrene-listlayers <askrene-listlayers.7.md>
+   askrene-listreservations <askrene-listreservations.7.md>
+   askrene-remove-layer <askrene-remove-layer.7.md>
+   askrene-reserve <askrene-reserve.7.md>
+   askrene-unreserve <askrene-unreserve.7.md>
+   askrene-update-channel <askrene-update-channel.7.md>
+   autoclean-once <autoclean-once.7.md>
+   autoclean-status <autoclean-status.7.md>
+   batching <batching.7.md>
+   bkpr-channelsapy <bkpr-channelsapy.7.md>
+   bkpr-dumpincomecsv <bkpr-dumpincomecsv.7.md>
+   bkpr-editdescriptionbyoutpoint <bkpr-editdescriptionbyoutpoint.7.md>
+   bkpr-editdescriptionbypaymentid <bkpr-editdescriptionbypaymentid.7.md>
+   bkpr-inspect <bkpr-inspect.7.md>
+   bkpr-listaccountevents <bkpr-listaccountevents.7.md>
+   bkpr-listbalances <bkpr-listbalances.7.md>
+   bkpr-listincome <bkpr-listincome.7.md>
+   bkpr-report <bkpr-report.7.md>
+   blacklistrune <blacklistrune.7.md>
+   cancelrecurringinvoice <cancelrecurringinvoice.7.md>
+   check <check.7.md>
+   checkmessage <checkmessage.7.md>
+   checkrune <checkrune.7.md>
+   clnrest-register-path <clnrest-register-path.7.md>
+   close <close.7.md>
+   commando <commando.7.md>
+   connect <connect.7.md>
+   createinvoice <createinvoice.7.md>
+   createonion <createonion.7.md>
+   createproof <createproof.7.md>
+   createrune <createrune.7.md>
+   currencyconvert <currencyconvert.7.md>
+   currencyrate <currencyrate.7.md>
+   datastore <datastore.7.md>
+   datastoreusage <datastoreusage.7.md>
+   decode <decode.7.md>
+   deldatastore <deldatastore.7.md>
+   delforward <delforward.7.md>
+   delinvoice <delinvoice.7.md>
+   delnetworkevent <delnetworkevent.7.md>
+   delpay <delpay.7.md>
+   deprecations <deprecations.7.md>
+   dev-forget-channel <dev-forget-channel.7.md>
+   dev-splice <dev-splice.7.md>
+   disableinvoicerequest <disableinvoicerequest.7.md>
+   disableoffer <disableoffer.7.md>
+   disconnect <disconnect.7.md>
+   emergencyrecover <emergencyrecover.7.md>
+   enableoffer <enableoffer.7.md>
+   exposesecret <exposesecret.7.md>
+   feerates <feerates.7.md>
+   fetchbip353 <fetchbip353.7.md>
+   fetchinvoice <fetchinvoice.7.md>
+   fundchannel <fundchannel.7.md>
+   fundchannel_cancel <fundchannel_cancel.7.md>
+   fundchannel_complete <fundchannel_complete.7.md>
+   fundchannel_start <fundchannel_start.7.md>
+   funderupdate <funderupdate.7.md>
+   fundpsbt <fundpsbt.7.md>
+   getemergencyrecoverdata <getemergencyrecoverdata.7.md>
+   getinfo <getinfo.7.md>
+   getlog <getlog.7.md>
+   getroute <getroute.7.md>
+   getroutes <getroutes.7.md>
+   graceful <graceful.7.md>
+   help <help.7.md>
+   hook-commitment_revocation <hook-commitment_revocation.7.md>
+   hook-custommsg <hook-custommsg.7.md>
+   hook-db_write <hook-db_write.7.md>
+   hook-htlc_accepted <hook-htlc_accepted.7.md>
+   hook-invoice_payment <hook-invoice_payment.7.md>
+   hook-onion_message_recv <hook-onion_message_recv.7.md>
+   hook-onion_message_recv_secret <hook-onion_message_recv_secret.7.md>
+   hook-openchannel <hook-openchannel.7.md>
+   hook-openchannel2 <hook-openchannel2.7.md>
+   hook-openchannel2_changed <hook-openchannel2_changed.7.md>
+   hook-openchannel2_sign <hook-openchannel2_sign.7.md>
+   hook-peer_connected <hook-peer_connected.7.md>
+   hook-rbf_channel <hook-rbf_channel.7.md>
+   hook-recover <hook-recover.7.md>
+   hook-rpc_command <hook-rpc_command.7.md>
+   injectonionmessage <injectonionmessage.7.md>
+   injectpaymentonion <injectpaymentonion.7.md>
+   invoice <invoice.7.md>
+   invoicerequest <invoicerequest.7.md>
+   keysend <keysend.7.md>
    lightning-cli <lightning-cli.1.md>
-   lightning-close <lightning-close.7.md>
-   lightning-connect <lightning-connect.7.md>
-   lightning-createinvoice <lightning-createinvoice.7.md>
-   lightning-createonion <lightning-createonion.7.md>
-   lightning-decode <lightning-decode.7.md>
-   lightning-decodepay <lightning-decodepay.7.md>
-   lightning-delexpiredinvoice <lightning-delexpiredinvoice.7.md>
-   lightning-delinvoice <lightning-delinvoice.7.md>
-   lightning-delpay <lightning-delpay.7.md>
-   lightning-dev-sendcustommsg <lightning-dev-sendcustommsg.7.md>
-   lightning-disableoffer <lightning-disableoffer.7.md>
-   lightning-disconnect <lightning-disconnect.7.md>
-   lightning-feerates <lightning-feerates.7.md>
-   lightning-fetchinvoice <lightning-fetchinvoice.7.md>
-   lightning-fundchannel <lightning-fundchannel.7.md>
-   lightning-fundchannel_cancel <lightning-fundchannel_cancel.7.md>
-   lightning-fundchannel_complete <lightning-fundchannel_complete.7.md>
-   lightning-fundchannel_start <lightning-fundchannel_start.7.md>
-   lightning-fundpsbt <lightning-fundpsbt.7.md>
-   lightning-getinfo <lightning-getinfo.7.md>
-   lightning-getlog <lightning-getlog.7.md>
-   lightning-getroute <lightning-getroute.7.md>
-   lightning-getsharedsecret <lightning-getsharedsecret.7.md>
-   lightning-help <lightning-help.7.md>
+   lightning-downgrade <lightning-downgrade.8.md>
    lightning-hsmtool <lightning-hsmtool.8.md>
-   lightning-invoice <lightning-invoice.7.md>
-   lightning-keysend <lightning-keysend.7.md>
-   lightning-listchannels <lightning-listchannels.7.md>
-   lightning-listconfigs <lightning-listconfigs.7.md>
-   lightning-listforwards <lightning-listforwards.7.md>
-   lightning-listfunds <lightning-listfunds.7.md>
-   lightning-listinvoices <lightning-listinvoices.7.md>
-   lightning-listnodes <lightning-listnodes.7.md>
-   lightning-listoffers <lightning-listoffers.7.md>
-   lightning-listpays <lightning-listpays.7.md>
-   lightning-listpeers <lightning-listpeers.7.md>
-   lightning-listsendpays <lightning-listsendpays.7.md>
-   lightning-listtransactions <lightning-listtransactions.7.md>
-   lightning-multifundchannel <lightning-multifundchannel.7.md>
-   lightning-multiwithdraw <lightning-multiwithdraw.7.md>
-   lightning-newaddr <lightning-newaddr.7.md>
-   lightning-notifications <lightning-notifications.7.md>
-   lightning-offer <lightning-offer.7.md>
-   lightning-offerout <lightning-offerout.7.md>
-   lightning-openchannel_abort <lightning-openchannel_abort.7.md>
-   lightning-openchannel_bump <lightning-openchannel_bump.7.md>
-   lightning-openchannel_init <lightning-openchannel_init.7.md>
-   lightning-openchannel_signed <lightning-openchannel_signed.7.md>
-   lightning-openchannel_update <lightning-openchannel_update.7.md>
-   lightning-pay <lightning-pay.7.md>
-   lightning-ping <lightning-ping.7.md>
-   lightning-plugin <lightning-plugin.7.md>
-   lightning-reserveinputs <lightning-reserveinputs.7.md>
-   lightning-sendinvoice <lightning-sendinvoice.7.md>
-   lightning-sendonion <lightning-sendonion.7.md>
-   lightning-sendonionmessage <lightning-sendonionmessage.7.md>
-   lightning-sendpay <lightning-sendpay.7.md>
-   lightning-sendpsbt <lightning-sendpsbt.7.md>
-   lightning-setchannelfee <lightning-setchannelfee.7.md>
-   lightning-signmessage <lightning-signmessage.7.md>
-   lightning-signpsbt <lightning-signpsbt.7.md>
-   lightning-stop <lightning-stop.7.md>
-   lightning-txdiscard <lightning-txdiscard.7.md>
-   lightning-txprepare <lightning-txprepare.7.md>
-   lightning-txsend <lightning-txsend.7.md>
-   lightning-unreserveinputs <lightning-unreserveinputs.7.md>
-   lightning-utxopsbt <lightning-utxopsbt.7.md>
-   lightning-waitanyinvoice <lightning-waitanyinvoice.7.md>
-   lightning-waitblockheight <lightning-waitblockheight.7.md>
-   lightning-waitinvoice <lightning-waitinvoice.7.md>
-   lightning-waitsendpay <lightning-waitsendpay.7.md>
-   lightning-withdraw <lightning-withdraw.7.md>
+   lightning-reckless <lightning-reckless.1.md>
    lightningd <lightningd.8.md>
    lightningd-config <lightningd-config.5.md>
+   lightningd-rpc <lightningd-rpc.7.md>
+   listaddresses <listaddresses.7.md>
+   listchainmoves <listchainmoves.7.md>
+   listchannelmoves <listchannelmoves.7.md>
+   listchannels <listchannels.7.md>
+   listclosedchannels <listclosedchannels.7.md>
+   listconfigs <listconfigs.7.md>
+   listcurrencyrates <listcurrencyrates.7.md>
+   listdatastore <listdatastore.7.md>
+   listforwards <listforwards.7.md>
+   listfunds <listfunds.7.md>
+   listhtlcs <listhtlcs.7.md>
+   listinvoicerequests <listinvoicerequests.7.md>
+   listinvoices <listinvoices.7.md>
+   listnetworkevents <listnetworkevents.7.md>
+   listnodes <listnodes.7.md>
+   listoffers <listoffers.7.md>
+   listpays <listpays.7.md>
+   listpeerchannels <listpeerchannels.7.md>
+   listpeers <listpeers.7.md>
+   listsendpays <listsendpays.7.md>
+   listsqlschemas <listsqlschemas.7.md>
+   listtransactions <listtransactions.7.md>
+   makesecret <makesecret.7.md>
+   multifundchannel <multifundchannel.7.md>
+   multiwithdraw <multiwithdraw.7.md>
+   newaddr <newaddr.7.md>
+   notification-balance_snapshot <notification-balance_snapshot.7.md>
+   notification-block_added <notification-block_added.7.md>
+   notification-channel_open_failed <notification-channel_open_failed.7.md>
+   notification-channel_opened <notification-channel_opened.7.md>
+   notification-channel_state_changed <notification-channel_state_changed.7.md>
+   notification-coin_movement <notification-coin_movement.7.md>
+   notification-connect <notification-connect.7.md>
+   notification-custommsg <notification-custommsg.7.md>
+   notification-deprecated_oneshot <notification-deprecated_oneshot.7.md>
+   notification-disconnect <notification-disconnect.7.md>
+   notification-forward_event <notification-forward_event.7.md>
+   notification-invoice_creation <notification-invoice_creation.7.md>
+   notification-invoice_payment <notification-invoice_payment.7.md>
+   notification-log <notification-log.7.md>
+   notification-onionmessage_forward_fail <notification-onionmessage_forward_fail.7.md>
+   notification-openchannel_peer_sigs <notification-openchannel_peer_sigs.7.md>
+   notification-plugin_started <notification-plugin_started.7.md>
+   notification-plugin_stopped <notification-plugin_stopped.7.md>
+   notification-sendpay_failure <notification-sendpay_failure.7.md>
+   notification-sendpay_success <notification-sendpay_success.7.md>
+   notification-shutdown <notification-shutdown.7.md>
+   notification-warning <notification-warning.7.md>
+   notification-xpay_pay_part_end <notification-xpay_pay_part_end.7.md>
+   notification-xpay_pay_part_start <notification-xpay_pay_part_start.7.md>
+   notifications <notifications.7.md>
+   offer <offer.7.md>
+   openchannel_abort <openchannel_abort.7.md>
+   openchannel_bump <openchannel_bump.7.md>
+   openchannel_init <openchannel_init.7.md>
+   openchannel_signed <openchannel_signed.7.md>
+   openchannel_update <openchannel_update.7.md>
+   parsefeerate <parsefeerate.7.md>
+   pay <pay.7.md>
+   ping <ping.7.md>
+   plugin <plugin.7.md>
+   preapproveinvoice <preapproveinvoice.7.md>
+   preapprovekeysend <preapprovekeysend.7.md>
+   reckless <reckless.7.md>
+   recover <recover.7.md>
+   recoverchannel <recoverchannel.7.md>
+   renepay <renepay.7.md>
+   renepaystatus <renepaystatus.7.md>
+   reserveinputs <reserveinputs.7.md>
+   sendamount <sendamount.7.md>
+   sendcustommsg <sendcustommsg.7.md>
+   sendinvoice <sendinvoice.7.md>
+   sendonion <sendonion.7.md>
+   sendpay <sendpay.7.md>
+   sendpsbt <sendpsbt.7.md>
+   setchannel <setchannel.7.md>
+   setconfig <setconfig.7.md>
+   setpsbtversion <setpsbtversion.7.md>
+   showrunes <showrunes.7.md>
+   signinvoice <signinvoice.7.md>
+   signmessage <signmessage.7.md>
+   signmessagewithkey <signmessagewithkey.7.md>
+   signpsbt <signpsbt.7.md>
+   splice_init <splice_init.7.md>
+   splice_signed <splice_signed.7.md>
+   splice_update <splice_update.7.md>
+   splicein <splicein.7.md>
+   spliceout <spliceout.7.md>
+   sql <sql.7.md>
+   staticbackup <staticbackup.7.md>
+   stop <stop.7.md>
+   txdiscard <txdiscard.7.md>
+   txprepare <txprepare.7.md>
+   txsend <txsend.7.md>
+   unreserveinputs <unreserveinputs.7.md>
+   upgradewallet <upgradewallet.7.md>
+   utxopsbt <utxopsbt.7.md>
+   wait <wait.7.md>
+   waitanyinvoice <waitanyinvoice.7.md>
+   waitblockheight <waitblockheight.7.md>
+   waitinvoice <waitinvoice.7.md>
+   waitsendpay <waitsendpay.7.md>
+   withdraw <withdraw.7.md>
+   xkeysend <xkeysend.7.md>
+   xpay <xpay.7.md>
+.. block_end manpages

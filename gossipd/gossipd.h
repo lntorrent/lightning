@@ -1,23 +1,32 @@
 #ifndef LIGHTNING_GOSSIPD_GOSSIPD_H
 #define LIGHTNING_GOSSIPD_GOSSIPD_H
 #include "config.h"
-#include <bitcoin/block.h>
-#include <ccan/list/list.h>
-#include <ccan/short_types/short_types.h>
+#include <ccan/ccan/opt/opt.h>
+#include <ccan/htable/htable_type.h>
 #include <ccan/timer/timer.h>
-#include <common/bigsize.h>
 #include <common/node_id.h>
+#include <lightningd/options.h>
 #include <wire/peer_wire.h>
 
-/* We talk to `hsmd` to sign our gossip messages with the node key */
-#define HSM_FD 3
-/* connectd asks us for help finding nodes, and gossip fds for new peers */
-#define CONNECTD_FD 4
+/* connectd forwards gossip messages to us. */
+#define CONNECTD_FD 3
 
 struct chan;
+struct peer;
 struct channel_update_timestamps;
 struct broadcastable;
+struct lease_rates;
 struct seeker;
+struct dying_channel;
+
+/* Helpers for htable */
+const struct node_id *peer_node_id(const struct peer *peer);
+bool peer_node_id_eq(const struct peer *peer, const struct node_id *node_id);
+
+/* Defines struct peer_node_id_map */
+HTABLE_DEFINE_NODUPS_TYPE(struct peer,
+			  peer_node_id, node_id_hash, peer_node_id_eq,
+			  peer_node_id_map);
 
 /*~ The core daemon structure: */
 struct daemon {
@@ -25,7 +34,10 @@ struct daemon {
 	struct node_id id;
 
 	/* Peers we are gossiping to: id is unique */
-	struct list_head peers;
+	struct peer_node_id_map *peers;
+
+	/* --developer? */
+	bool developer;
 
 	/* Current blockheight: 0 means we're not up-to-date. */
 	u32 current_blockheight;
@@ -36,21 +48,11 @@ struct daemon {
 	/* Connection to connect daemon. */
 	struct daemon_conn *connectd;
 
-	/* Routing information */
-	struct routing_state *rstate;
+	/* Manager of writing to the gossip_store */
+	struct gossmap_manage *gm;
 
 	/* Timers: we batch gossip, and also refresh announcements */
 	struct timers timers;
-
-	/* Alias (not NUL terminated) and favorite color for node_announcement */
-	u8 alias[32];
-	u8 rgb[3];
-
-	/* What addresses we can actually announce. */
-	struct wireaddr *announcable;
-
-	/* Timer until we can send a new node_announcement */
-	struct oneshot *node_announce_timer;
 
 	/* Channels we have an announce for, but aren't deep enough. */
 	struct short_channel_id *deferred_txouts;
@@ -60,6 +62,18 @@ struct daemon {
 
 	/* Features lightningd told us to set. */
 	struct feature_set *our_features;
+
+	/* Program to run to compact the datastore */
+	char *compactd_helper;
+
+	/* Speed up gossip. */
+	bool dev_fast_gossip;
+
+	/* Speed up pruning. */
+	bool dev_fast_gossip_prune;
+
+	/* Minimum gossip peers - seeker connects to random peers to fill. */
+	u32 autoconnect_seeker_peers;
 };
 
 struct range_query_reply {
@@ -81,6 +95,9 @@ struct peer {
 	/* How much contribution have we made to gossip? */
 	size_t gossip_counter;
 
+	/* How much gossip have we sent in response to gossip queries? */
+	size_t query_reply_counter;
+
 	/* The two features gossip cares about (so far) */
 	bool gossip_queries_feature, initial_routing_sync_feature;
 
@@ -97,9 +114,6 @@ struct peer {
 	bool scid_query_outstanding;
 	void (*scid_query_cb)(struct peer *peer, bool complete);
 
-	/* How many pongs are we expecting? */
-	size_t num_pings_outstanding;
-
 	/* What we're querying: [range_first_blocknum, range_end_blocknum) */
 	u32 range_first_blocknum, range_end_blocknum;
 	u32 range_blocks_outstanding;
@@ -107,34 +121,44 @@ struct peer {
 	void (*query_channel_range_cb)(struct peer *peer,
 				       u32 first_blocknum, u32 number_of_blocks,
 				       const struct range_query_reply *replies);
-
-	/* The daemon_conn used to queue messages to/from the peer. */
-	struct daemon_conn *dc;
 };
 
 /* Search for a peer. */
 struct peer *find_peer(struct daemon *daemon, const struct node_id *id);
 
-/* This peer (may be NULL) gave is valid gossip. */
-void peer_supplied_good_gossip(struct peer *peer, size_t amount);
+/* This peer (may be NULL) gave us valid gossip. */
+void peer_supplied_good_gossip(struct daemon *daemon,
+			       const struct node_id *source_peer,
+			       size_t amount);
 
-/* Pick a random peer which passes check_peer */
-struct peer *random_peer(struct daemon *daemon,
-			 bool (*check_peer)(const struct peer *peer));
+/* Increase peer's query_reply_counter, if peer not NULL */
+void peer_supplied_query_response(struct daemon *daemon,
+				  const struct node_id *source_peer,
+				  size_t amount);
+
+/* Get a random peer.  NULL if no peers. */
+struct peer *first_random_peer(struct daemon *daemon,
+			       struct peer_node_id_map_iter *it);
+
+/* Get another... return NULL when we're back at frist. */
+struct peer *next_random_peer(struct daemon *daemon,
+			      const struct peer *first,
+			      struct peer_node_id_map_iter *it);
 
 /* Queue a gossip message for the peer: the subdaemon on the other end simply
  * forwards it to the peer. */
-void queue_peer_msg(struct peer *peer, const u8 *msg TAKES);
+void queue_peer_msg(struct daemon *daemon,
+		    const struct node_id *peer,
+		    const u8 *msg TAKES);
 
-/* Queue a gossip_store message for the peer: the subdaemon on the
- * other end simply forwards it to the peer. */
-void queue_peer_from_store(struct peer *peer,
-			   const struct broadcastable *bcast);
-
-/* Reset gossip range for this peer. */
-void setup_gossip_range(struct peer *peer);
-
-/* A peer has given us these short channel ids: see if we need to catch up */
-void process_scids(struct daemon *daemon, const struct short_channel_id *scids);
+/* We have an update for one of our channels (or unknown). */
+void tell_lightningd_peer_update(struct daemon *daemon,
+				 const struct node_id *source_peer,
+				 struct short_channel_id scid,
+				 u32 fee_base_msat,
+				 u32 fee_ppm,
+				 u16 cltv_delta,
+				 struct amount_msat htlc_minimum,
+				 struct amount_msat htlc_maximum);
 
 #endif /* LIGHTNING_GOSSIPD_GOSSIPD_H */

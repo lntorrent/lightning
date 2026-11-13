@@ -1,6 +1,7 @@
+#include "config.h"
+#include <assert.h>
 #include <ccan/fdpass/fdpass.h>
 #include <ccan/io/fdpass/fdpass.h>
-#include <ccan/take/take.h>
 #include <common/daemon_conn.h>
 #include <wire/wire_io.h>
 #include <wire/wire_sync.h>
@@ -8,6 +9,7 @@
 struct daemon_conn {
 	/* Last message we received */
 	u8 *msg_in;
+	int fd_in;
 
 	/* Queue of outgoing messages */
 	struct msg_queue *out;
@@ -17,11 +19,13 @@ struct daemon_conn {
 
 	/* Callback for incoming messages */
 	struct io_plan *(*recv)(struct io_conn *conn, const u8 *, void *);
+	/* Callback with fd */
+	struct io_plan *(*recv_fd)(struct io_conn *conn, const u8 *, int, void *);
 
 	/* Called whenever we've cleared the msg_out queue. */
 	void (*outq_empty)(void *);
 
-	/* Arg for both callbacks. */
+	/* Arg for all three callbacks. */
 	void *arg;
 };
 
@@ -40,6 +44,26 @@ struct io_plan *daemon_conn_read_next(struct io_conn *conn,
 	return io_read_wire(conn, dc, &dc->msg_in, handle_read, dc);
 }
 
+static struct io_plan *handle_recv_fd(struct io_conn *conn,
+				      struct daemon_conn *dc)
+{
+	return dc->recv_fd(conn, dc->msg_in, dc->fd_in, dc->arg);
+}
+
+struct io_plan *daemon_conn_read_with_fd_(struct io_conn *conn,
+					  struct daemon_conn *dc,
+					  struct io_plan *(*recv_fd)(struct io_conn *,
+								     const u8 *,
+								     int fd,
+								     void *),
+					  void *arg)
+{
+	/* We only get this for the type! */
+	assert(arg == dc->arg);
+	dc->recv_fd = recv_fd;
+	return io_recv_fd(conn, &dc->fd_in, handle_recv_fd, dc);
+}
+
 static struct io_plan *daemon_conn_write_next(struct io_conn *conn,
 					      struct daemon_conn *dc)
 {
@@ -54,7 +78,7 @@ static struct io_plan *daemon_conn_write_next(struct io_conn *conn,
 	}
 
 	if (msg) {
-		int fd = msg_extract_fd(msg);
+		int fd = msg_extract_fd(dc->out, msg);
 		if (fd >= 0) {
 			tal_free(msg);
 			return io_send_fd(conn, fd, true,
@@ -82,7 +106,7 @@ bool daemon_conn_sync_flush(struct daemon_conn *dc)
 
 	/* Flush existing messages. */
 	while ((msg = msg_dequeue(dc->out)) != NULL) {
-		int fd = msg_extract_fd(msg);
+		int fd = msg_extract_fd(dc->out, msg);
 		if (fd >= 0) {
 			tal_free(msg);
 			if (!fdpass_send(daemon_fd, fd))
@@ -119,13 +143,13 @@ struct daemon_conn *daemon_conn_new_(const tal_t *ctx, int fd,
 				     void (*outq_empty)(void *),
 				     void *arg)
 {
-	struct daemon_conn *dc = tal(NULL, struct daemon_conn);
+	struct daemon_conn *dc = tal(ctx, struct daemon_conn);
 
 	dc->recv = recv;
 	dc->outq_empty = outq_empty;
 	dc->arg = arg;
 	dc->msg_in = NULL;
-	dc->out = msg_queue_new(dc);
+	dc->out = msg_queue_new(dc, true);
 
 	dc->conn = io_new_conn(dc, fd, daemon_conn_start, dc);
 	tal_add_destructor2(dc->conn, destroy_dc_from_conn, dc);

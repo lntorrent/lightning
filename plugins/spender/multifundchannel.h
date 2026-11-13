@@ -56,7 +56,7 @@ struct multifundchannel_removed {
 	*/
 	const char *method;
 	const char *error_message;
-	errcode_t error_code;
+	enum jsonrpc_errcode error_code;
 	/* Optional JSON object containing extra data */
 	const char *error_data;
 };
@@ -112,6 +112,8 @@ struct multifundchannel_destination {
 	bool all;
 	struct amount_sat amount;
 
+	struct amount_sat *reserve;
+
 	/* the output index for this destination.  */
 	unsigned int outnum;
 
@@ -128,7 +130,7 @@ struct multifundchannel_destination {
 	struct channel_id channel_id;
 
 	const char *error_message;
-	errcode_t error_code;
+	enum jsonrpc_errcode error_code;
 	/* Optional JSON object containing extra data */
 	const char *error_data;
 
@@ -143,6 +145,18 @@ struct multifundchannel_destination {
 
 	/* serial of the funding output for this channel (OPEN_CHANNEL) */
 	u64 funding_serial;
+
+	/* amount to request peer to lease (OPEN_CHANNEL) */
+	struct amount_sat request_amt;
+
+	/* Channel lease rates that we expect the peer to respond with */
+	struct lease_rates *rates;
+
+	/* Number of blocks to wait before sending `channel_ready`. */
+	u32 *mindepth;
+
+	/* Channel type to ask for (NULL if default OK) */
+	struct channel_type *channel_type;
 };
 
 
@@ -157,9 +171,6 @@ struct multifundchannel_command {
 	multiple `multifundchannel` commands in parallel, or
 	in very close sequence, which might confuse us with
 	*which* debug message belongs with *which* command.
-
-	We actually just reuse the id from the cmd.
-	Store it here for easier access.
 	*/
 	u64 id;
 
@@ -207,21 +218,6 @@ struct multifundchannel_command {
 	/* The expected weight of the PSBT after adding in all the outputs.
 	 * In weight units (sipa).  */
 	u32 estimated_final_weight;
-	/* Excess satoshi from the PSBT.
-	 * If "all" this is the entire amount; if not "all" this is the
-	 * proposed change amount, which if dusty should be donated to
-	 * the miners.
-	 */
-	struct amount_sat excess_sat;
-
-	/* A convenient change address. NULL at the start, filled in
-	 * if we detect we need it.  */
-	const u8 *change_scriptpubkey;
-	/* Whether we need a change output.  */
-	bool change_needed;
-	/* The change amount.  */
-	struct amount_sat change_amount;
-
 	/* The txid of the final funding transaction.  */
 	struct bitcoin_txid *txid;
 
@@ -241,6 +237,7 @@ struct multifundchannel_command {
 /* Use this instead of forward_error.  */
 struct command_result *
 mfc_forward_error(struct command *cmd,
+		  const char *method,
 		  const char *buf, const jsmntok_t *error,
 		  struct multifundchannel_command *);
 
@@ -250,7 +247,7 @@ void fail_destination_tok(struct multifundchannel_destination *dest,
 			  const char *buf,
 			  const jsmntok_t *error);
 void fail_destination_msg(struct multifundchannel_destination *dest,
-			  int error_code,
+			  enum jsonrpc_errcode error_code,
 			  const char *err_str TAKES);
 
 /* dest_count - Returns count of destinations using given protocol version */
@@ -280,4 +277,7 @@ struct command_result *
 redo_multifundchannel(struct multifundchannel_command *mfc,
 		      const char *failing_method,
 		      const char *why);
+
+struct channel_type *json_bits_to_channel_type(const tal_t *ctx,
+					       const char *buffer, const jsmntok_t *tok);
 #endif /* LIGHTNING_PLUGINS_SPENDER_MULTIFUNDCHANNEL_H */

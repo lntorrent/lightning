@@ -1,17 +1,31 @@
 #ifndef LIGHTNING_LIGHTNINGD_CHANNEL_H
 #define LIGHTNING_LIGHTNINGD_CHANNEL_H
 #include "config.h"
-#include <ccan/list/list.h>
+#include <bitcoin/signature.h>
+#include <ccan/htable/htable_type.h>
+#include <common/channel_config.h>
 #include <common/channel_id.h>
-#include <common/per_peer_state.h>
+#include <common/channel_type.h>
+#include <common/derive_basepoints.h>
+#include <common/scb_wiregen.h>
 #include <common/tx_roles.h>
+#include <common/utils.h>
+#include <gossipd/gossipd_wiregen.h>
 #include <lightningd/channel_state.h>
-#include <lightningd/peer_htlcs.h>
 #include <wallet/wallet.h>
 
-struct channel_id;
 struct uncommitted_channel;
 struct wally_psbt;
+
+/* FIXME: Define serialization primitive for this? */
+struct channel_info {
+	struct channel_config their_config;
+	struct pubkey remote_fundingkey;
+	struct basepoints theirbase;
+	/* The old_remote_per_commit is for the locked-in remote commit_tx,
+	 * and the remote_per_commit is for the commit_tx we're modifying now. */
+	struct pubkey remote_per_commit, old_remote_per_commit;
+};
 
 struct billboard {
 	/* Status information to display on listpeers */
@@ -20,13 +34,16 @@ struct billboard {
 };
 
 struct funding_info {
-	struct bitcoin_txid txid;
-	u16 outnum;
+	struct bitcoin_outpoint outpoint;
 	u32 feerate;
 	struct amount_sat total_funds;
 
 	/* Our original funds, in funding amount */
 	struct amount_sat our_funds;
+
+	/* Relative splicing balance change */
+	s64 splice_amnt;
+	struct pubkey *splice_remote_funding;
 };
 
 struct channel_inflight {
@@ -35,6 +52,9 @@ struct channel_inflight {
 
 	/* Channel context */
 	struct channel *channel;
+
+	/* SCID once we're mined, otherwise NULL */
+	struct short_channel_id *scid;
 
 	/* Funding info */
 	const struct funding_info *funding;
@@ -45,6 +65,44 @@ struct channel_inflight {
 	/* Commitment tx and sigs */
 	struct bitcoin_tx *last_tx;
 	struct bitcoin_signature last_sig;
+
+	/* Channel lease infos */
+	u32 lease_expiry;
+	secp256k1_ecdsa_signature *lease_commit_sig;
+	u32 lease_chan_max_msat;
+	u16 lease_chan_max_ppt;
+	u32 lease_blockheight_start;
+
+	/* We save this data so we can do nice accounting;
+	 * on the channel we slot it into the 'push' field */
+	struct amount_msat lease_fee;
+
+	/* Amount requested to lease for this open */
+	struct amount_sat lease_amt;
+
+	/* Did I initate this splice attempt? */
+	bool i_am_initiator;
+
+	/* On reestablish recovery; should I sign first? */
+	bool force_sign_first;
+
+	/* Has this inflight reached sufficent depth on chain? This is needed
+	 * for splices that need to coordinate `splice_locked` with their
+	 * peer through reconnect flows. */
+	struct short_channel_id *locked_scid;
+
+	/* Have I sent my peer my sigs? */
+	bool i_sent_sigs;
+
+	/* Note: This field is not stored in the database.
+	 *
+	 * After splice_locked, we need a way to stop the chain watchers from
+	 * thinking the old channel was spent.
+	 *
+	 * Leaving the inflight in memory-only with splice_locked true leaves
+	 * moves the responsiblity of cleaning up the inflight to the watcher,
+	 * avoiding any potential race conditions. */
+	bool splice_locked_memonly;
 };
 
 struct open_attempt {
@@ -58,6 +116,26 @@ struct open_attempt {
 	struct command *cmd;
 	struct amount_sat funding;
 	const u8 *our_upfront_shutdown_script;
+
+	/* First msg to send to dualopend (to make it create channel) */
+	const u8 *open_msg;
+};
+
+/* Statistics for a channel */
+struct channel_stats {
+	u64  in_payments_offered,  in_payments_fulfilled;
+	struct amount_msat  in_msatoshi_offered,  in_msatoshi_fulfilled;
+	u64 out_payments_offered, out_payments_fulfilled;
+	struct amount_msat out_msatoshi_offered, out_msatoshi_fulfilled;
+};
+
+
+struct channel_state_change {
+	struct timeabs timestamp;
+	enum channel_state old_state;
+	enum channel_state new_state;
+	enum state_change cause;
+	const char *message;
 };
 
 struct channel {
@@ -94,8 +172,11 @@ struct channel {
 	/* Is there a single subdaemon responsible for us? */
 	struct subd *owner;
 
+	/* Telling the world (or just our peer) about us */
+	struct channel_gossip *channel_gossip;
+
 	/* History */
-	struct log *log;
+	struct logger *log;
 	struct billboard billboard;
 
 	/* Channel flags from opening message. */
@@ -104,25 +185,56 @@ struct channel {
 	/* Our channel config. */
 	struct channel_config our_config;
 
+	/* Require confirmed inputs for interactive tx */
+	bool req_confirmed_ins[NUM_SIDES];
+
 	/* Minimum funding depth (specified by us if they fund). */
 	u32 minimum_depth;
+
+	/* Depth of the funding TX as reported by the txout
+	 * watch. Only used while we're in state
+	 * CHANNELD_AWAITING_LOCKING, afterwards the watches do not
+	 * trigger anymore. */
+	u32 depth;
 
 	/* Tracking commitment transaction numbers. */
 	u64 next_index[NUM_SIDES];
 	u64 next_htlc_id;
+	/* The id we expect for the next HTLC they offer. */
+	u64 next_their_htlc_id;
 
-	/* Funding txid and amounts */
-	struct bitcoin_txid funding_txid;
-	u16 funding_outnum;
-	struct amount_sat funding;
+	/* Funding outpoint and amount */
+	struct bitcoin_outpoint funding;
+	struct amount_sat funding_sats;
+
+	/* Watch we have on funding output. */
+	struct txowatch *funding_spend_watch;
+
+	/* Watch we have on inflights. */
+	struct txowatch **inflight_spend_watches;
+
+	/* If we're doing a replay for onchaind, here are the txids it's watching */
+	struct replay_tx_hash *onchaind_replay_watches;
+	/* Number of outstanding onchaind_spent calls */
+	size_t num_onchain_spent_calls;
+	/* Height we're replaying at (if onchaind_replay_watches set) */
+	u32 onchaind_replay_height;
 
 	/* Our original funds, in funding amount */
 	struct amount_sat our_funds;
 
 	struct amount_msat push;
-	bool remote_funding_locked;
+	bool remote_channel_ready;
 	/* Channel if locked locally. */
 	struct short_channel_id *scid;
+	/* Old scids if we were spliced */
+	struct short_channel_id *old_scids;
+
+	/* Alias used for option_zeroconf, or option_scid_alias, if
+	 * present. LOCAL are all the alias we told the peer about and
+	 * REMOTE is one of the aliases we got from the peer and we'll
+	 * use in a routehint. */
+	struct short_channel_id *alias[NUM_SIDES];
 
 	struct channel_id cid;
 
@@ -132,12 +244,8 @@ struct channel {
 	struct amount_msat msat_to_us_min;
 	struct amount_msat msat_to_us_max;
 
-	/* Timer we use in case they don't add an HTLC in a timely manner. */
-	struct oneshot *htlc_timeout;
-
 	/* Last tx they gave us. */
 	struct bitcoin_tx *last_tx;
-	enum wallet_tx_type last_tx_type;
 	struct bitcoin_signature last_sig;
 	const struct bitcoin_signature *last_htlc_sigs;
 
@@ -146,6 +254,9 @@ struct channel {
 
 	/* Fee status */
 	const struct fee_states *fee_states;
+
+	/* Height states (option_will_fund, update_blockheight) */
+	const struct height_states *blockheight_states;
 
 	/* Our local basepoints */
 	struct basepoints local_basepoints;
@@ -167,6 +278,9 @@ struct channel {
 	/* optional wrong_funding for mutual close */
 	const struct bitcoin_outpoint *shutdown_wrong_funding;
 
+	/* optional feerate min/max for mutual close */
+	u32 *closing_feerate_range;
+
 	/* Reestablishment stuff: last sent commit and revocation details. */
 	bool last_was_revoke;
 	struct changed_htlc *last_sent_commit;
@@ -178,24 +292,29 @@ struct channel {
 	/* Feerate range */
 	u32 min_possible_feerate, max_possible_feerate;
 
-	/* Does gossipd need to know if the owner dies? (ie. not onchaind) */
-	bool connected;
-
 	/* Do we have an "impossible" future per_commitment_point from
 	 * peer via option_data_loss_protect? */
-	const struct pubkey *future_per_commitment_point;
+	bool has_future_per_commitment_point;
+
+	/* Min/max htlc amount allowed in channel. */
+	struct amount_msat htlc_minimum_msat, htlc_maximum_msat;
 
 	/* Feerate per channel */
 	u32 feerate_base, feerate_ppm;
 
+	/* But allow these feerates/htlcs up until this time. */
+	struct timemono old_feerate_timeout;
+	u32 old_feerate_base, old_feerate_ppm;
+	struct amount_msat old_htlc_minimum_msat, old_htlc_maximum_msat;
+
 	/* If they used option_upfront_shutdown_script. */
 	const u8 *remote_upfront_shutdown_script;
 
-	/* Was this negotiated with `option_static_remotekey? */
-	bool option_static_remotekey;
+	/* At what commit numbers does `option_static_remotekey` apply? */
+	u64 static_remotekey_start[NUM_SIDES];
 
-	/* Was this negotiated with `option_anchor_outputs? */
-	bool option_anchor_outputs;
+	/* What features apply to this channel? */
+	const struct channel_type *type;
 
 	/* Any commands trying to forget us. */
 	struct command **forgets;
@@ -206,12 +325,55 @@ struct channel {
 	/* the one that initiated a bilateral close, NUM_SIDES if unknown. */
 	enum side closer;
 
+	/* Block height we tried to close at (0 = not tried) */
+	u32 close_attempt_height;
+
+	/* Block height we saw closing tx at */
+	u32 *close_blockheight;
+
+	/* Channeld said we've successfully exchanged reestablish. */
+	bool reestablished;
+
 	/* Last known state_change cause */
 	enum state_change state_change_cause;
 
 	/* Outstanding command for this channel, v2 only */
 	struct command *openchannel_signed_cmd;
+
+	/* Block lease expires at, zero is no lease */
+	u32 lease_expiry;
+
+	/* Lease commitment, useful someone breaks their promise
+	 * wrt channel fees */
+	secp256k1_ecdsa_signature *lease_commit_sig;
+
+	/* Lease commited maximum channel fee base msat */
+	u32 lease_chan_max_msat;
+	/* Lease commited max part per thousandth channel fee (ppm * 1000) */
+	u16 lease_chan_max_ppt;
+
+	/* Do we allow the peer to set any fee it wants? */
+	bool ignore_fee_limits;
+
+	/* Last time we had a stable connection, if any (0 = none) */
+	u64 last_stable_connection;
+	struct oneshot *stable_conn_timer;
+
+	/* Our stats */
+	struct channel_stats stats;
+
+	/* Our change history. */
+	struct channel_state_change **state_changes;
+
+	/* Unsigned PSBT if we initiated the open channel */
+	const struct wally_psbt *funding_psbt;
+
+	/* Are we not broadcasting the open tx? */
+	bool withheld;
 };
+
+/* Is channel owned (and should be talking to peer) */
+bool channel_is_connected(const struct channel *channel);
 
 /* For v2 opens, a channel that has not yet been committed/saved to disk */
 struct channel *new_unsaved_channel(struct peer *peer,
@@ -226,22 +388,26 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    enum channel_state state,
 			    enum side opener,
 			    /* NULL or stolen */
-			    struct log *log STEALS,
+			    struct logger *log STEALS,
 			    const char *transient_billboard TAKES,
 			    u8 channel_flags,
+			    bool req_confirmed_ins_local,
+			    bool req_confirmed_ins_remote,
 			    const struct channel_config *our_config,
 			    u32 minimum_depth,
 			    u64 next_index_local,
 			    u64 next_index_remote,
 			    u64 next_htlc_id,
-			    const struct bitcoin_txid *funding_txid,
-			    u16 funding_outnum,
-			    struct amount_sat funding,
+			    const struct bitcoin_outpoint *funding,
+			    struct amount_sat funding_sats,
 			    struct amount_msat push,
 			    struct amount_sat our_funds,
-			    bool remote_funding_locked,
+			    bool remote_channel_ready,
 			    /* NULL or stolen */
-			    struct short_channel_id *scid STEALS,
+			    struct short_channel_id *scid TAKES,
+			    struct short_channel_id *old_scids TAKES,
+			    struct short_channel_id alias_local,
+			    struct short_channel_id *alias_remote STEALS,
 			    struct channel_id *cid,
 			    struct amount_msat our_msatoshi,
 			    struct amount_msat msatoshi_to_us_min,
@@ -262,32 +428,71 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 first_blocknum,
 			    u32 min_possible_feerate,
 			    u32 max_possible_feerate,
-			    bool connected,
 			    const struct basepoints *local_basepoints,
 			    const struct pubkey *local_funding_pubkey,
-			    const struct pubkey *future_per_commitment_point,
+			    bool has_future_per_commitment_point,
 			    u32 feerate_base,
 			    u32 feerate_ppm,
 			    /* NULL or stolen */
 			    const u8 *remote_upfront_shutdown_script STEALS,
-			    bool option_static_remotekey,
-			    bool option_anchor_outputs,
+			    u64 local_static_remotekey_start,
+			    u64 remote_static_remotekey_start,
+			    const struct channel_type *type STEALS,
 			    enum side closer,
+			    u32 close_attempt_height,
 			    enum state_change reason,
 			    /* NULL or stolen */
-			    const struct bitcoin_outpoint *shutdown_wrong_funding STEALS);
+			    const struct bitcoin_outpoint *shutdown_wrong_funding STEALS,
+			    const struct height_states *height_states TAKES,
+			    u32 lease_expiry,
+			    secp256k1_ecdsa_signature *lease_commit_sig STEALS,
+			    u32 lease_chan_max_msat,
+			    u16 lease_chan_max_ppt,
+			    struct amount_msat htlc_minimum_msat,
+			    struct amount_msat htlc_maximum_msat,
+			    bool ignore_fee_limits,
+			    /* NULL or stolen */
+			    struct peer_update *peer_update STEALS,
+			    u64 last_stable_connection,
+			    const struct channel_stats *stats,
+			    struct channel_state_change **state_changes STEALS,
+			    const struct wally_psbt *funding_psbt STEALS,
+			    bool withheld);
 
 /* new_inflight - Create a new channel_inflight for a channel */
-struct channel_inflight *
-new_inflight(struct channel *channel,
-	     const struct bitcoin_txid funding_txid,
-	     u16 funding_outnum,
+struct channel_inflight *new_inflight(struct channel *channel,
+	     struct pubkey *remote_funding STEALS,
+	     const struct bitcoin_outpoint *funding_outpoint,
 	     u32 funding_feerate,
-	     struct amount_sat funding,
+	     struct amount_sat funding_sat,
 	     struct amount_sat our_funds,
 	     struct wally_psbt *funding_psbt STEALS,
-	     struct bitcoin_tx *last_tx STEALS,
-	     const struct bitcoin_signature last_sig);
+	     const u32 lease_expiry,
+	     const secp256k1_ecdsa_signature *lease_commit_sig,
+	     const u32 lease_chan_max_msat,
+	     const u16 lease_chan_max_ppt,
+	     const u32 lease_blockheight_start,
+	     const struct amount_msat lease_fee,
+	     const struct amount_sat lease_amt,
+	     s64 splice_amnt,
+	     bool i_am_initiator,
+	     bool force_sign_first,
+	     bool i_sent_sigs);
+
+struct channel_state_change *new_channel_state_change(const tal_t *ctx,
+						      struct timeabs timestamp,
+						      enum channel_state old_state,
+						      enum channel_state new_state,
+						      enum state_change cause,
+						      const char *message TAKES);
+
+/* Add a last_tx and sig to an inflight */
+void inflight_set_last_tx(struct channel_inflight *inflight,
+		          struct bitcoin_tx *last_tx STEALS,
+		          const struct bitcoin_signature last_sig);
+
+/* If the last inflight has no commitment tx, remove it */
+bool maybe_cleanup_last_inflight(struct channel *channel);
 
 /* Given a txid, find an inflight channel stub. Returns NULL if none found */
 struct channel_inflight *channel_inflight_find(struct channel *channel,
@@ -297,28 +502,347 @@ struct channel_inflight *channel_inflight_find(struct channel *channel,
 struct channel_inflight *
 channel_current_inflight(const struct channel *channel);
 
+/* True if we have already sent tx_signatures for the current inflight. */
+bool channel_funding_sigs_sent(const struct channel *channel);
+
 /* What's the last feerate used for a funding tx on this channel? */
 u32 channel_last_funding_feerate(const struct channel *channel);
 
-void delete_channel(struct channel *channel STEALS);
+/* Only set completely_eliminate for never-existed channels */
+void delete_channel(struct channel *channel STEALS,
+		    bool completely_eliminate);
+
+/* Add a historic (public) short_channel_id to this channel */
+void channel_add_old_scid(struct channel *channel,
+			  struct short_channel_id old_scid);
 
 const char *channel_state_name(const struct channel *channel);
 const char *channel_state_str(enum channel_state state);
 
+/* Can this channel send an HTLC? */
+static inline bool channel_state_can_add_htlc(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_SIGEXCHANGE:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+		return false;
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+		return true;
+	}
+	abort();
+}
+
+/* Can this channel remove an HTLC? */
+static inline bool channel_state_can_remove_htlc(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case CLOSINGD_SIGEXCHANGE:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+		return false;
+	case CHANNELD_SHUTTING_DOWN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+		return true;
+	}
+	abort();
+}
+
+static inline bool channel_state_closing(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case CHANNELD_AWAITING_SPLICE:
+		return false;
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_SIGEXCHANGE:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+		return true;
+	}
+	abort();
+}
+
+static inline bool channel_state_fees_can_change(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+		return false;
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+		return true;
+	}
+	abort();
+}
+
+static inline bool channel_state_failing_onchain(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_COMPLETE:
+	case CLOSED:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+		return false;
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+		return true;
+	}
+	abort();
+}
+
+static inline bool channel_state_funding_spent_onchain(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_COMPLETE:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case AWAITING_UNILATERAL:
+		return false;
+	case CLOSED:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+		return true;
+	}
+	abort();
+}
+
+static inline bool channel_state_pre_open(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+		return true;
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+		return false;
+	}
+	abort();
+}
+
+static inline bool channel_state_closed(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+		return false;
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+		return true;
+	}
+	abort();
+}
+
+/* Not even in the database yet? */
+static inline bool channel_state_uncommitted(enum channel_state state)
+{
+	switch (state) {
+ 	case DUALOPEND_OPEN_INIT:
+		return true;
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case CHANNELD_AWAITING_LOCKIN:
+ 	case DUALOPEND_AWAITING_LOCKIN:
+ 	case CHANNELD_NORMAL:
+ 	case CHANNELD_AWAITING_SPLICE:
+ 	case CLOSINGD_SIGEXCHANGE:
+ 	case CHANNELD_SHUTTING_DOWN:
+ 	case CLOSINGD_COMPLETE:
+ 	case AWAITING_UNILATERAL:
+ 	case FUNDING_SPEND_SEEN:
+ 	case ONCHAIN:
+ 	case CLOSED:
+		return false;
+	}
+	abort();
+}
+
+/* Established enough, that we could reach out to peer to discuss */
+static inline bool channel_state_wants_peercomms(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case DUALOPEND_OPEN_COMMITTED:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+		return true;
+	case DUALOPEND_OPEN_INIT:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+		return false;
+	}
+	abort();
+}
+
+/* Established enough, that we have to fail onto chain */
+static inline bool channel_state_wants_onchain_fail(enum channel_state state)
+{
+	switch (state) {
+	case CHANNELD_AWAITING_LOCKIN:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+		return true;
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+		return false;
+	}
+	abort();
+}
+
+static inline bool channel_state_open_uncommitted(enum channel_state state)
+{
+	switch (state) {
+	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_COMMIT_READY:
+		return true;
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
+	case CHANNELD_AWAITING_LOCKIN:
+	case DUALOPEND_OPEN_COMMITTED:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+		return false;
+	}
+
+	abort();
+}
+
+static inline size_t channel_dbid_hash(u64 dbid)
+{
+	return siphash24(siphash_seed(), &dbid, sizeof(dbid));
+}
+
+static u64 channel_dbid(const struct channel *channel)
+{
+	assert(channel->dbid);
+	return channel->dbid;
+}
+
+static bool channel_dbid_eq(const struct channel *channel, u64 dbid)
+{
+	return channel->dbid == dbid;
+}
+/* Defines struct channel_dbid_map */
+HTABLE_DEFINE_NODUPS_TYPE(struct channel,
+			  channel_dbid, channel_dbid_hash, channel_dbid_eq,
+			  channel_dbid_map);
+
+void add_channel_to_dbid_map(struct lightningd *ld, struct channel *channel);
+
 void channel_set_owner(struct channel *channel, struct subd *owner);
 
-/* Channel has failed, but can try again. */
-void channel_fail_reconnect(struct channel *channel,
-			    const char *fmt, ...) PRINTF_FMT(2,3);
-/* Channel has failed, but can try again after a minute. */
-void channel_fail_reconnect_later(struct channel *channel,
-				  const char *fmt,...) PRINTF_FMT(2,3);
+/* Channel has failed, but can try again.  Usually, set disconnect to true. */
+void channel_fail_transient(struct channel *channel,
+			    bool disconnect,
+			    const char *fmt, ...) PRINTF_FMT(3, 4);
 
 /* Channel has failed, give up on it. */
 void channel_fail_permanent(struct channel *channel,
 			    enum state_change reason,
 			    const char *fmt,
 			    ...);
+
+/* Channel has failed, give up on it, specifically because we saw this tx spend it. */
+void channel_fail_saw_onchain(struct channel *channel,
+			      enum state_change reason,
+			      const struct bitcoin_tx *tx,
+			      const char *fmt,
+			      ...);
+
 /* Forget the channel. This is only used for the case when we "receive" error
  * during CHANNELD_AWAITING_LOCKIN if we are "fundee". */
 void channel_fail_forget(struct channel *channel, const char *fmt, ...);
@@ -332,78 +856,121 @@ void channel_set_state(struct channel *channel,
 		       enum channel_state old_state,
 		       enum channel_state state,
 		       enum state_change reason,
-		       char *why);
+		       const char *why);
 
 const char *channel_change_state_reason_str(enum state_change reason);
 
-/* Find a channel which is not yet saved to disk */
-struct channel *peer_unsaved_channel(struct peer *peer);
+/* Find a channel which is passes filter, if any: sets *others if there
+ * is more than one. */
+#define peer_any_channel(peer, filter, arg, others)		\
+	peer_any_channel_((peer),				\
+			  typesafe_cb_preargs(bool, void *,		\
+					      (filter), (arg),		\
+					      const struct channel *),	\
+			  (arg),					\
+			  others)
 
-/* Find a channel which is not onchain, if any */
-struct channel *peer_active_channel(struct peer *peer);
+struct channel *peer_any_channel_(struct peer *peer,
+				  bool (*filter)(const struct channel *,
+						 void *arg),
+				  void *arg,
+				  bool *others);
 
-/* Find a channel which is in state CHANNELD_NORMAL, if any */
-struct channel *peer_normal_channel(struct peer *peer);
-
-/* Get active channel for peer, optionally any uncommitted_channel. */
-struct channel *active_channel_by_id(struct lightningd *ld,
-				     const struct node_id *id,
-				     struct uncommitted_channel **uc);
-
-/* Get unsaved channel for peer */
-struct channel *unsaved_channel_by_id(struct lightningd *ld,
-				      const struct node_id *id);
+/* More common version for filtering by state */
+struct channel *peer_any_channel_bystate(struct peer *peer,
+					 bool (*channel_state_filter)(enum channel_state),
+					 bool *others);
 
 struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid);
 
-struct channel *active_channel_by_scid(struct lightningd *ld,
-				       const struct short_channel_id *scid);
+struct scid_to_channel {
+	struct short_channel_id scid;
+	struct channel *channel;
+};
+
+static inline const struct short_channel_id scid_to_channel_key(const struct scid_to_channel *scidchan)
+{
+	return scidchan->scid;
+}
+
+static inline bool scid_to_channel_eq_scid(const struct scid_to_channel *scidchan,
+					   struct short_channel_id scid)
+{
+	return short_channel_id_eq(scidchan->scid, scid);
+}
+
+/* Define channel_scid_map */
+HTABLE_DEFINE_NODUPS_TYPE(struct scid_to_channel,
+			  scid_to_channel_key,
+			  hash_scid,
+			  scid_to_channel_eq_scid,
+			  channel_scid_map);
+
+/* The only allowed way to set channel->scid */
+void channel_set_scid(struct channel *channel, const struct short_channel_id *new_scid);
+
+/* The only allowed way to set channel->alias[LOCAL] */
+void channel_set_local_alias(struct channel *channel, struct short_channel_id alias_scid);
+
+/* Includes both real scids and aliases.  If !privacy_leak_ok, then private
+ * channels' real scids are not included. */
 struct channel *any_channel_by_scid(struct lightningd *ld,
-				    const struct short_channel_id *scid);
+				    struct short_channel_id scid,
+				    bool privacy_leak_ok);
 
 /* Get channel by channel_id */
 struct channel *channel_by_cid(struct lightningd *ld,
 			       const struct channel_id *cid);
 
+/* Is this channel_id used by a channel with any peer (other than @ignore),
+ * or by a closed channel? */
+bool channel_id_in_use(struct lightningd *ld,
+		       const struct channel_id *cid,
+		       const struct channel *ignore);
+
+/* Find this channel within peer */
+struct channel *find_channel_by_id(const struct peer *peer,
+				   const struct channel_id *cid);
+
+/* Find a channel with this funding outpoint within peer (an outpoint
+ * funds at most one channel). */
+struct channel *find_channel_by_funding_outpoint(const struct peer *peer,
+						 const struct bitcoin_outpoint *outpoint);
+
+/* Find this channel within peer */
+struct channel *find_channel_by_scid(const struct peer *peer,
+				     struct short_channel_id scid);
+
+/* Find a channel by its alias, either local or remote. */
+struct channel *find_channel_by_alias(const struct peer *peer,
+				      struct short_channel_id alias,
+				      enum side side);
+
+/* Do we have any channel with option_anchors_zero_fee_htlc_tx?  (i.e. we
+ * might need to CPFP the fee if it force closes!) */
+bool have_anchor_channel(struct lightningd *ld);
+
+/* Do we consider this channel "important" for connectd to maintain
+ * connection to peer? */
+bool channel_important_filter(const struct channel *channel, void *unused);
+
 void channel_set_last_tx(struct channel *channel,
 			 struct bitcoin_tx *tx,
-			 const struct bitcoin_signature *sig,
-			 enum wallet_tx_type type);
+			 const struct bitcoin_signature *sig);
 
-static inline bool channel_can_add_htlc(const struct channel *channel)
+static inline bool channel_has(const struct channel *channel, int f)
 {
-	return channel->state == CHANNELD_NORMAL;
+	return channel_type_has(channel->type, f);
 }
 
-static inline bool channel_fees_can_change(const struct channel *channel)
-{
-	return channel->state == CHANNELD_NORMAL
-		|| channel->state == CHANNELD_SHUTTING_DOWN;
-}
-
-static inline bool channel_state_on_chain(enum channel_state state)
-{
-	return state == ONCHAIN;
-}
-
-static inline bool channel_on_chain(const struct channel *channel)
-{
-	return channel_state_on_chain(channel->state);
-}
-
-static inline bool channel_unsaved(const struct channel *channel)
-{
-	return channel->state == DUALOPEND_OPEN_INIT
-		&& channel->dbid == 0;
-}
-
-static inline bool channel_active(const struct channel *channel)
-{
-	return channel->state != FUNDING_SPEND_SEEN
-		&& channel->state != CLOSINGD_COMPLETE
-		&& !channel_unsaved(channel)
-		&& !channel_on_chain(channel);
-}
+/**
+ * Either returns the short_channel_id if it is known or the local alias.
+ *
+ * This is used to refer to a channel by its scid. But sometimes we
+ * don't have a scid yet, e.g., for `zeroconf` channels, so we resort
+ * to referencing it by the local alias, which we have in that case.
+ */
+struct short_channel_id channel_scid_or_local_alias(const struct channel *chan);
 
 void get_channel_basepoints(struct lightningd *ld,
 			    const struct node_id *peer_id,
@@ -414,7 +981,19 @@ void get_channel_basepoints(struct lightningd *ld,
 void channel_set_billboard(struct channel *channel, bool perm,
 			   const char *str TAKES);
 
-struct htlc_in *channel_has_htlc_in(struct channel *channel);
-struct htlc_out *channel_has_htlc_out(struct channel *channel);
+struct htlc_in *channel_has_htlc_in(const struct channel *channel);
+struct htlc_out *channel_has_htlc_out(const struct channel *channel);
+
+/* hin can be NULL */
+const u8 *channel_update_for_error(const tal_t *ctx,
+				   const struct htlc_in *hin,
+				   struct channel *channel);
+
+struct amount_msat htlc_max_possible_send(const struct channel *channel);
+
+/* Given features, what channel_type do we want? */
+struct channel_type *desired_channel_type(const tal_t *ctx,
+					  const struct feature_set *our_features,
+					  const u8 *their_features);
 
 #endif /* LIGHTNING_LIGHTNINGD_CHANNEL_H */

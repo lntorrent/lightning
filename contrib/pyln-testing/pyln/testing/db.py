@@ -1,4 +1,4 @@
-from ephemeral_port_reserve import reserve  # type: ignore
+from .utils import reserve_unused_port, drop_unused_port
 
 import itertools
 import logging
@@ -14,9 +14,15 @@ import time
 from typing import Dict, List, Optional, Union
 
 
-class Sqlite3Db(object):
+class BaseDb(object):
+    def wipe_db(self):
+        raise NotImplementedError("wipe_db method must be implemented by the subclass")
+
+
+class Sqlite3Db(BaseDb):
     def __init__(self, path: str) -> None:
         self.path = path
+        self.provider = None
 
     def get_dsn(self) -> None:
         """SQLite3 doesn't provide a DSN, resulting in no CLI-option.
@@ -31,6 +37,8 @@ class Sqlite3Db(object):
 
         db.row_factory = sqlite3.Row
         c = db.cursor()
+        # Don't get upset by concurrent writes; wait for up to 5 seconds!
+        c.execute("PRAGMA busy_timeout = 5000")
         c.execute(query)
         rows = c.fetchall()
 
@@ -43,19 +51,31 @@ class Sqlite3Db(object):
         db.close()
         return result
 
-    def execute(self, query: str) -> None:
-        db = sqlite3.connect(self.path)
-        c = db.cursor()
-        c.execute(query)
-        db.commit()
-        c.close()
-        db.close()
+    def execute(self, query: str, params: tuple = ()) -> None:
+        """Execute a single statement with bound params. Placeholders: '?'"""
+        with sqlite3.connect(self.path) as db:
+            db.execute("PRAGMA busy_timeout = 5000")
+            db.execute(query, params)
+
+    def executemany(self, query: str, seq_of_params: list[tuple]) -> None:
+        """Batch execute with bound params. Placeholders: '?'"""
+        with sqlite3.connect(self.path) as db:
+            db.execute("PRAGMA busy_timeout = 5000")
+            db.executemany(query, seq_of_params)
+
+    def stop(self):
+        pass
+
+    def wipe_db(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
 
 
-class PostgresDb(object):
+class PostgresDb(BaseDb):
     def __init__(self, dbname, port):
         self.dbname = dbname
         self.port = port
+        self.provider = None
 
         self.conn = psycopg2.connect("dbname={dbname} user=postgres host=localhost port={port}".format(
             dbname=dbname, port=port
@@ -84,9 +104,30 @@ class PostgresDb(object):
         cur.close()
         return res
 
-    def execute(self, query):
+    def execute(self, query: str, params: tuple = ()) -> None:
+        """Execute a single statement with bound params. Placeholders: '%s'"""
         with self.conn, self.conn.cursor() as cur:
-            cur.execute(query)
+            cur.execute(query, params)
+
+    def executemany(self, query: str, seq_of_params: list[tuple]) -> None:
+        """Batch execute with bound params. Placeholders: '%s'"""
+        with self.conn, self.conn.cursor() as cur:
+            cur.executemany(query.replace('?', '%s'), seq_of_params)
+
+    def stop(self):
+        """Clean up the database.
+        """
+        self.conn.close()
+        conn = psycopg2.connect("dbname=postgres user=postgres host=localhost port={self.port}")
+        cur = conn.cursor()
+        cur.execute("DROP DATABASE {};".format(self.dbname))
+        cur.close()
+
+    def wipe_db(self):
+        cur = self.conn.cursor()
+        cur.execute(f"DROP DATABASE IF EXISTS {self.dbname};")
+        cur.execute(f"CREATE DATABASE {self.dbname};")
+        cur.close()
 
 
 class SqliteDbProvider(object):
@@ -108,6 +149,9 @@ class SqliteDbProvider(object):
 
 
 class PostgresDbProvider(object):
+    # Postgres truncates identifiers at NAMEDATALEN - 1 bytes.
+    MAX_IDENTIFIER_LEN = 63
+
     def __init__(self, directory):
         self.directory = directory
         self.port = None
@@ -161,7 +205,7 @@ class PostgresDbProvider(object):
         with open(conffile, 'a') as f:
             f.write('max_connections = 1000\nshared_buffers = 240MB\n')
 
-        self.port = reserve()
+        self.port = reserve_unused_port()
         self.proc = subprocess.Popen([
             postgres,
             '-k', '/tmp/',  # So we don't use /var/lib/...
@@ -182,10 +226,21 @@ class PostgresDbProvider(object):
         # Required for CREATE DATABASE to work
         self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
+    @staticmethod
+    def db_name(testname: str, node_id: int, nonce: str) -> str:
+        """Build the database name for a node of a test.
+
+        Truncates the testname, not the suffix: postgres would otherwise
+        cut off the node_id and the nonce, making the names of
+        long-named tests collide and fail with `DuplicateDatabase`.
+        """
+        suffix = "_{}_{}".format(node_id, nonce)
+        return testname[:PostgresDbProvider.MAX_IDENTIFIER_LEN - len(suffix)] + suffix
+
     def get_db(self, node_directory, testname, node_id):
         # Random suffix to avoid collisions on repeated tests
         nonce = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-        dbname = "{}_{}_{}".format(testname, node_id, nonce)
+        dbname = self.db_name(testname, node_id, nonce)
 
         cur = self.conn.cursor()
         cur.execute("CREATE DATABASE {};".format(dbname))
@@ -208,3 +263,5 @@ class PostgresDbProvider(object):
         # [1] https://www.postgresql.org/docs/9.1/server-shutdown.html
         self.proc.send_signal(signal.SIGINT)
         self.proc.wait()
+        shutil.rmtree(self.pgdir)
+        drop_unused_port(self.port)

@@ -85,4 +85,22 @@ struct fee_states *fromwire_fee_states(const tal_t *ctx,
  * Is this fee_state struct valid for this side?
  */
 bool fee_states_valid(const struct fee_states *fee_states, enum side opener);
+
+/* Are there no more fee changes in-flight? */
+bool feerate_changes_done(const struct fee_states *fee_states,
+			  bool ignore_uncommitted);
+
+char *fmt_fee_states(const tal_t *ctx,
+		     const struct fee_states *fee_states);
+
+/**
+ * https://github.com/lightningnetwork/lightning-rfc/issues/740 indicates
+ * we should not allow an HTLC if a fee increase of 100% would cause us to
+ * get stuck.
+ *
+ * This proved overzealous: if fees are already high there is less chance
+ * they increase by another 100%, so we scale the factor.
+ */
+u32 marginal_feerate(u32 current_feerate);
+
 #endif /* LIGHTNING_COMMON_FEE_STATES_H */

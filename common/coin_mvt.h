@@ -3,212 +3,350 @@
 #include "config.h"
 
 #include <bitcoin/tx.h>
-#include <ccan/ccan/crypto/sha256/sha256.h>
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
-#include <common/amount.h>
 #include <common/channel_id.h>
-#include <stdbool.h>
-#include <wire/wire.h>
 
-#define COIN_MVT_VERSION 1
+#define COIN_MVT_VERSION 2
+#define ACCOUNT_NAME_WALLET "wallet"
+#define ACCOUNT_NAME_EXTERNAL "external"
 
-#define COIN_MVT_ACCT_WALLET "wallet"
-
-enum mvt_type {
-	CHAIN_MVT = 0,
-	CHANNEL_MVT = 1,
+/* /!\ You cannot change this order, it's committed to the db! /!\ */
+enum mvt_tag {
+	MVT_DEPOSIT = 0,
+	MVT_WITHDRAWAL = 1,
+	MVT_PENALTY = 2,
+	MVT_INVOICE = 3,
+	MVT_ROUTED = 4,
+	MVT_PUSHED = 5,
+	MVT_CHANNEL_OPEN = 6,
+	MVT_CHANNEL_CLOSE = 7,
+	MVT_CHANNEL_TO_US = 8,
+	MVT_HTLC_TIMEOUT = 9,
+	MVT_HTLC_FULFILL = 10,
+	MVT_HTLC_TX = 11,
+	MVT_TO_WALLET = 12,
+	MVT_ANCHOR = 13,
+	MVT_TO_THEM = 14,
+	MVT_PENALIZED = 15,
+	MVT_STOLEN = 16,
+	MVT_TO_MINER = 17,
+	MVT_OPENER = 18,
+	MVT_LEASE_FEE = 19,
+	MVT_LEASED = 20,
+	MVT_STEALABLE = 21,
+	MVT_CHANNEL_PROPOSED = 22,
+	MVT_SPLICE = 23,
+	MVT_PENALTY_ADJ = 24,
+	MVT_JOURNAL = 25,
+	MVT_FOREIGN = 26,
+	MVT_IGNORED = 27,
+#define NUM_MVT_TAGS (MVT_IGNORED + 1)
 };
 
-enum mvt_tag {
-	DEPOSIT = 0,
-	WITHDRAWAL = 1,
-	CHAIN_FEES = 2,
-	PENALTY = 3,
-	INVOICE = 4,
-	ROUTED = 5,
-	JOURNAL = 6,
-	ONCHAIN_HTLC = 7,
-	PUSHED = 8,
-	SPEND_TRACK = 9,
+struct mvt_tags {
+	u64 bits;
+};
+
+enum coin_mvt_dir {
+	COIN_CREDIT = 1,
+	COIN_DEBIT = 2,
+};
+
+struct channel_coin_mvt_id {
+	/* multi-part payments may share a payment hash,
+	 * so we should also record part-id and group-id for them */
+	u64 part_id;
+	u64 group_id;
+};
+
+/* Only one of these is set. */
+struct mvt_account_id {
+	const struct channel *channel;
+	const char *alt_account;
 };
 
 struct channel_coin_mvt {
-	/* account_id */
-	struct channel_id chan_id;
-
-	/* identifier */
-	struct sha256 *payment_hash;
-
-	/* mutli-part payments may share a payment hash,
-	 * so we should also record a 'part-id' for them */
-	u64 *part_id;
-
-	/* label / tag */
-	enum mvt_tag tag;
-
+	/* Common fields */
+	struct mvt_account_id account;
+	struct mvt_tags tags;
 	/* only one or the other */
 	struct amount_msat credit;
 	struct amount_msat debit;
+	u64 timestamp;
 
+	/* identifier */
+	const struct sha256 *payment_hash;
+
+	/* multi-part payments may share a payment hash,
+	 * so we should also record part-id and group-id for them */
+	const struct channel_coin_mvt_id *part_and_group;
+
+	/* Fees collected (or paid) on this mvt */
+	struct amount_msat fees;
 };
 
 struct chain_coin_mvt {
 	/* account_id */
-	const char *account_name;
-	const struct bitcoin_txid *tx_txid;
-	const struct bitcoin_txid *output_txid;
-	u32 vout;
+	struct mvt_account_id account;
+	struct mvt_tags tags;
+	/* only one or the other */
+	struct amount_msat credit;
+	struct amount_msat debit;
+	u64 timestamp;
+	struct bitcoin_outpoint outpoint;
+
+	const struct bitcoin_txid *spending_txid;
+
+	/* The id of the peer we have this channel with.
+	 * Only on our channel_open events */
+	const struct node_id *peer_id;
 
 	/* some on-chain movements have a payment hash */
-	struct sha256 *payment_hash;
+	const struct sha256 *payment_hash;
 
-	/* label / tag */
-	enum mvt_tag tag;
-
-	/* block this transaction is confirmed in
-	 * zero means it's unknown/unconfirmed */
+	/* block this transaction is confirmed in */
 	u32 blockheight;
 
-	/* only one or the other */
-	struct amount_msat credit;
-	struct amount_msat debit;
+	/* total value of output (useful for tracking external outs) */
+	struct amount_sat output_val;
+
+	/* When we pay to external accounts, it's useful
+	 * to track which internal account it originated from */
+	const struct mvt_account_id *originating_acct;
+
+	/* Number of outputs in spending tx; used by the
+	 * `channel_close` event */
+	u32 output_count;
 };
 
-/* differs depending on type!? */
-struct mvt_id {
-	struct sha256 *payment_hash;
-	u64 *part_id;
-	const struct bitcoin_txid *tx_txid;
-	const struct bitcoin_txid *output_txid;
-	u32 vout;
-};
+/* Convenience macro for creating tag bitmaps */
+#define mk_mvt_tags(...) mk_mvt_tags_(__VA_ARGS__, 999)
+struct mvt_tags mk_mvt_tags_(enum mvt_tag tag, ...);
 
-struct coin_mvt {
-	/* name of 'account': wallet, external, <channel_id> */
-	const char *account_id;
-	const char *bip173_name;
+static inline struct mvt_tags tag_to_mvt_tags(enum mvt_tag tag)
+{
+	struct mvt_tags tags;
+	tags.bits = ((u64)1) << tag;
+	return tags;
+}
 
-	/* type of movement: channel or chain */
-	enum mvt_type type;
+/* Add a tag */
+void mvt_tag_set(struct mvt_tags *tags, enum mvt_tag tag);
 
-	/* identifier */
-	struct mvt_id id;
+/* Extract the primary tag */
+enum mvt_tag primary_mvt_tag(struct mvt_tags tags);
 
-	/* label / tag */
-	enum mvt_tag tag;
+/* Useful for assertions */
+bool mvt_tags_valid(struct mvt_tags tags);
 
-	/* only one or the other */
-	struct amount_msat credit;
-	struct amount_msat debit;
+/* Useful constructor for mvt_account_id: exactly one of channel/account_name must be NULL */
+void set_mvt_account_id(struct mvt_account_id *acct_id,
+			const struct channel *channel,
+			const char *account_name TAKES);
 
-	u32 timestamp;
-	u32 blockheight;
+/* Allocating version */
+struct mvt_account_id *new_mvt_account_id(const tal_t *ctx,
+					  const struct channel *channel,
+					  const char *account_name TAKES);
 
-	/* version is a counter of the format of the data payload that
-	 * makes up a coin movement */
-	u8 version;
-
-	/* node originating this movement */
-	struct node_id *node_id;
-
-	/* id of this movement (on this node) */
-	u64 counter;
-};
-
+/* Either part_id and group_id both NULL, or neither are */
 struct channel_coin_mvt *new_channel_coin_mvt(const tal_t *ctx,
-					      const struct channel_id *cid,
-					      struct sha256 payment_hash,
-					      u64 *part_id,
+					      const struct channel *channel,
+					      u64 timestamp,
+					      const struct sha256 *payment_hash TAKES,
+					      const u64 *part_id,
+					      const u64 *group_id,
+					      enum coin_mvt_dir direction,
 					      struct amount_msat amount,
-					      enum mvt_tag tag,
-					      bool is_credit);
+					      struct mvt_tags tags,
+					      struct amount_msat fees)
+	NON_NULL_ARGS(2);
 
-struct chain_coin_mvt *new_coin_withdrawal(const tal_t *ctx,
-					  const char *account_name,
-					  const struct bitcoin_txid *tx_txid,
-					  const struct bitcoin_txid *out_txid,
-					  u32 vout,
-					  u32 blockheight,
-					  struct amount_msat amount);
-struct chain_coin_mvt *new_coin_withdrawal_sat(const tal_t *ctx,
-					       const char *account_name,
-					       const struct bitcoin_txid *tx_txid,
-					       const struct bitcoin_txid *out_txid,
-					       u32 vout,
-					       u32 blockheight,
-					       struct amount_sat amount);
-struct chain_coin_mvt *new_coin_chain_fees(const tal_t *ctx,
-					   const char *account_name,
-					   const struct bitcoin_txid *tx_txid,
-					   u32 blockheight,
-					   struct amount_msat amount);
-struct chain_coin_mvt *new_coin_chain_fees_sat(const tal_t *ctx,
-					       const char *account_name,
-					       const struct bitcoin_txid *tx_txid,
-					       u32 blockheight,
-					       struct amount_sat amount);
-struct chain_coin_mvt *new_coin_journal_entry(const tal_t *ctx,
-					      const char *account_name,
+struct chain_coin_mvt *new_onchaind_withdraw(const tal_t *ctx,
+					     const struct bitcoin_outpoint *outpoint,
+					     const struct bitcoin_txid *spend_txid,
+					     u32 blockheight,
+					     struct amount_sat amount,
+					     struct mvt_tags tags)
+	NON_NULL_ARGS(2, 3);
+
+struct chain_coin_mvt *new_onchaind_deposit(const tal_t *ctx,
+					    const struct bitcoin_outpoint *outpoint,
+					    u32 blockheight,
+					    struct amount_sat amount,
+					    struct mvt_tags tags)
+	NON_NULL_ARGS(2);
+
+struct chain_coin_mvt *new_coin_channel_close(const tal_t *ctx,
+					      const struct channel *channel,
+					      const char *alt_account,
 					      const struct bitcoin_txid *txid,
-					      const struct bitcoin_txid *out_txid,
-					      u32 vout,
+					      const struct bitcoin_outpoint *out,
 					      u32 blockheight,
-					      struct amount_msat amount,
-					      bool is_credit);
-struct chain_coin_mvt *new_coin_deposit(const tal_t *ctx,
-					const char *account_name,
-					const struct bitcoin_txid *txid,
-					u32 vout, u32 blockheight,
-					struct amount_msat amount);
-struct chain_coin_mvt *new_coin_deposit_sat(const tal_t *ctx,
-					    const char *account_name,
-					    const struct bitcoin_txid *txid,
-					    u32 vout,
-					    u32 blockheight,
-					    struct amount_sat amount);
-struct chain_coin_mvt *new_coin_penalty_sat(const tal_t *ctx,
-					    const char *account_name,
-					    const struct bitcoin_txid *txid,
-					    const struct bitcoin_txid *out_txid,
-					    u32 vout,
-					    u32 blockheight,
-					    struct amount_sat amount);
+					      const struct amount_msat amount,
+					      const struct amount_sat output_val,
+					      u32 output_count,
+					      bool is_splice)
+	NON_NULL_ARGS(4, 5);
 
-struct chain_coin_mvt *new_coin_onchain_htlc_sat(const tal_t *ctx,
-						 const char *account_name,
-						 const struct bitcoin_txid *txid,
-						 const struct bitcoin_txid *out_txid,
-						 u32 vout,
-						 struct sha256 payment_hash,
+struct chain_coin_mvt *new_coin_channel_open_proposed(const tal_t *ctx,
+						      const struct channel *channel,
+						      const struct bitcoin_outpoint *out,
+						      const struct node_id *peer_id,
+						      const struct amount_msat amount,
+						      const struct amount_sat output_val,
+						      bool is_opener,
+						      bool is_leased)
+	NON_NULL_ARGS(2, 3, 4);
+
+struct chain_coin_mvt *new_coin_channel_open(const tal_t *ctx,
+					     const struct channel *channel,
+					     const struct bitcoin_outpoint *out,
+					     const struct node_id *peer_id,
+					     u32 blockheight,
+					     const struct amount_msat amount,
+					     const struct amount_sat output_val,
+					     bool is_opener,
+					     bool is_leased)
+	NON_NULL_ARGS(2, 3, 4);
+
+struct chain_coin_mvt *new_onchain_htlc_deposit(const tal_t *ctx,
+						const struct bitcoin_outpoint *outpoint,
+						u32 blockheight,
+						struct amount_sat amount,
+						const struct sha256 *payment_hash)
+	NON_NULL_ARGS(2, 5);
+
+struct chain_coin_mvt *new_onchain_htlc_withdraw(const tal_t *ctx,
+						 const struct bitcoin_outpoint *outpoint,
 						 u32 blockheight,
 						 struct amount_sat amount,
-						 bool is_credit);
-struct chain_coin_mvt *new_coin_spend_track(const tal_t *ctx,
-					    const struct bitcoin_txid *txid,
-					    const struct bitcoin_txid *out_txid,
-					    u32 vout, u32 blockheight);
-struct chain_coin_mvt *new_coin_pushed(const tal_t *ctx,
-				       const char *account_name,
-				       const struct bitcoin_txid *txid,
-				       u32 blockheight,
-				       struct amount_msat amount);
-struct coin_mvt *finalize_chain_mvt(const tal_t *ctx,
-				    const struct chain_coin_mvt *chain_mvt,
-				    const char *bip173_name,
-				    u32 timestamp,
-				    struct node_id *node_id,
-				    s64 mvt_count);
-struct coin_mvt *finalize_channel_mvt(const tal_t *ctx,
-				      const struct channel_coin_mvt *chan_mvt,
-				      const char *bip173_name,
-				      u32 timestamp, struct node_id *node_id,
-				      s64 mvt_count);
+						 const struct sha256 *payment_hash)
+	NON_NULL_ARGS(2, 5);
 
-const char *mvt_type_str(enum mvt_type type);
+struct chain_coin_mvt *new_coin_wallet_deposit(const tal_t *ctx,
+					       const struct bitcoin_outpoint *outpoint,
+					       u32 blockheight,
+					       struct amount_sat amount,
+					       struct mvt_tags tags)
+	NON_NULL_ARGS(2);
+
+
+struct chain_coin_mvt *new_coin_wallet_withdraw(const tal_t *ctx,
+						const struct bitcoin_txid *spend_txid,
+						const struct bitcoin_outpoint *outpoint,
+						u32 blockheight,
+						struct amount_sat amount,
+						struct mvt_tags tags)
+	NON_NULL_ARGS(2, 3);
+
+struct chain_coin_mvt *new_coin_external_spend(const tal_t *ctx,
+					       const struct bitcoin_outpoint *outpoint,
+					       const struct bitcoin_txid *txid,
+					       u32 blockheight,
+					       struct amount_sat amount,
+					       struct mvt_tags tags)
+	NON_NULL_ARGS(2, 3);
+
+struct chain_coin_mvt *new_coin_external_deposit(const tal_t *ctx,
+						 const struct bitcoin_outpoint *outpoint,
+						 u32 blockheight,
+						 struct amount_sat amount,
+						 struct mvt_tags tags)
+	NON_NULL_ARGS(2);
+
+struct channel_coin_mvt *new_coin_channel_push(const tal_t *ctx,
+					       const struct channel *channel,
+					       enum coin_mvt_dir direction,
+					       struct amount_msat amount,
+					       struct mvt_tags tags)
+	NON_NULL_ARGS(2);
+
+/* FIXME: Does not set originating_acct, caller must do that! */
+struct chain_coin_mvt *new_foreign_deposit(const tal_t *ctx,
+					   const struct bitcoin_outpoint *outpoint,
+					   u32 blockheight,
+					   struct amount_sat amount,
+					   const char *account,
+					   u64 timestamp)
+	NON_NULL_ARGS(2, 5);
+
+struct chain_coin_mvt *new_foreign_withdrawal(const tal_t *ctx,
+					      const struct bitcoin_outpoint *outpoint,
+					      const struct bitcoin_txid *spend_txid,
+					      struct amount_sat amount,
+					      u32 blockheight,
+					      const char *account,
+					      u64 timestamp)
+	NON_NULL_ARGS(2, 3, 6);
+
+/* Generic versions (prefer the above ones: these are for migrations) */
+struct channel_coin_mvt *new_channel_coin_mvt_general(const tal_t *ctx,
+						      const struct channel *channel,
+						      const struct channel_id *cid,
+						      u64 timestamp,
+						      const struct sha256 *payment_hash TAKES,
+						      const u64 *part_id,
+						      const u64 *group_id,
+						      enum coin_mvt_dir direction,
+						      struct amount_msat amount,
+						      struct mvt_tags tags,
+						      struct amount_msat fees);
+
+struct chain_coin_mvt *new_coin_channel_open_general(const tal_t *ctx,
+						     const struct channel *channel,
+						     const struct channel_id *cid,
+						     u64 timestamp,
+						     const struct bitcoin_outpoint *out,
+						     const struct node_id *peer_id,
+						     u32 blockheight,
+						     const struct amount_msat amount,
+						     const struct amount_sat output_val,
+						     bool is_opener,
+						     bool is_leased);
+
+struct channel_coin_mvt *new_coin_channel_push_general(const tal_t *ctx,
+						       const struct channel *channel,
+						       const struct channel_id *cid,
+						       u64 timestamp,
+						       enum coin_mvt_dir direction,
+						       struct amount_msat amount,
+						       struct mvt_tags tags);
+
+/* There are three standard accounts:
+ * "wallet" for our internal wallet,
+ * "external" for other bitcoin sources,
+ * <channelid> for lightning channels.
+ *
+ * Exactly one of these is true:
+ */
+static inline bool is_wallet_account(const char *acctname)
+{
+	return streq(acctname, ACCOUNT_NAME_WALLET);
+}
+
+static inline bool is_external_account(const char *acctname)
+{
+	return streq(acctname, ACCOUNT_NAME_EXTERNAL);
+}
+
+static inline bool is_channel_account(const char *acctname)
+{
+	return !is_wallet_account(acctname) && !is_external_account(acctname);
+}
+
+/* Is this an xternal account? */
+bool chain_mvt_is_external(const struct chain_coin_mvt *mvt);
+
 const char *mvt_tag_str(enum mvt_tag tag);
+const char **mvt_tag_strs(const tal_t *ctx, struct mvt_tags tags);
+
+/* Parse a single mvt tag.  Returns false or populates *tag */
+bool mvt_tag_parse(const char *buf, size_t len, enum mvt_tag *tag);
 
 void towire_chain_coin_mvt(u8 **pptr, const struct chain_coin_mvt *mvt);
 void fromwire_chain_coin_mvt(const u8 **cursor, size_t *max, struct chain_coin_mvt *mvt);
+
+/* Time helper for deterministic timestamps: always moves forwards */
+u64 coinmvt_current_time(void);
 
 #endif /* LIGHTNING_COMMON_COIN_MVT_H */

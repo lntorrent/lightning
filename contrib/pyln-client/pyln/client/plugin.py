@@ -1,10 +1,4 @@
-from .lightning import LightningRpc, Millisatoshi
-from binascii import hexlify
-from collections import OrderedDict
-from enum import Enum
-from threading import RLock
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+import copy
 import inspect
 import io
 import json
@@ -14,6 +8,14 @@ import os
 import re
 import sys
 import traceback
+from binascii import hexlify
+from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum
+from threading import RLock
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+from .lightning import LightningRpc, Millisatoshi
 
 # Notice that this definition is incomplete as it only checks the
 # top-level. Arrays and Dicts could contain types that aren't encodeable. This
@@ -47,18 +49,48 @@ class Method(object):
     """
     def __init__(self, name: str, func: Callable[..., JSONType],
                  mtype: MethodType = MethodType.RPCMETHOD,
-                 category: str = None, desc: str = None,
-                 long_desc: str = None, deprecated: bool = False):
+                 deprecated: Union[bool, List[str]] = None,
+                 description: str = None):
         self.name = name
         self.func = func
         self.mtype = mtype
-        self.category = category
         self.background = False
-        self.desc = desc
-        self.long_desc = long_desc
         self.deprecated = deprecated
+        self.description = description
         self.before: List[str] = []
         self.after: List[str] = []
+        self.filters: Optional[List[Union[str, int]]] = None
+
+    def get_usage(self):
+        # Handles out-of-order use of parameters like:
+        #
+        # ```python3
+        #
+        # def hello_obfus(arg1, arg2, plugin, thing3, request=None,
+        #                 thing5='at', thing6=21)
+        #
+        # ```
+        argspec = inspect.getfullargspec(self.func)
+        defaults = argspec.defaults
+        num_defaults = len(defaults) if defaults else 0
+        start_kwargs_idx = len(argspec.args) - num_defaults
+        args = []
+        for idx, arg in enumerate(argspec.args):
+            if arg in ('plugin', 'request'):
+                continue
+            # Positional arg
+            if idx < start_kwargs_idx:
+                args.append("%s" % arg)
+            # Keyword arg
+            else:
+                args.append("[%s]" % arg)
+
+        if self.description is not None:
+            doc = inspect.getdoc(self.func)
+            doc = re.sub('\n', '\n ', doc)
+            args.append(" \n %s" % doc)
+
+        return " ".join(args)
 
 
 class RpcException(Exception):
@@ -72,13 +104,14 @@ class RpcException(Exception):
 class Request(dict):
     """A request object that wraps params and allows async return
     """
-    def __init__(self, plugin: 'Plugin', req_id: Optional[int], method: str,
-                 params: Any, background: bool = False):
+    def __init__(self, plugin: 'Plugin', req_id: Optional[str], method: str,
+                 params: Any, background: bool = False, origin: Optional[str] = None):
         self.method = method
         self.params = params
         self.background = background
         self.plugin = plugin
         self.state = RequestState.PENDING
+        self.origin = origin
         self.id = req_id
         self.termination_tb: Optional[str] = None
 
@@ -96,7 +129,7 @@ class Request(dict):
 
     def set_result(self, result: Any) -> None:
         if self.state != RequestState.PENDING:
-            assert(self.termination_tb is not None)
+            assert self.termination_tb is not None
             raise ValueError(
                 "Cannot set the result of a request that is not pending, "
                 "current state is {state}. Request previously terminated at\n"
@@ -112,7 +145,7 @@ class Request(dict):
 
     def set_exception(self, exc: Union[Exception, RpcException]) -> None:
         if self.state != RequestState.PENDING:
-            assert(self.termination_tb is not None)
+            assert self.termination_tb is not None
             raise ValueError(
                 "Cannot set the exception of a request that is not pending, "
                 "current state is {state}. Request previously terminated at\n"
@@ -131,8 +164,6 @@ class Request(dict):
             "error": {
                 "code": code,
                 "message": message,
-                # 'data' field "may be omitted."
-                "traceback": traceback.format_exc(),
             },
         })
         self.state = RequestState.FAILED
@@ -183,6 +214,38 @@ class Request(dict):
         self._notify("progress", d)
 
 
+@dataclass
+class Option:
+    name: str
+    default: Optional[Any]
+    description: Optional[str]
+    opt_type: str
+    value: Optional[Any]
+    multi: bool
+    deprecated: Optional[Union[bool, List[str]]]
+    dynamic: bool
+    on_change: Optional[Callable[["Plugin", str, Optional[Any]], None]]
+
+    def __getitem__(self, key):
+        """Backwards compatibility for callers who directly asked for ['value']"""
+        if key == 'value':
+            return self.value
+        raise KeyError(f"Key {key} not supported, only 'value' is")
+
+    def json(self) -> Dict[str, Any]:
+        ret = {
+            'name': self.name,
+            'description': self.description,
+            'type': self.opt_type,
+            'multi': self.multi,
+            'deprecated': self.deprecated,
+            'dynamic': self.dynamic,
+        }
+        if self.default is not None:
+            ret['default'] = self.default
+        return ret
+
+
 # If a hook call fails we need to coerce it into something the main daemon can
 # handle. Returning an error is not an option since we explicitly do not allow
 # those as a response to the calls, otherwise the only option we have is to
@@ -200,6 +263,13 @@ hook_fallbacks = {
     'openchannel': {'result': 'reject'},
     'rpc_command': {'result': 'continue'},
     'custommsg': {'result': 'continue'},
+    'openchannel2': {'result': 'reject'},
+    'openchannel2_changed': {'result': 'reject'},
+    'openchannel2_sign': {'result': 'reject'},
+    'rbf_channel': {'result': 'reject'},
+    'onion_message_recv': {'result': 'continue'},
+    'onion_message_recv_secret': {'result': 'continue'},
+    'recover': {'result': 'continue'},
 }
 
 
@@ -217,12 +287,16 @@ class Plugin(object):
                  dynamic: bool = True,
                  init_features: Optional[Union[int, str, bytes]] = None,
                  node_features: Optional[Union[int, str, bytes]] = None,
-                 invoice_features: Optional[Union[int, str, bytes]] = None):
+                 invoice_features: Optional[Union[int, str, bytes]] = None,
+                 custom_msgs: Optional[List[int]] = None):
         self.methods = {
-            'init': Method('init', self._init, MethodType.RPCMETHOD)
+            'init': Method('init', self._init, MethodType.RPCMETHOD),
+            'setconfig': Method('setconfig', self._set_config, MethodType.RPCMETHOD)
         }
 
-        self.options: Dict[str, Dict[str, Any]] = {}
+        self.options: Dict[str, Option] = {}
+        self.notification_topics: List[str] = []
+        self.custom_msgs = custom_msgs
 
         def convert_featurebits(
                 bits: Optional[Union[int, str, bytes]]) -> Optional[str]:
@@ -273,7 +347,11 @@ class Plugin(object):
         self.rpc: Optional[LightningRpc] = None
         self.startup = True
         self.dynamic = dynamic
-        self.child_init: Optional[Callable[..., None]] = None
+
+        # The function registering as init may return a dict of the
+        # form `{'disable': 'why'}` to self-disable, however most
+        # commonly you'll want to return `None`
+        self.child_init: Optional[Callable[..., Optional[dict]]] = None
 
         self.write_lock = RLock()
 
@@ -286,10 +364,8 @@ class Plugin(object):
 
     def add_method(self, name: str, func: Callable[..., Any],
                    background: bool = False,
-                   category: Optional[str] = None,
-                   desc: Optional[str] = None,
-                   long_desc: Optional[str] = None,
-                   deprecated: bool = False) -> None:
+                   deprecated: Optional[Union[bool, List[str]]] = None,
+                   description: str = None) -> None:
         """Add a plugin method to the dispatch table.
 
         The function will be expected at call time (see `_dispatch`)
@@ -316,11 +392,9 @@ class Plugin(object):
         `request.set_result` or `result.set_exception` to return a result or
         raise an exception for the call.
 
-        The `category` argument can be used to specify the category of the
-        newly created rpc command.
-
-        `deprecated` means that it won't appear unless `allow-deprecated-apis`
-        is true (the default).
+        `deprecated` True means that it won't appear unless `allow-deprecated-apis`
+        is true (the default), or if list of version string (e.g. "v23.08"), then
+        start deprecation cycle at that version (and removal after second entry in list).
         """
         if name in self.methods:
             raise ValueError(
@@ -328,11 +402,7 @@ class Plugin(object):
             )
 
         # Register the function with the name
-        method = Method(
-            name, func, MethodType.RPCMETHOD, category, desc, long_desc,
-            deprecated
-        )
-
+        method = Method(name, func, MethodType.RPCMETHOD, deprecated, description)
         method.background = background
         self.methods[name] = method
 
@@ -379,10 +449,14 @@ class Plugin(object):
             return f
         return decorator
 
-    def add_option(self, name: str, default: Optional[str],
+    def add_option(self, name: str, default: Optional[Any],
                    description: Optional[str],
-                   opt_type: str = "string", deprecated: bool = False,
-                   multi: bool = False) -> None:
+                   opt_type: str = "string",
+                   deprecated: Optional[Union[bool, List[str]]] = None,
+                   multi: bool = False,
+                   dynamic=False,
+                   on_change: Optional[Callable[["Plugin", str, Optional[Any]], None]] = None,
+                   ) -> None:
         """Add an option that we'd like to register with lightningd.
 
         Needs to be called before `Plugin.run`, otherwise we might not
@@ -396,21 +470,29 @@ class Plugin(object):
 
         if opt_type not in ["string", "int", "bool", "flag"]:
             raise ValueError(
-                '{} not in supported type set (string, int, bool, flag)'
+                '{} not in supported type set (string, int, bool, flag)'.format(opt_type)
             )
 
-        self.options[name] = {
-            'name': name,
-            'default': default,
-            'description': description,
-            'type': opt_type,
-            'value': None,
-            'multi': multi,
-            'deprecated': deprecated,
-        }
+        if on_change is not None and not dynamic:
+            raise ValueError(
+                'Option {} has on_change callback but is not dynamic'.format(name)
+            )
+
+        self.options[name] = Option(
+            name=name,
+            default=default,
+            description=description,
+            opt_type=opt_type,
+            value=None,
+            dynamic=dynamic,
+            on_change=on_change,
+            multi=multi,
+            deprecated=deprecated if deprecated is not None else False,
+        )
 
     def add_flag_option(self, name: str, description: str,
-                        deprecated: bool = False) -> None:
+                        deprecated: Optional[Union[bool, List[str]]] = None,
+                        dynamic: bool = False) -> None:
         """Add a flag option that we'd like to register with lightningd.
 
         Needs to be called before `Plugin.run`, otherwise we might not
@@ -418,55 +500,60 @@ class Plugin(object):
 
         """
         self.add_option(name, None, description, opt_type="flag",
-                        deprecated=deprecated)
+                        deprecated=deprecated, dynamic=dynamic)
 
-    def get_option(self, name: str) -> str:
+    def add_notification_topic(self, topic: str):
+        """Announce that the plugin will emit notifications for the topic.
+        """
+        self.notification_topics.append(topic)
+
+    def get_option(self, name: str) -> Optional[Any]:
         if name not in self.options:
             raise ValueError("No option with name {} registered".format(name))
 
-        if self.options[name]['value'] is not None:
-            return self.options[name]['value']
+        if self.options[name].value is not None:
+            return self.options[name].value
         else:
-            return self.options[name]['default']
+            return self.options[name].default
 
     def async_method(self, method_name: str, category: Optional[str] = None,
                      desc: Optional[str] = None,
                      long_desc: Optional[str] = None,
-                     deprecated: bool = False) -> NoneDecoratorType:
+                     deprecated: Optional[Union[bool, List[str]]] = None) -> NoneDecoratorType:
         """Decorator to add an async plugin method to the dispatch table.
 
         Internally uses add_method.
         """
         def decorator(f: Callable[..., None]) -> Callable[..., None]:
-            self.add_method(method_name, f, background=True, category=category,
-                            desc=desc, long_desc=long_desc,
-                            deprecated=deprecated)
+            for attr, attr_name in [(category, "Category"), (desc, "Description"), (long_desc, "Long description")]:
+                if attr is not None:
+                    self.log("{} is deprecated but defined in method {}; it will be ignored by Core Lightning".format(attr_name, method_name), level="warn")
+            self.add_method(method_name, f, background=True, deprecated=deprecated)
             return f
         return decorator
 
     def method(self, method_name: str, category: Optional[str] = None,
                desc: Optional[str] = None,
                long_desc: Optional[str] = None,
-               deprecated: bool = False) -> JsonDecoratorType:
+               deprecated: Union[bool, List[str]] = None,
+               description: str = None) -> JsonDecoratorType:
         """Decorator to add a plugin method to the dispatch table.
 
         Internally uses add_method.
         """
         def decorator(f: Callable[..., JSONType]) -> Callable[..., JSONType]:
-            self.add_method(method_name,
-                            f,
-                            background=False,
-                            category=category,
-                            desc=desc,
-                            long_desc=long_desc,
-                            deprecated=deprecated)
+            for attr, attr_name in [(category, "Category"), (desc, "Description"), (long_desc, "Long description")]:
+                if attr is not None:
+                    self.log("{} is deprecated but defined in method {}; it will be ignored by Core Lightning".format(attr_name, method_name), level="warn")
+            self.add_method(method_name, f, background=False, deprecated=deprecated, description=f.__doc__)
             return f
         return decorator
 
     def add_hook(self, name: str, func: Callable[..., JSONType],
                  background: bool = False,
                  before: Optional[List[str]] = None,
-                 after: Optional[List[str]] = None) -> None:
+                 after: Optional[List[str]] = None,
+                 filters: Optional[List[Union[str, int]]] = None) -> None:
         """Register a hook that is called synchronously by lightningd on events
         """
         if name in self.methods:
@@ -494,17 +581,19 @@ class Plugin(object):
         method.after = []
         if after:
             method.after = after
+        method.filters = filters
         self.methods[name] = method
 
     def hook(self, method_name: str,
              before: List[str] = None,
-             after: List[str] = None) -> JsonDecoratorType:
+             after: List[str] = None,
+             filters: List[Union[str, int]] = None) -> JsonDecoratorType:
         """Decorator to add a plugin hook to the dispatch table.
 
         Internally uses add_hook.
         """
         def decorator(f: Callable[..., JSONType]) -> Callable[..., JSONType]:
-            self.add_hook(method_name, f, background=False, before=before, after=after)
+            self.add_hook(method_name, f, background=False, before=before, after=after, filters=filters)
             return f
         return decorator
 
@@ -552,7 +641,7 @@ class Plugin(object):
                   request: Request) -> inspect.BoundArguments:
         """Positional binding of parameters
         """
-        assert(isinstance(params, list))
+        assert isinstance(params, list)
         sig = inspect.signature(func)
 
         # Collect injections so we can sort them and insert them in the right
@@ -578,7 +667,7 @@ class Plugin(object):
                      request: Request) -> inspect.BoundArguments:
         """Keyword based binding of parameters
         """
-        assert(isinstance(params, dict))
+        assert isinstance(params, dict)
         sig = inspect.signature(func)
 
         # Inject additional parameters if they are in the signature.
@@ -597,17 +686,25 @@ class Plugin(object):
 
     def _exec_func(self, func: Callable[..., Any],
                    request: Request) -> JSONType:
+        # By default, any RPC calls this makes will have JSON id prefixed by incoming id.
+        if self.rpc:
+            self.rpc.cmdprefix = request.id
         params = request.params
         if isinstance(params, list):
             ba = self._bind_pos(func, params, request)
-            return func(*ba.args, **ba.kwargs)
+            ret = func(*ba.args, **ba.kwargs)
         elif isinstance(params, dict):
             ba = self._bind_kwargs(func, params, request)
-            return func(*ba.args, **ba.kwargs)
+            ret = func(*ba.args, **ba.kwargs)
         else:
+            if self.rpc:
+                self.rpc.cmdprefix = None
             raise TypeError(
                 "Parameters to function call must be either a dict or a list."
             )
+        if self.rpc:
+            self.rpc.cmdprefix = None
+        return ret
 
     def _dispatch_request(self, request: Request) -> None:
         name = request.method
@@ -620,13 +717,13 @@ class Plugin(object):
         try:
             result = self._exec_func(method.func, request)
             if not method.background:
-                # Only if this is not an async (background) call do we need to
-                # return the result, otherwise the callee will eventually need
+                # Only if this is a synchronous (background=False) call do we need to
+                # return the result. Otherwise the callee (method) will eventually need
                 # to call request.set_result or request.set_exception to
                 # return a result or raise an exception.
                 request.set_result(result)
         except Exception as e:
-            if name in hook_fallbacks:
+            if method.mtype == MethodType.HOOK and name in hook_fallbacks:
                 response = hook_fallbacks[name]
                 self.log((
                     "Hook handler for {name} failed with an exception. "
@@ -641,10 +738,26 @@ class Plugin(object):
             self.log(traceback.format_exc())
 
     def _dispatch_notification(self, request: Request) -> None:
-        if request.method not in self.subscriptions:
-            raise ValueError("No subscription for {name} found.".format(
-                name=request.method))
-        func = self.subscriptions[request.method]
+        if request.method in self.subscriptions:
+            func = self.subscriptions[request.method]
+        # Wildcard 'all' subscriptions using asterisk
+        elif '*' in self.subscriptions:
+            func = self.subscriptions['*']
+        else:
+            raise ValueError(f"No subscription for {request.method} found.")
+
+        # Old style:
+        # params: {payload: {...}, origin: "pluginname"}
+        # New style:
+        # origin: "pluginname", params: {method: {...}}
+
+        # Old style?
+        if 'payload' in request.params and request.method not in request.params:
+            request.params[request.method] = request.params['payload']
+
+        # Always hoist origin into params:
+        if request.origin and 'origin' not in request.params:
+            request.params['origin'] = request.origin
 
         try:
             self._exec_func(func, request)
@@ -656,7 +769,6 @@ class Plugin(object):
         # then utf8 ourselves.
         s = bytes(json.dumps(
             obj,
-            cls=LightningRpc.LightningJSONEncoder,
             ensure_ascii=False
         ) + "\n\n", encoding='utf-8')
         with self.write_lock:
@@ -664,6 +776,12 @@ class Plugin(object):
             self.stdout.flush()
 
     def notify(self, method: str, params: JSONType) -> None:
+        # Adapt old-style: wrap in method.
+        if method not in params:
+            new_params = copy.copy(params)
+            new_params[method] = params
+            params = new_params
+
         payload = {
             'jsonrpc': '2.0',
             'method': method,
@@ -680,7 +798,7 @@ class Plugin(object):
     def notify_message(self, request: Request, message: str,
                        level: str = 'info') -> None:
         """Send a notification message to sender of this request"""
-        request.notify(message=message)
+        request.notify(message=message, level=level)
 
     def notify_progress(self, request: Request,
                         progress: int, progress_total: int,
@@ -690,15 +808,12 @@ class Plugin(object):
         request.progress(progress, progress_total, stage, stage_total)
 
     def _parse_request(self, jsrequest: Dict[str, JSONType]) -> Request:
-        i = jsrequest.get('id', None)
-        if not isinstance(i, int) and i is not None:
-            raise ValueError('Non-integer request id "{i}"'.format(i=i))
-
         request = Request(
             plugin=self,
-            req_id=i,
+            req_id=jsrequest.get('id', None),
             method=str(jsrequest['method']),
             params=jsrequest['params'],
+            origin=jsrequest.get('origin'),
             background=False,
         )
         return request
@@ -724,7 +839,7 @@ class Plugin(object):
 
         return msgs[-1]
 
-    def print_usage(self):
+    def get_usage(self):
         import textwrap
 
         executable = os.path.abspath(sys.argv[0])
@@ -737,6 +852,11 @@ class Plugin(object):
         look:
 
           $ lightningd --plugin={executable}
+
+        If lightningd is already running, you can also start a plugin
+        by using the cli:
+
+          $ lightning-cli plugin start /path/to/a/plugin
 
         Since we're here however let me tell you about this plugin.
         """).format(executable=executable)
@@ -756,11 +876,10 @@ class Plugin(object):
 
         method_tpl = textwrap.dedent("""
           {name}
-        {doc}
         """)
 
         for method in self.methods.values():
-            if method.name in ['init', 'getmanifest']:
+            if method.name in ['init', 'getmanifest', 'setconfig']:
                 # Skip internal methods provided by all plugins
                 continue
 
@@ -774,10 +893,8 @@ class Plugin(object):
                 parts.append(methods_header)
                 methods_header = None
 
-            doc = method.long_desc if method.long_desc is not None else "No documentation found"
             parts.append(method_tpl.format(
-                name=method.name,
-                doc=textwrap.indent(doc, prefix="    ")
+                name="%s %s" % (method.name, method.get_usage()),
             ))
 
         options_header = textwrap.dedent("""
@@ -798,19 +915,24 @@ class Plugin(object):
                 parts.append(options_header)
                 options_header = None
 
-            doc = textwrap.indent(opt['description'], prefix="    ")
+            if opt.description:
+                doc = textwrap.indent(opt.description, prefix="    ")
+            else:
+                doc = ""
 
-            if opt['multi']:
+            if opt.multi:
                 doc += "\n\n    This option can be specified multiple times"
 
             parts.append(option_tpl.format(
-                name=opt['name'],
+                name=opt.name,
                 doc=doc,
-                default=opt['default'],
-                typ=opt['type'],
+                default=opt.default,
+                typ=opt.opt_type,
             ))
+        return "".join(parts)
 
-        sys.stdout.write("".join(parts))
+    def print_usage(self):
+        sys.stdout.write(self.get_usage())
         sys.stdout.write("\n")
 
     def run(self) -> None:
@@ -840,70 +962,49 @@ class Plugin(object):
         hooks = []
         for method in self.methods.values():
             # Skip the builtin ones, they don't get reported
-            if method.name in ['getmanifest', 'init']:
+            if method.name in ['getmanifest', 'init', 'setconfig']:
                 continue
 
             if method.mtype == MethodType.HOOK:
-                hooks.append({'name': method.name,
-                              'before': method.before,
-                              'after': method.after})
+                hook = {'name': method.name,
+                        'before': method.before,
+                        'after': method.after}
+                if method.filters:
+                    hook['filters'] = method.filters
+                hooks.append(hook)
                 continue
 
-            doc = inspect.getdoc(method.func)
-            if not doc:
-                self.log(
-                    'RPC method \'{}\' does not have a docstring.'.format(
-                        method.name
-                    )
-                )
-                doc = "Undocumented RPC method from a plugin."
-            doc = re.sub('\n+', ' ', doc)
-
-            # Handles out-of-order use of parameters like:
-            #
-            # ```python3
-            #
-            # def hello_obfus(arg1, arg2, plugin, thing3, request=None,
-            #                 thing5='at', thing6=21)
-            #
-            # ```
-            argspec = inspect.getfullargspec(method.func)
-            defaults = argspec.defaults
-            num_defaults = len(defaults) if defaults else 0
-            start_kwargs_idx = len(argspec.args) - num_defaults
-            args = []
-            for idx, arg in enumerate(argspec.args):
-                if arg in ('plugin', 'request'):
-                    continue
-                # Positional arg
-                if idx < start_kwargs_idx:
-                    args.append("%s" % arg)
-                # Keyword arg
-                else:
-                    args.append("[%s]" % arg)
+            # For compatibility with lightningd prior to 24.08, we must
+            # provide a description.  Ignored by 24.08 onwards,
+            description = method.description
+            if description is None:
+                description = ""
 
             methods.append({
                 'name': method.name,
-                'category': method.category if method.category else "plugin",
-                'usage': " ".join(args),
-                'description': doc if not method.desc else method.desc
+                'usage': method.get_usage(),
+                'description': description,
             })
-            if method.long_desc:
-                m = methods[len(methods) - 1]
-                m["long_description"] = method.long_desc
 
         manifest = {
-            'options': list(self.options.values()),
+            'options': list(d.json() for d in self.options.values()),
             'rpcmethods': methods,
             'subscriptions': list(self.subscriptions.keys()),
             'hooks': hooks,
             'dynamic': self.dynamic,
+            'nonnumericids': True,
+            'notifications': [
+                {"method": name} for name in self.notification_topics
+            ],
         }
 
         # Compact the features a bit, not important.
         features = {k: v for k, v in self.featurebits.items() if v is not None}
         if features is not None:
             manifest['featurebits'] = features
+
+        if self.custom_msgs is not None:
+            manifest['custommessages'] = self.custom_msgs
 
         return manifest
 
@@ -914,15 +1015,15 @@ class Plugin(object):
         def verify_str(d: Dict[str, JSONType], key: str) -> str:
             v = d.get(key)
             if not isinstance(v, str):
-                raise ValueError("Wrong argument to init: expected {key} to be"
-                                 " a string, got {v}".format(key=key, v=v))
+                raise TypeError("Wrong argument to init: expected {key} to be"
+                                " a string, got {v}".format(key=key, v=v))
             return v
 
         def verify_bool(d: Dict[str, JSONType], key: str) -> bool:
             v = d.get(key)
             if not isinstance(v, bool):
-                raise ValueError("Wrong argument to init: expected {key} to be"
-                                 " a bool, got {v}".format(key=key, v=v))
+                raise TypeError("Wrong argument to init: expected {key} to be"
+                                " a bool, got {v}".format(key=key, v=v))
             return v
 
         self.rpc_filename = verify_str(configuration, 'rpc-file')
@@ -932,12 +1033,23 @@ class Plugin(object):
         self.rpc = LightningRpc(path)
         self.startup = verify_bool(configuration, 'startup')
         for name, value in options.items():
-            self.options[name]['value'] = value
+            self.options[name].value = value
 
         # Dispatch the plugin's init handler if any
         if self.child_init:
             return self._exec_func(self.child_init, request)
         return None
+
+    def _set_config(self, config: str, val: Optional[Any]) -> None:
+        """Called when the value of a dynamic option is changed
+        """
+        opt = self.options[config]
+        cb = opt.on_change
+        if cb is not None:
+            # This may throw an exception: caller will turn into error msg for user.
+            cb(self, config, val)
+
+        opt.value = val
 
 
 class PluginStream(object):

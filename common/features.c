@@ -1,8 +1,8 @@
-#include "features.h"
+#include "config.h"
 #include <assert.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
-#include <common/memleak.h>
+#include <common/features.h>
 #include <common/utils.h>
 #include <wire/peer_wire.h>
 
@@ -25,16 +25,17 @@ const char *feature_place_names[] = {
 	NULL,
 	"node",
 	"channel",
-	"invoice"
+	"invoice",
+	"bolt12_offer",
+	"bolt12_invreq",
+	"bolt12_invoice",
+	"channel_type",
 };
 
 static const struct feature_style feature_styles[] = {
 	{ OPT_DATA_LOSS_PROTECT,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT } },
-	{ OPT_INITIAL_ROUTING_SYNC,
-	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT_AS_OPTIONAL,
-			  [NODE_ANNOUNCE_FEATURE] = FEATURE_DONT_REPRESENT } },
 	{ OPT_UPFRONT_SHUTDOWN_SCRIPT,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT } },
@@ -60,7 +61,8 @@ static const struct feature_style feature_styles[] = {
 	{ OPT_BASIC_MPP,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [BOLT11_FEATURE] = FEATURE_REPRESENT } },
+			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT12_INVOICE_FEATURE] = FEATURE_REPRESENT } },
 	/* BOLT #9:
 	 * | 18/19 | `option_support_large_channel` |... IN ...
 	 */
@@ -71,27 +73,81 @@ static const struct feature_style feature_styles[] = {
 	{ OPT_ONION_MESSAGES,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
 	{ OPT_SHUTDOWN_WRONG_FUNDING,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
-	{ OPT_ANCHOR_OUTPUTS,
+	{ OPT_ANCHORS_ZERO_FEE_HTLC_TX,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_TYPE_FEATURE] = FEATURE_REPRESENT } },
 	{ OPT_DUAL_FUND,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
-#if EXPERIMENTAL_FEATURES
+	/* FIXME: Currently not explicitly signalled, but we do
+	 * support it for zeroconf */
+	{ OPT_SCID_ALIAS,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_TYPE_FEATURE] = FEATURE_REPRESENT} },
+
+	/* Zeroconf is always signalled in `init`, but we still
+	 * negotiate on a per-channel basis when calling `fundchannel`
+	 * with the `mindepth` parameter, and accept a channel with
+	 * the `open_channel` hook and its return value for
+	 * `mindepth`.
+	 */
+	{ OPT_ZEROCONF,
+	  .copy_style = {
+		          [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_TYPE_FEATURE] = FEATURE_REPRESENT} },
+	{ OPT_ROUTE_BLINDING,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
 	{ OPT_SHUTDOWN_ANYSEGWIT,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
-#endif
+	{ OPT_QUIESCE,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+	{ OPT_PAYMENT_METADATA,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_DONT_REPRESENT,
+			  /* Note: we don't actually set this in invoices, since
+			   * we don't need to use it, but if we don't set it here
+			   * we refuse to parse it. */
+			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+	{ OPT_CHANNEL_TYPE,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+	{ OPT_PROVIDE_STORAGE,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT } },
+	{ OPT_SIMPLE_CLOSE,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+	{ OPT_SPLICE,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
 };
 
 struct dependency {
@@ -103,27 +159,9 @@ static const struct dependency feature_deps[] = {
 	/* BOLT #9:
 	 * Name                | Description  | Context  | Dependencies  |
 	 *...
-	 * `gossip_queries_ex` | ...          | ...      | `gossip_queries` |
-	 *...
-	 * `payment_secret`    | ...          | ...      | `var_onion_optin` |
-	 *...
 	 * `basic_mpp`         | ...          | ...      | `payment_secret` |
 	 */
-	{ OPT_GOSSIP_QUERIES_EX, OPT_GOSSIP_QUERIES },
-	{ OPT_PAYMENT_SECRET, OPT_VAR_ONION },
 	{ OPT_BASIC_MPP, OPT_PAYMENT_SECRET },
-	/* BOLT #9:
-	 * Name                | Description  | Context  | Dependencies  |
-	 *...
-	 * `option_anchor_outputs` | ...      | ...      | `option_static_remotekey`
-	 */
-	{ OPT_ANCHOR_OUTPUTS, OPT_STATIC_REMOTEKEY },
-	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #9:
-	 * Name                | Description  | Context  | Dependencies  |
-	 * ...
-	 * `option_dual_fund`  | ...          | ...      | `option_anchor_outputs`
-	 */
-	{ OPT_DUAL_FUND, OPT_ANCHOR_OUTPUTS },
 };
 
 static void trim_features(u8 **features)
@@ -191,8 +229,7 @@ bool feature_set_or(struct feature_set *a,
 		for (size_t j = 0; j < tal_bytelen(b->bits[i])*8; j++) {
 			if (feature_is_set(b->bits[i], j)
 			    && feature_offered(a->bits[i], j)) {
-				if (taken(b))
-					tal_free(b);
+				tal_free_if_taken(b);
 				return false;
 			}
 		}
@@ -205,8 +242,7 @@ bool feature_set_or(struct feature_set *a,
 		}
 	}
 
-	if (taken(b))
-		tal_free(b);
+	tal_free_if_taken(b);
 	return true;
 }
 
@@ -218,8 +254,7 @@ bool feature_set_sub(struct feature_set *a,
 		for (size_t j = 0; j < tal_bytelen(b->bits[i])*8; j++) {
 			if (feature_is_set(b->bits[i], j)
 			    && !feature_offered(a->bits[i], j)) {
-				if (taken(b))
-					tal_free(b);
+				tal_free_if_taken(b);
 				return false;
 			}
 		}
@@ -234,8 +269,7 @@ bool feature_set_sub(struct feature_set *a,
 	}
 
 
-	if (taken(b))
-		tal_free(b);
+	tal_free_if_taken(b);
 	return true;
 }
 
@@ -368,16 +402,10 @@ int features_unsupported(const struct feature_set *our_features,
 			 const u8 *their_features,
 			 enum feature_place p)
 {
-	/* BIT 2 would logically be "compulsory initial_routing_sync", but
-	 * that does not exist, so we special case it. */
-	if (feature_is_set(their_features,
-			   COMPULSORY_FEATURE(OPT_INITIAL_ROUTING_SYNC)))
-		return COMPULSORY_FEATURE(OPT_INITIAL_ROUTING_SYNC);
-
 	return all_supported_features(our_features, their_features, p);
 }
 
-static const char *feature_name(const tal_t *ctx, size_t f)
+const char *feature_name(const tal_t *ctx, size_t f)
 {
 	static const char *fnames[] = {
 		"option_data_loss_protect", 	/* 0/1 */
@@ -391,27 +419,27 @@ static const char *feature_name(const tal_t *ctx, size_t f)
 		"option_basic_mpp",
 		"option_support_large_channel",
 		"option_anchor_outputs", 	/* 20/21 */
-		"option_anchors_zero_fee_htlc_tx",
-		NULL,
+		"option_anchors",
+		"option_route_blinding", /* https://github.com/lightning/bolts/pull/765 */
 		"option_shutdown_anysegwit",
 		"option_dual_fund",
-		NULL, /* 30/31 */
+		"option_amp", /* 30/31 */ /* https://github.com/lightning/bolts/pull/658 */
 		NULL,
+		"option_quiesce", /* https://github.com/lightning/bolts/pull/869 */
 		NULL,
+		"option_onion_messages",  /* https://github.com/lightning/bolts/pull/759 */
 		NULL,
+		"option_provide_storage",
+		"option_channel_type",
+		"option_scid_alias", /* https://github.com/lightning/bolts/pull/910 */
+		"option_payment_metadata",
+		"option_zeroconf", /* 50/51, https://github.com/lightning/bolts/pull/910 */
 		NULL,
-		NULL, /* 40/41 */
+		"option_keysend",
+		"option_trampoline_routing", /* https://github.com/lightning/bolts/pull/836 */
 		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL, /* 50/51 */
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL, /* 60/61 */
-		NULL,
+		"option_simple_close", /* 60/61 */
+		"option_splice",
 		NULL,
 		NULL,
 		NULL,
@@ -431,7 +459,41 @@ static const char *feature_name(const tal_t *ctx, size_t f)
 		NULL,
 		NULL,
 		NULL, /* 100/101 */
-		"option_onion_messages", /* 102/103 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 110/111 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 120/121 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 130/131 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 140/141 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 150/151 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 160/161 */
+		"option_experimental_splice", /* https://github.com/lightning/bolts/pull/863 */
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 170/171 */
 	};
 
 	if (f / 2 >= ARRAY_SIZE(fnames) || !fnames[f / 2])
@@ -472,10 +534,34 @@ u8 *featurebits_or(const tal_t *ctx, const u8 *f1 TAKES, const u8 *f2 TAKES)
 		result[l1 - l2 + i] |= f2[i];
 
 	/* Cleanup the featurebits if we were told to do so. */
-	if (taken(f2))
-		tal_free(f2);
+	tal_free_if_taken(f2);
 
 	return result;
+}
+
+void featurebits_unset(u8 **ptr, size_t bit)
+{
+	size_t len = tal_count(*ptr);
+	if (bit / 8 >= len)
+		return;
+
+	(*ptr)[len - 1 - bit / 8] &= (0 << (bit % 8));
+
+	trim_features(ptr);
+}
+
+bool featurebits_eq(const u8 *f1, const u8 *f2)
+{
+	size_t len = tal_bytelen(f1);
+
+	if (tal_bytelen(f2) > len)
+		len = tal_bytelen(f2);
+
+	for (size_t i = 0; i < len * 8; i++) {
+		if (feature_is_set(f1, i) != feature_is_set(f2, i))
+			return false;
+	}
+	return true;
 }
 
 struct feature_set *fromwire_feature_set(const tal_t *ctx,
@@ -498,4 +584,30 @@ void towire_feature_set(u8 **pptr, const struct feature_set *fset)
 		towire_u16(pptr, tal_bytelen(fset->bits[i]));
 		towire_u8_array(pptr, fset->bits[i], tal_bytelen(fset->bits[i]));
 	}
+}
+
+const char *fmt_featurebits(const tal_t *ctx, const u8 *featurebits)
+{
+	size_t size = tal_count(featurebits);
+	char *fmt = tal_strdup(ctx, "");
+	const char *prefix = "";
+
+	for (size_t i = 0; i < size * 8; i++) {
+		if (feature_is_set(featurebits, i)) {
+			tal_append_fmt(&fmt, "%s%zu", prefix, i);
+			prefix = ",";
+		}
+	}
+	return fmt;
+}
+
+struct feature_set *feature_set_dup(const tal_t *ctx,
+				    const struct feature_set *other)
+{
+	struct feature_set *res = tal(ctx, struct feature_set);
+
+	for (size_t i = 0; i < ARRAY_SIZE(res->bits); i++)
+		res->bits[i] = tal_dup_talarr(res, u8, other->bits[i]);
+
+	return res;
 }

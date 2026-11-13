@@ -1,25 +1,16 @@
-#include <bitcoin/chainparams.h>
-#include <bitcoin/feerate.h>
+#include "config.h"
 #include <bitcoin/psbt.h>
-#include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
-#include <ccan/cast/cast.h>
-#include <ccan/json_out/json_out.h>
-#include <ccan/list/list.h>
-#include <ccan/tal/str/str.h>
-#include <common/addr.h>
-#include <common/amount.h>
-#include <common/features.h>
+#include <common/json_param.h>
 #include <common/json_stream.h>
-#include <common/json_tok.h>
-#include <common/pseudorand.h>
-#include <common/type_to_string.h>
-#include <common/utils.h>
+#include <common/memleak.h>
+#include <common/psbt_open.h>
 #include <plugins/libplugin.h>
 
 struct tx_output {
 	struct amount_sat amount;
 	const u8 *script;
+	bool is_to_external;
 };
 
 struct txprepare {
@@ -35,11 +26,11 @@ struct txprepare {
 	struct wally_psbt *psbt;
 	u32 feerate;
 
-	/* Once we have reserved all the inputs, this is set. */
-	struct amount_sat change_amount;
-
 	/* For withdraw, we actually send immediately. */
 	bool is_withdraw;
+
+	/* Keep track if upgrade, so we can report on finish */
+	bool is_upgrade;
 };
 
 struct unreleased_tx {
@@ -47,6 +38,7 @@ struct unreleased_tx {
 	struct bitcoin_txid txid;
 	struct wally_tx *tx;
 	struct wally_psbt *psbt;
+	bool is_upgrade;
 };
 
 static LIST_HEAD(unreleased_txs);
@@ -56,6 +48,45 @@ static struct wally_psbt *json_tok_psbt(const tal_t *ctx,
 					const jsmntok_t *tok)
 {
 	return psbt_from_b64(ctx, buffer + tok->start, tok->end - tok->start);
+}
+
+struct txprepare_cleanup {
+	char *error_json;
+};
+
+static struct command_result *
+txprepare_cleanup_done(struct command *cmd,
+		       const char *method UNUSED,
+		       const char *buf UNUSED,
+		       const jsmntok_t *result UNUSED,
+		       struct txprepare_cleanup *cleanup)
+{
+	return command_err_raw(cmd, cleanup->error_json);
+}
+
+/* Immediate send flows must drop the original PSBT input reservation. */
+static struct command_result *
+txprepare_forward_error(struct command *cmd,
+			const char *method,
+			const char *buf,
+			const jsmntok_t *error,
+			struct unreleased_tx *utx)
+{
+	struct out_req *req;
+	struct txprepare_cleanup *cleanup;
+
+	if (!utx->psbt)
+		return forward_error(cmd, method, buf, error, NULL);
+
+	cleanup = tal(cmd, struct txprepare_cleanup);
+	cleanup->error_json = json_strdup(cleanup, buf, error);
+
+	req = jsonrpc_request_start(cmd, "unreserveinputs",
+				    txprepare_cleanup_done,
+				    txprepare_cleanup_done,
+				    cleanup);
+	json_add_psbt(req->js, "psbt", utx->psbt);
+	return send_outreq(req);
 }
 
 static struct command_result *param_outputs(struct command *cmd,
@@ -85,6 +116,9 @@ static struct command_result *param_outputs(struct command *cmd,
 	json_for_each_arr(i, t, tok) {
 		enum address_parse_result res;
 		struct tx_output *out = &txp->outputs[i];
+
+		/* We assume these are accounted for elsewhere */
+		out->is_to_external = false;
 
 		/* output format: {destination: amount} */
 		if (t->type != JSMN_OBJECT)
@@ -129,6 +163,7 @@ static struct command_result *param_outputs(struct command *cmd,
 
 /* Called after lightningd has broadcast the transaction. */
 static struct command_result *sendpsbt_done(struct command *cmd,
+					    const char *method,
 					    const char *buf,
 					    const jsmntok_t *result,
 					    struct unreleased_tx *utx)
@@ -139,11 +174,14 @@ static struct command_result *sendpsbt_done(struct command *cmd,
 	json_add_hex_talarr(out, "tx", linearize_wtx(tmpctx, utx->tx));
 	json_add_txid(out, "txid", &utx->txid);
 	json_add_psbt(out, "psbt", utx->psbt);
+	if (utx->is_upgrade)
+		json_add_num(out, "upgraded_outs", utx->tx->num_inputs);
 	return command_finished(cmd, out);
 }
 
 /* Called after lightningd has signed the inputs. */
 static struct command_result *signpsbt_done(struct command *cmd,
+					    const char *method,
 					    const char *buf,
 					    const jsmntok_t *result,
 					    struct unreleased_tx *utx)
@@ -157,29 +195,40 @@ static struct command_result *signpsbt_done(struct command *cmd,
 	/* Replace with signed tx. */
 	tal_free(utx->tx);
 
-	/* The txid from the final should match our expectation. */
-	psbt_txid(utx, utx->psbt, &txid, &utx->tx);
+	/* The txid from the signed PSBT should match our expectation. */
+	psbt_txid(NULL, utx->psbt, &txid, NULL);
 	if (!bitcoin_txid_eq(&txid, &utx->txid)) {
 		return command_fail(cmd, LIGHTNINGD,
 				    "Signed tx changed txid? Had '%s' now '%s'",
-				    tal_hex(tmpctx,
-					    linearize_wtx(tmpctx, utx->tx)),
-				    tal_hex(tmpctx,
-					    linearize_wtx(tmpctx,
-							  utx->psbt->tx)));
+				    fmt_bitcoin_txid(tmpctx, &utx->txid),
+				    fmt_bitcoin_txid(tmpctx, &txid));
 	}
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "sendpsbt",
-				    sendpsbt_done, forward_error,
+	/* Finalize the signed PSBT and extract the fully signed tx,
+	 * so that utx->tx contains witness data for the response. */
+	if (!psbt_finalize(utx->psbt))
+		return command_fail(cmd, LIGHTNINGD,
+				    "Signed PSBT not finalizeable: %s",
+				    fmt_wally_psbt(tmpctx, utx->psbt));
+
+	utx->tx = psbt_final_tx(utx, utx->psbt);
+	if (!utx->tx)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Could not extract final tx: %s",
+				    fmt_wally_psbt(tmpctx, utx->psbt));
+
+	req = jsonrpc_request_start(cmd, "sendpsbt",
+				    sendpsbt_done,
+				    txprepare_forward_error,
 				    utx);
 	json_add_psbt(req->js, "psbt", utx->psbt);
-	return send_outreq(cmd->plugin, req);
+	return send_outreq(req);
 }
 
 static struct command_result *finish_txprepare(struct command *cmd,
 					       struct txprepare *txp)
 {
-	struct json_stream *out;
+	struct json_stream *js;
 	struct unreleased_tx *utx;
 
 	/* Add the outputs they gave us */
@@ -193,10 +242,14 @@ static struct command_result *finish_txprepare(struct command *cmd,
 					    "Invalid output %zi (%s:%s)", i,
 					    tal_hex(tmpctx,
 						    txp->outputs[i].script),
-					    type_to_string(tmpctx,
-							   struct amount_sat,
-							   &txp->outputs[i].amount));
+					    fmt_amount_sat(tmpctx,
+							   txp->outputs[i].amount));
 		psbt_add_output(txp->psbt, out, i);
+
+		if (txp->outputs[i].is_to_external)
+			psbt_output_mark_as_external(txp->psbt,
+						     &txp->psbt->outputs[i]);
+
 		wally_tx_output_free(out);
 	}
 
@@ -205,78 +258,43 @@ static struct command_result *finish_txprepare(struct command *cmd,
 	psbt_elements_normalize_fees(txp->psbt);
 
 	utx = tal(NULL, struct unreleased_tx);
+	utx->is_upgrade = txp->is_upgrade;
 	utx->psbt = tal_steal(utx, txp->psbt);
-	psbt_txid(utx, txp->psbt, &utx->txid, &utx->tx);
+	psbt_txid(utx, utx->psbt, &utx->txid, &utx->tx);
 
 	/* If this is a withdraw, we sign and send immediately. */
 	if (txp->is_withdraw) {
 		struct out_req *req;
 
-		req = jsonrpc_request_start(cmd->plugin, cmd, "signpsbt",
-					    signpsbt_done, forward_error,
+		/* Won't live beyond this cmd. */
+		tal_steal(cmd, utx);
+		req = jsonrpc_request_start(cmd, "signpsbt",
+					    signpsbt_done,
+					    txprepare_forward_error,
 					    utx);
 		json_add_psbt(req->js, "psbt", utx->psbt);
-		return send_outreq(cmd->plugin, req);
+		return send_outreq(req);
 	}
 
 	list_add(&unreleased_txs, &utx->list);
-	out = jsonrpc_stream_success(cmd);
-	json_add_hex_talarr(out, "unsigned_tx", linearize_wtx(tmpctx, utx->tx));
-	json_add_txid(out, "txid", &utx->txid);
-	json_add_psbt(out, "psbt", utx->psbt);
-	return command_finished(cmd, out);
-}
-
-/* newaddr has given us a change address. */
-static struct command_result *newaddr_done(struct command *cmd,
-					   const char *buf,
-					   const jsmntok_t *result,
-					   struct txprepare *txp)
-{
-	size_t num = tal_count(txp->outputs), pos;
-	const jsmntok_t *addr = json_get_member(buf, result, "bech32");
-
-	/* Insert change in random position in outputs */
-	tal_resize(&txp->outputs, num+1);
-	pos = pseudorand(num+1);
-	memmove(txp->outputs + pos + 1,
-		txp->outputs + pos,
-		sizeof(txp->outputs[0]) * (num - pos));
-
-	txp->outputs[pos].amount = txp->change_amount;
-	if (json_to_address_scriptpubkey(txp, chainparams, buf, addr,
-					 &txp->outputs[pos].script)
-	    != ADDRESS_PARSE_SUCCESS) {
-		return command_fail(cmd, LIGHTNINGD,
-				    "Change address '%.*s' unparsable?",
-				    addr->end - addr->start,
-				    buf + addr->start);
-	}
-
-	return finish_txprepare(cmd, txp);
-}
-
-static bool resolve_all_output_amount(struct txprepare *txp,
-				      struct amount_sat excess)
-{
-	if (!amount_sat_greater_eq(excess, chainparams->dust_limit))
-		return false;
-
-	assert(amount_sat_eq(txp->outputs[txp->all_output_idx].amount,
-			     AMOUNT_SAT(-1ULL)));
-	txp->outputs[txp->all_output_idx].amount = excess;
-	return true;
+	js = jsonrpc_stream_success(cmd);
+	json_add_hex_talarr(js, "unsigned_tx", linearize_wtx(tmpctx, utx->tx));
+	json_add_txid(js, "txid", &utx->txid);
+	json_add_psbt(js, "psbt", utx->psbt);
+	return command_finished(cmd, js);
 }
 
 /* fundpsbt/utxopsbt gets a viable PSBT for us. */
 static struct command_result *psbt_created(struct command *cmd,
+					   const char *method,
 					   const char *buf,
 					   const jsmntok_t *result,
 					   struct txprepare *txp)
 {
 	const jsmntok_t *psbttok;
-	struct out_req *req;
+	struct amount_msat excess_msat;
 	struct amount_sat excess;
+	u32 weight;
 
 	psbttok = json_get_member(buf, result, "psbt");
 	txp->psbt = json_tok_psbt(txp, buf, psbttok);
@@ -286,6 +304,11 @@ static struct command_result *psbt_created(struct command *cmd,
 				    psbttok->end - psbttok->start,
 				    buf + psbttok->start);
 
+	if (!psbt_set_version(txp->psbt, 2)) {
+		return command_fail(cmd, LIGHTNINGD,
+					"Unable to convert PSBT to version 2.");
+	}
+
 	if (!json_to_number(buf, json_get_member(buf, result, "feerate_per_kw"),
 			    &txp->feerate))
 		return command_fail(cmd, LIGHTNINGD,
@@ -293,39 +316,42 @@ static struct command_result *psbt_created(struct command *cmd,
 				    result->end - result->start,
 				    buf + result->start);
 
-	if (!json_to_sat(buf, json_get_member(buf, result, "excess_msat"),
-			 &excess))
+	if (!json_to_msat(buf, json_get_member(buf, result, "excess_msat"),
+			  &excess_msat)
+	    || !amount_msat_to_sat(&excess, excess_msat))
 		return command_fail(cmd, LIGHTNINGD,
 				    "Unparsable excess_msat: '%.*s'",
 				    result->end - result->start,
 				    buf + result->start);
 
-	/* If we have an "all" output, now we can derive its value: excess
-	 * in this case will be total value after inputs paid for themselves. */
-	if (txp->all_output_idx != -1) {
-		if (!resolve_all_output_amount(txp, excess))
-			return command_fail(cmd, FUND_CANNOT_AFFORD,
-					    "Insufficient funds to make"
-					    " 'all' output");
+	if (!json_to_number(buf, json_get_member(buf, result,
+						 "estimated_final_weight"),
+			    &weight))
+		return command_fail(cmd, LIGHTNINGD,
+				    "Unparsable estimated_final_weight: '%.*s'",
+				    result->end - result->start,
+				    buf + result->start);
 
-		/* Never produce change if they asked for all */
-		excess = AMOUNT_SAT(0);
+	/* If we have an "all" output, we now know its value ("excess_msat") */
+	if (txp->all_output_idx != -1) {
+		/* Subtract any other outputs they specified! */
+		for (size_t i = 0; i < tal_count(txp->outputs); i++) {
+			if (i == txp->all_output_idx)
+				continue;
+			if (!amount_sat_sub(&excess, excess, txp->outputs[i].amount)) {
+				return command_fail(cmd, FUND_CANNOT_AFFORD,
+						    "Could not afford output %zu", i);
+			}
+		}
+		if (amount_sat_less(excess, chainparams->dust_limit)) {
+			return command_fail(cmd, FUND_CANNOT_AFFORD,
+					    "Could not afford 'all' output: only %s left",
+					    fmt_amount_sat(tmpctx, excess));
+		}
+		txp->outputs[txp->all_output_idx].amount = excess;
 	}
 
-	/* So, do we need change? */
-	txp->change_amount = change_amount(excess, txp->feerate);
-	if (amount_sat_eq(txp->change_amount, AMOUNT_SAT(0)))
-		return finish_txprepare(cmd, txp);
-
-	/* Ask for a change address */
-	req = jsonrpc_request_start(cmd->plugin, cmd,
-				    "newaddr",
-				    newaddr_done,
-				    /* It would be nice to unreserve inputs,
-				     * but probably won't happen. */
-				    forward_error,
-				    txp);
-	return send_outreq(cmd->plugin, req);
+	return finish_txprepare(cmd, txp);
 }
 
 /* Common point for txprepare and withdraw */
@@ -334,7 +360,8 @@ static struct command_result *txprepare_continue(struct command *cmd,
 						 const char *feerate,
 						 unsigned int *minconf,
 						 struct bitcoin_outpoint *utxos,
-						 bool is_withdraw)
+						 bool is_withdraw,
+						 bool reservedok)
 {
 	struct out_req *req;
 
@@ -347,7 +374,7 @@ static struct command_result *txprepare_continue(struct command *cmd,
 	/* These calls are deliberately very similar, but utxopsbt wants utxos,
 	 * and fundpsbt wants minconf */
 	if (utxos) {
-		req = jsonrpc_request_start(cmd->plugin, cmd, "utxopsbt",
+		req = jsonrpc_request_start(cmd, "utxopsbt",
 					    psbt_created, forward_error,
 					    txp);
 		json_array_start(req->js, "utxos");
@@ -355,22 +382,25 @@ static struct command_result *txprepare_continue(struct command *cmd,
 			json_add_outpoint(req->js, NULL, &utxos[i]);
 		}
 		json_array_end(req->js);
+		json_add_bool(req->js, "reservedok", reservedok);
 	} else {
-		req = jsonrpc_request_start(cmd->plugin, cmd, "fundpsbt",
+		req = jsonrpc_request_start(cmd, "fundpsbt",
 					    psbt_created, forward_error,
 					    txp);
-		json_add_u32(req->js, "minconf", *minconf);
+		if (minconf)
+			json_add_u32(req->js, "minconf", *minconf);
 	}
 
 	if (txp->all_output_idx == -1)
-		json_add_amount_sat_only(req->js, "satoshi", txp->output_total);
+		json_add_sats(req->js, "satoshi", txp->output_total);
 	else
 		json_add_string(req->js, "satoshi", "all");
 
 	json_add_u32(req->js, "startweight", txp->weight);
+	json_add_bool(req->js, "excess_as_change", true);
 
 	json_add_string(req->js, "feerate", feerate);
-	return send_outreq(cmd->plugin, req);
+	return send_outreq(req);
 }
 
 static struct command_result *json_txprepare(struct command *cmd,
@@ -390,11 +420,13 @@ static struct command_result *json_txprepare(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	return txprepare_continue(cmd, txp, feerate, minconf, utxos, false);
+	txp->is_upgrade = false;
+	return txprepare_continue(cmd, txp, feerate, minconf, utxos, false, false);
 }
 
 /* Called after we've unreserved the inputs. */
 static struct command_result *unreserve_done(struct command *cmd,
+					     const char *method,
 					     const char *buf,
 					     const jsmntok_t *result,
 					     struct unreleased_tx *utx)
@@ -428,7 +460,7 @@ static struct command_result *param_unreleased_txid(struct command *cmd,
 
 	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			    "not an unreleased txid '%s'",
-			    type_to_string(tmpctx, struct bitcoin_txid, txid));
+			    fmt_bitcoin_txid(tmpctx, txid));
 }
 
 static struct command_result *json_txdiscard(struct command *cmd,
@@ -448,11 +480,11 @@ static struct command_result *json_txdiscard(struct command *cmd,
 	/* Whatever happens, we free it once this command is done. */
 	tal_steal(cmd, utx);
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "unreserveinputs",
+	req = jsonrpc_request_start(cmd, "unreserveinputs",
 				    unreserve_done, forward_error,
 				    utx);
 	json_add_psbt(req->js, "psbt", utx->psbt);
-	return send_outreq(cmd->plugin, req);
+	return send_outreq(req);
 }
 
 static struct command_result *json_txsend(struct command *cmd,
@@ -472,11 +504,12 @@ static struct command_result *json_txsend(struct command *cmd,
 	/* If things go wrong, free it. */
 	tal_steal(cmd, utx);
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "signpsbt",
-				    signpsbt_done, forward_error,
+	req = jsonrpc_request_start(cmd, "signpsbt",
+				    signpsbt_done,
+				    txprepare_forward_error,
 				    utx);
 	json_add_psbt(req->js, "psbt", utx->psbt);
-	return send_outreq(cmd->plugin, req);
+	return send_outreq(req);
 }
 
 static struct command_result *json_withdraw(struct command *cmd,
@@ -512,46 +545,199 @@ static struct command_result *json_withdraw(struct command *cmd,
 	}
 	txp->outputs[0].amount = *amount;
 	txp->outputs[0].script = scriptpubkey;
+	txp->outputs[0].is_to_external = true;
 	txp->weight = bitcoin_tx_core_weight(1, tal_count(txp->outputs))
 		+ bitcoin_tx_output_weight(tal_bytelen(scriptpubkey));
 
-	return txprepare_continue(cmd, txp, feerate, minconf, utxos, true);
+	txp->is_upgrade = false;
+	return txprepare_continue(cmd, txp, feerate, minconf, utxos, true, false);
+}
+
+struct listfunds_info {
+	struct txprepare *txp;
+	const char *feerate;
+	bool reservedok;
+};
+
+/* Find all the utxos that are p2sh in our wallet */
+static struct command_result *listfunds_done(struct command *cmd,
+					     const char *method,
+					     const char *buf,
+					     const jsmntok_t *result,
+					     struct listfunds_info *info)
+{
+	struct bitcoin_outpoint *utxos;
+	const jsmntok_t *outputs_tok, *tok;
+	size_t i;
+	struct txprepare *txp = info->txp;
+
+	/* Find all the utxos in our wallet that are p2sh! */
+	outputs_tok = json_get_member(buf, result, "outputs");
+	txp->output_total = AMOUNT_SAT(0);
+	if (!outputs_tok)
+		plugin_err(cmd->plugin,
+			   "`listfunds` payload has no outputs token: %.*s",
+			   json_tok_full_len(result),
+			   json_tok_full(buf, result));
+
+	utxos = tal_arr(cmd, struct bitcoin_outpoint, 0);
+	json_for_each_arr(i, tok, outputs_tok) {
+		struct bitcoin_outpoint prev_out;
+		struct amount_sat val;
+		bool is_reserved;
+		char *status;
+		const char *err;
+
+		err = json_scan(tmpctx, buf, tok,
+				"{amount_msat:%"
+				",status:%"
+				",reserved:%"
+				",txid:%"
+				",output:%}",
+				JSON_SCAN(json_to_sat, &val),
+				JSON_SCAN_TAL(cmd, json_strdup, &status),
+				JSON_SCAN(json_to_bool, &is_reserved),
+				JSON_SCAN(json_to_txid, &prev_out.txid),
+				JSON_SCAN(json_to_number, &prev_out.n));
+		if (err)
+			plugin_err(cmd->plugin,
+				   "`listfunds` payload did not scan. %s: %.*s",
+				   err, json_tok_full_len(result),
+				   json_tok_full(buf, result));
+
+		/* Skip non-p2sh outputs */
+		if (!json_get_member(buf, tok, "redeemscript"))
+			continue;
+
+		/* only include confirmed + unconfirmed outputs */
+		if (!streq(status, "confirmed")
+		    && !streq(status, "unconfirmed"))
+			continue;
+
+		if (!info->reservedok && is_reserved)
+			continue;
+
+		tal_arr_expand(&utxos, prev_out);
+	}
+
+	/* Nothing found to upgrade, return a success */
+	if (tal_count(utxos) == 0) {
+		struct json_stream *out;
+		out = jsonrpc_stream_success(cmd);
+		json_add_num(out, "upgraded_outs", tal_count(utxos));
+		return command_finished(cmd, out);
+	}
+
+	return txprepare_continue(cmd, txp, info->feerate,
+				  NULL, utxos, true,
+				  info->reservedok);
+}
+
+/* We've got an address for sending funds */
+static struct command_result *newaddr_sweep_done(struct command *cmd,
+						 const char *method,
+						 const char *buf,
+						 const jsmntok_t *result,
+						 struct listfunds_info *info)
+{
+	struct out_req *req;
+	const jsmntok_t *addr = json_get_member(buf, result, chainparams->is_elements ? "bech32" : "p2tr");
+	assert(addr);
+
+	info->txp = tal(info, struct txprepare);
+	info->txp->is_upgrade = true;
+
+	/* Add output for 'all' to txp */
+	info->txp->outputs = tal_arr(info->txp, struct tx_output, 1);
+	info->txp->all_output_idx = 0;
+	info->txp->output_total = AMOUNT_SAT(0);
+	info->txp->outputs[0].amount = AMOUNT_SAT(-1ULL);
+	info->txp->outputs[0].is_to_external = false;
+
+	if (json_to_address_scriptpubkey(info->txp, chainparams, buf, addr,
+					 &info->txp->outputs[0].script)
+	    != ADDRESS_PARSE_SUCCESS) {
+		return command_fail(cmd, LIGHTNINGD,
+				    "Change address '%.*s' unparsable?",
+				    addr->end - addr->start,
+				    buf + addr->start);
+	}
+
+	info->txp->weight = bitcoin_tx_core_weight(0, 1)
+		+ bitcoin_tx_output_weight(tal_bytelen(info->txp->outputs[0].script));
+
+	/* Find all the utxos we want to spend on this tx */
+	req = jsonrpc_request_start(cmd,
+				    "listfunds",
+				    listfunds_done,
+				    forward_error,
+				    info);
+	return send_outreq(req);
+}
+
+static struct command_result *json_upgradewallet(struct command *cmd,
+						 const char *buffer,
+						 const jsmntok_t *params)
+{
+	bool *reservedok;
+	struct out_req *req;
+	struct listfunds_info *info = tal(cmd, struct listfunds_info);
+
+	if (!param(cmd, buffer, params,
+		   p_opt("feerate", param_string, &info->feerate),
+		   p_opt_def("reservedok", param_bool, &reservedok, false),
+		   NULL))
+		return command_param_failed();
+
+	info->reservedok = *reservedok;
+	/* Get an address to send everything to */
+	req = jsonrpc_request_start(cmd,
+				    "newaddr",
+				    newaddr_sweep_done,
+				    forward_error,
+				    info);
+	json_add_string(req->js, "addresstype", "all");
+	return send_outreq(req);
 }
 
 static const struct plugin_command commands[] = {
 	{
 		"txprepare",
-		"bitcoin",
-		"Create a transaction, with option to spend in future (either txsend and txdiscard)",
-		"Create an unsigned transaction paying {outputs} with optional {feerate}, {minconf} and {utxos}",
 		json_txprepare
 	},
 	{
 		"txdiscard",
-		"bitcoin",
-		"Discard a transaction created by txprepare",
-		"Discard a transcation by {txid}",
 		json_txdiscard
 	},
 	{
 		"txsend",
-		"bitcoin",
-		"Send a transaction created by txprepare",
-		"Send a transacation by {txid}",
 		json_txsend
 	},
 	{
 		"withdraw",
-		"bitcoin",
-		"Send funds to {destination} address",
-		"Send to {destination} {satoshi} (or 'all') at optional {feerate} using utxos from {minconf} or {utxos}.",
 		json_withdraw
 	},
+	{
+		"upgradewallet",
+		json_upgradewallet
+	},
 };
+
+static void mark_unreleased_txs(struct plugin *plugin, struct htable *memtable)
+{
+	memleak_scan_list_head(memtable, &unreleased_txs);
+}
+
+static const char *init(struct command *init_cmd,
+			const char *buf UNUSED, const jsmntok_t *config UNUSED)
+{
+	plugin_set_memleak_handler(init_cmd->plugin, mark_unreleased_txs);
+	return NULL;
+}
 
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, NULL, PLUGIN_RESTARTABLE, true, NULL, commands,
-		    ARRAY_SIZE(commands), NULL, 0, NULL, 0, NULL);
+	plugin_main(argv, init, NULL, PLUGIN_RESTARTABLE, true, NULL, commands,
+		    ARRAY_SIZE(commands), NULL, 0, NULL, 0, NULL, 0, NULL);
 }

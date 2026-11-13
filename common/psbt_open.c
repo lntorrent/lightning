@@ -1,13 +1,13 @@
-#include "common/psbt_open.h"
-#include <assert.h>
+#include "config.h"
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
-#include <bitcoin/tx.h>
 #include <ccan/asort/asort.h>
-#include <ccan/ccan/endian/endian.h>
-#include <ccan/ccan/mem/mem.h>
+#include <common/channel_id.h>
+#include <common/psbt_open.h>
 #include <common/pseudorand.h>
 #include <common/utils.h>
+
+#define MAX_CHANNEL_IDS 4096
 
 bool psbt_get_serial_id(const struct wally_map *map, u64 *serial_id)
 {
@@ -59,74 +59,83 @@ static int compare_outputs_at(const struct output_set *a,
 }
 
 static const u8 *linearize_input(const tal_t *ctx,
-				 const struct wally_psbt_input *in,
-				 const struct wally_tx_input *tx_in)
+				 const struct wally_psbt *parent,
+				 size_t index)
 {
+	struct wally_psbt *copy = clone_psbt(NULL, parent);
 	struct wally_psbt *psbt = create_psbt(NULL, 1, 0, 0);
+	struct wally_psbt_input dummy_in;
 	size_t byte_len;
 
-	tal_wally_start();
-	if (wally_tx_add_input(psbt->tx, tx_in) != WALLY_OK)
-		abort();
-	tal_wally_end(psbt->tx);
-
-	psbt->inputs[0] = *in;
-	psbt->num_inputs++;
-
+	dummy_in = psbt->inputs[0];
+	psbt->inputs[0] = copy->inputs[index];
+	psbt->num_inputs = 1;
 
 	/* Sort the inputs, so serializing them is ok */
 	wally_map_sort(&psbt->inputs[0].unknowns, 0);
 
 	/* signatures, keypaths, etc - we dont care if they change */
-	psbt->inputs[0].final_witness = NULL;
-	psbt->inputs[0].final_scriptsig_len = 0;
-	psbt->inputs[0].witness_script_len = 0;
-	psbt->inputs[0].redeem_script_len = 0;
+	wally_psbt_input_set_final_witness(&psbt->inputs[0], NULL);
+	wally_psbt_input_set_final_scriptsig(&psbt->inputs[0], NULL, 0);
+	wally_psbt_input_set_witness_script(&psbt->inputs[0], NULL, 0);
+	wally_psbt_input_set_redeem_script(&psbt->inputs[0], NULL, 0);
+	wally_psbt_input_set_taproot_signature(&psbt->inputs[0], NULL, 0);
+	wally_psbt_input_set_sighash(&psbt->inputs[0], 0);
+	psbt->inputs[0].taproot_leaf_hashes.num_items = 0;
+	psbt->inputs[0].taproot_leaf_paths.num_items = 0;
 	psbt->inputs[0].keypaths.num_items = 0;
 	psbt->inputs[0].signatures.num_items = 0;
-
+	psbt->inputs[0].utxo = NULL;
+	psbt->inputs[0].witness_utxo = NULL;
 
 	const u8 *bytes = psbt_get_bytes(ctx, psbt, &byte_len);
 
-	/* Hide the inputs we added, so it doesn't get freed */
-	psbt->num_inputs--;
+	psbt->inputs[0] = dummy_in;
+	psbt->num_inputs = 0;
+
 	tal_free(psbt);
+	tal_free(copy);
+
 	return bytes;
 }
 
 static const u8 *linearize_output(const tal_t *ctx,
-				  const struct wally_psbt_output *out,
-				  const struct wally_tx_output *tx_out)
+				  const struct wally_psbt *parent,
+				  size_t index)
 {
-	struct wally_psbt *psbt = create_psbt(NULL, 1, 1, 0);
+	struct wally_psbt *copy = clone_psbt(NULL, parent);
+	struct wally_psbt *psbt = create_psbt(NULL, 0, 1, 0);
+	struct wally_psbt_output dummy_out;
 	size_t byte_len;
-	struct bitcoin_txid txid;
+	struct bitcoin_outpoint outpoint;
 
-	/* Add a 'fake' input so this will linearize the tx */
-	memset(&txid, 0, sizeof(txid));
-	psbt_append_input(psbt, &txid, 0, 0, NULL, NULL, NULL);
+	/* Add a 'fake' non-zero input so libwally will agree to linearize the tx */
+	memset(&outpoint, 1, sizeof(outpoint));
+	psbt_append_input(psbt, &outpoint, 0, NULL, NULL, NULL);
 
-	tal_wally_start();
-	if (wally_tx_add_output(psbt->tx, tx_out) != WALLY_OK)
-		abort();
-	tal_wally_end(psbt->tx);
+	dummy_out = psbt->outputs[0];
+	psbt->outputs[0] = copy->outputs[index];
+	psbt->num_outputs = 1;
 
-	psbt->outputs[0] = *out;
-	psbt->num_outputs++;
 	/* Sort the outputs, so serializing them is ok */
 	wally_map_sort(&psbt->outputs[0].unknowns, 0);
 
 	/* We don't care if the keypaths change */
 	psbt->outputs[0].keypaths.num_items = 0;
+	psbt->outputs[0].taproot_leaf_hashes.num_items = 0;
+	psbt->outputs[0].taproot_leaf_paths.num_items = 0;
 	/* And you can add scripts, no problem */
-	psbt->outputs[0].witness_script_len = 0;
-	psbt->outputs[0].redeem_script_len = 0;
+	wally_psbt_output_set_witness_script(&psbt->outputs[0], NULL, 0);
+	wally_psbt_output_set_redeem_script(&psbt->outputs[0], NULL, 0);
 
 	const u8 *bytes = psbt_get_bytes(ctx, psbt, &byte_len);
 
-	/* Hide the outputs we added, so it doesn't get freed */
-	psbt->num_outputs--;
+	psbt->outputs[0] = dummy_out;
+	psbt->num_outputs = 0;
+
 	tal_free(psbt);
+	tal_free(copy);
+
 	return bytes;
 }
 
@@ -135,15 +144,10 @@ static bool input_identical(const struct wally_psbt *a,
 			    const struct wally_psbt *b,
 			    size_t b_index)
 {
-	const u8 *a_in = linearize_input(tmpctx,
-					 &a->inputs[a_index],
-					 &a->tx->inputs[a_index]);
-	const u8 *b_in = linearize_input(tmpctx,
-					 &b->inputs[b_index],
-					 &b->tx->inputs[b_index]);
+	const u8 *a_in = linearize_input(tmpctx, a, a_index);
+	const u8 *b_in = linearize_input(tmpctx, b, b_index);
 
-	return memeq(a_in, tal_bytelen(a_in),
-		     b_in, tal_bytelen(b_in));
+	return tal_arr_eq(a_in, b_in);
 }
 
 static bool output_identical(const struct wally_psbt *a,
@@ -151,14 +155,9 @@ static bool output_identical(const struct wally_psbt *a,
 			     const struct wally_psbt *b,
 			     size_t b_index)
 {
-	const u8 *a_out = linearize_output(tmpctx,
-					   &a->outputs[a_index],
-					   &a->tx->outputs[a_index]);
-	const u8 *b_out = linearize_output(tmpctx,
-					   &b->outputs[b_index],
-					   &b->tx->outputs[b_index]);
-	return memeq(a_out, tal_bytelen(a_out),
-		     b_out, tal_bytelen(b_out));
+	const u8 *a_out = linearize_output(tmpctx, a, a_index);
+	const u8 *b_out = linearize_output(tmpctx, b, b_index);
+	return tal_arr_eq(a_out, b_out);
 }
 
 static void sort_inputs(struct wally_psbt *psbt)
@@ -169,7 +168,6 @@ static void sort_inputs(struct wally_psbt *psbt)
 					psbt->num_inputs);
 
 	for (size_t i = 0; i < tal_count(set); i++) {
-		set[i].tx_input = psbt->tx->inputs[i];
 		set[i].input = psbt->inputs[i];
 	}
 
@@ -179,7 +177,6 @@ static void sort_inputs(struct wally_psbt *psbt)
 	/* Put PSBT parts into place */
 	for (size_t i = 0; i < tal_count(set); i++) {
 		psbt->inputs[i] = set[i].input;
-		psbt->tx->inputs[i] = set[i].tx_input;
 	}
 
 	tal_free(set);
@@ -192,7 +189,6 @@ static void sort_outputs(struct wally_psbt *psbt)
 					 struct output_set,
 					 psbt->num_outputs);
 	for (size_t i = 0; i < tal_count(set); i++) {
-		set[i].tx_output = psbt->tx->outputs[i];
 		set[i].output = psbt->outputs[i];
 	}
 
@@ -202,7 +198,6 @@ static void sort_outputs(struct wally_psbt *psbt)
 	/* Put PSBT parts into place */
 	for (size_t i = 0; i < tal_count(set); i++) {
 		psbt->outputs[i] = set[i].output;
-		psbt->tx->outputs[i] = set[i].tx_output;
 	}
 
 	tal_free(set);
@@ -214,11 +209,60 @@ void psbt_sort_by_serial_id(struct wally_psbt *psbt)
 	sort_outputs(psbt);
 }
 
+bool psbt_get_channel_ids(const tal_t *ctx,
+			  const struct wally_psbt *psbt,
+			  struct channel_id **channel_ids)
+{
+	size_t value_len;
+	void *res = psbt_get_lightning(&psbt->unknowns, PSBT_TYPE_CHANNELIDS,
+				       &value_len);
+	if (!res)
+		return false;
+
+	/* Max channel id limit */
+	if (value_len > MAX_CHANNEL_IDS * 32)
+		return false;
+
+	/* Must be a multiple of 32 */
+	if (value_len % 32)
+		return false;
+
+	*channel_ids = tal_arr(ctx, struct channel_id, value_len / 32);
+	for (size_t i = 0; i < value_len / 32; i++)
+		memcpy((*channel_ids)[i].id, res + i * 32, 32);
+
+	return true;
+}
+
+void psbt_set_channel_ids(struct wally_psbt *psbt,
+			  struct channel_id *channel_ids)
+{
+	BUILD_ASSERT(sizeof(channel_ids[0].id) == 32);
+	int data_size = tal_count(channel_ids) * 32;
+	u8 *data = tal_arr(tmpctx, u8, data_size);
+
+	for (size_t i = 0; i < tal_count(channel_ids); i++)
+		memcpy(data + i * 32, channel_ids[i].id, 32);
+
+	psbt_set_lightning(psbt,
+			   &psbt->unknowns,
+			   PSBT_TYPE_CHANNELIDS,
+			   data,
+			   data_size);
+}
+
+/* psbt_set_channel_ids - Stores the channel_ids in the PSBT
+ *
+ * @psbt - the psbt to put the channel_ids into
+ * @channel_ids - the channel ids to put in
+ */
+void psbt_set_channel_ids(struct wally_psbt *psbt,
+			  struct channel_id *channel_ids);
+
 #define ADD(type, add_to, from, index)				\
 	do {							\
 		struct type##_set a;				\
 		a.type = from->type##s[index];			\
-		a.tx_##type = from->tx->type##s[index]; 	\
 		a.idx = index;					\
 		tal_arr_expand(&add_to, a);			\
 	} while (0)
@@ -399,6 +443,8 @@ bool psbt_has_required_fields(struct wally_psbt *psbt)
 {
 	u64 serial_id;
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		const struct wally_map_item *redeem_script;
+		const struct wally_tx_output *txout;
 		struct wally_psbt_input *input = &psbt->inputs[i];
 
 		if (!psbt_get_serial_id(&input->unknowns, &serial_id))
@@ -408,14 +454,15 @@ bool psbt_has_required_fields(struct wally_psbt *psbt)
 		if (!input->utxo)
 			return false;
 
-		/* If is P2SH, redeemscript must be present */
-		assert(psbt->tx->inputs[i].index < input->utxo->num_outputs);
-		const u8 *outscript =
-			wally_tx_output_get_script(tmpctx,
-				&input->utxo->outputs[psbt->tx->inputs[i].index]);
-		if (is_p2sh(outscript, NULL) && input->redeem_script_len == 0)
+		assert(input->index < input->utxo->num_outputs);
+		txout = &input->utxo->outputs[input->index];
+		if (!is_p2sh(txout->script, txout->script_len, NULL))
+			continue;
+		/* P2SH: redeemscript must be present */
+		const u32 key = 0x04; /* PSBT_IN_REDEEM_SCRIPT */
+		redeem_script = wally_map_get_integer(&input->psbt_fields, key);
+		if (!redeem_script || !redeem_script->value_len)
 			return false;
-
 	}
 
 	for (size_t i = 0; i < psbt->num_outputs; i++) {
@@ -480,4 +527,50 @@ bool psbt_input_is_ours(const struct wally_psbt_input *input)
 	void *result = psbt_get_lightning(&input->unknowns,
 					  PSBT_TYPE_INPUT_MARKER, &unused);
 	return !(!result);
+}
+
+bool psbt_has_our_input(const struct wally_psbt *psbt)
+{
+	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		if (psbt_input_is_ours(&psbt->inputs[i]))
+			return true;
+	}
+
+	return false;
+}
+
+void psbt_output_mark_as_external(const tal_t *ctx,
+				  struct wally_psbt_output *output)
+{
+	u8 *key = psbt_make_key(tmpctx, PSBT_TYPE_OUTPUT_EXTERNAL, NULL);
+	beint16_t bev = cpu_to_be16(1);
+
+	psbt_output_set_unknown(ctx, output, key, &bev, sizeof(bev));
+}
+
+bool psbt_output_to_external(const struct wally_psbt_output *output)
+{
+	size_t unused;
+	void *result = psbt_get_lightning(&output->unknowns,
+					  PSBT_TYPE_OUTPUT_EXTERNAL, &unused);
+	return !(!result);
+}
+
+/* FIXME: both PSBT should be const */
+bool psbt_contribs_changed(struct wally_psbt *orig,
+			   struct wally_psbt *new)
+{
+	struct psbt_changeset *cs;
+	bool ok;
+
+	assert(orig->version == 2 && new->version == 2);
+
+	cs = psbt_get_changeset(NULL, orig, new);
+
+	ok = tal_count(cs->added_ins) > 0 ||
+	    tal_count(cs->rm_ins) > 0 ||
+	    tal_count(cs->added_outs) > 0 ||
+	    tal_count(cs->rm_outs) > 0;
+	tal_free(cs);
+	return ok;
 }

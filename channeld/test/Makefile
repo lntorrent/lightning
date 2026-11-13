@@ -7,9 +7,18 @@ CHANNELD_TEST_PROGRAMS := $(CHANNELD_TEST_OBJS:.o=)
 ALL_C_SOURCES += $(CHANNELD_TEST_SRC)
 ALL_TEST_PROGRAMS += $(CHANNELD_TEST_PROGRAMS)
 
-CHANNELD_TEST_COMMON_OBJS :=			\
+# run-full_channel.o needs a special version of some common files!
+$(filter-out channeld/test/run-full_channel,$(CHANNELD_TEST_PROGRAMS)): libcommon.a
+
+channeld/test/run-full_channel:			\
+	$(BITCOIN_OBJS)				\
+	wire/towire.o				\
+	wire/fromwire.o				\
 	common/amount.o				\
+	common/autodata.o			\
+	common/channel_type.o			\
 	common/daemon_conn.o			\
+	common/features.o			\
 	common/htlc_state.o			\
 	common/htlc_trim.o			\
 	common/htlc_tx.o			\
@@ -18,14 +27,10 @@ CHANNELD_TEST_COMMON_OBJS :=			\
 	common/msg_queue.o			\
 	common/permute_tx.o			\
 	common/pseudorand.o			\
+	common/randbytes.o			\
 	common/setup.o				\
-	common/type_to_string.o			\
 	common/utils.o
 
-update-mocks: $(CHANNELD_TEST_SRC:%=update-mocks/%)
-
-$(CHANNELD_TEST_PROGRAMS): $(CCAN_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(CHANNELD_TEST_COMMON_OBJS)
-
-$(CHANNELD_TEST_OBJS): $(CHANNELD_HEADERS) $(CHANNELD_SRC)
+$(CHANNELD_TEST_OBJS): $(CHANNELD_HEADERS) $(CHANNELD_SRC) channeld/test/Makefile
 
 check-units: $(CHANNELD_TEST_PROGRAMS:%=unittest/%)

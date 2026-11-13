@@ -37,7 +37,7 @@ def get_commit_range():
     """
     description = git("describe")
     version = description.split('-')[0]
-    return "{version}..master".format(version=version)
+    return "{version}..HEAD".format(version=version)
 
 
 def get_log_entries(commitrange):
@@ -66,6 +66,10 @@ def get_log_entries(commitrange):
         url = 'https://api.github.com/repos/{repo}/commits/{commit}/pulls'.format(repo=repo, commit=commit)
         content = requests.get(url, headers=headers).json()
         if len(content):
+            # Check for bad credentials
+            if 'message' in content:
+                print(content)
+                exit()
             pullreq = content[0]['number']
         else:
             pullreq = None
@@ -77,14 +81,14 @@ def get_log_entries(commitrange):
 
 
 def linkify(entries):
-    links = []
+    links = {}
     for e in entries:
-        links.append(Link(
+        links[e.pullreq] = (Link(
             ref='#{}'.format(e.pullreq),
             content=e.content,
             url="https://github.com/ElementsProject/lightning/pull/{}".format(e.pullreq)
         ))
-    return list(set(links))
+    return list(set(links.values()))
 
 
 def group(entries):

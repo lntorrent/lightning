@@ -1,23 +1,20 @@
 #include "config.h"
 #include <assert.h>
-#include <stdint.h>
-#include <string.h>
-#include <tests/fuzz/libfuzz.h>
 
-#include <bitcoin/pubkey.h>
 #include <bitcoin/chainparams.h>
+#include <bitcoin/pubkey.h>
 #include <bitcoin/script.h>
-#include <bitcoin/tx.h>
-#include <ccan/tal/tal.h>
-#include <common/amount.h>
 #include <common/close_tx.h>
 #include <common/setup.h>
 #include <common/utils.h>
+#include <tests/fuzz/libfuzz.h>
 #include <wire/wire.h>
 
 void init(int *argc, char ***argv)
 {
-	common_setup("fuzzer");
+	/* Don't call this if we're in unit-test mode, as libfuzz.c does it */
+	if (!tmpctx)
+		common_setup("fuzzer");
 	chainparams = chainparams_for_network("bitcoin");
 }
 
@@ -25,8 +22,7 @@ void run(const uint8_t *data, size_t size)
 {
 	const uint8_t *wire_ptr;
 	size_t wire_max, min_size, script_size;
-	struct bitcoin_txid txid;
-	uint32_t vout;
+	struct bitcoin_outpoint outpoint;
 	struct amount_sat funding, to_us, to_them, dust_limit, max;
 	const uint8_t *our_script, *their_script, *funding_script;
 	struct pubkey *pk1, *pk2;
@@ -60,17 +56,15 @@ void run(const uint8_t *data, size_t size)
 	if (!(amount_sat_add(&funding, to_us, to_them)))
 		return;
 	/* .. And < max_btc as we assert it's not nonsensical! */
-	max = AMOUNT_SAT((u32)WALLY_SATOSHI_PER_BTC * WALLY_BTC_MAX);
+	max = AMOUNT_SAT((u64)WALLY_SATOSHI_PER_BTC * WALLY_BTC_MAX);
 	if (amount_sat_greater(funding, max)) {
 		funding = max;
 		to_us = amount_sat_div(max, 2);
 		to_them = amount_sat_div(max, 2);
 	}
 
-	wire_max = 4;
-	vout = fromwire_u32(&wire_ptr, &wire_max);
-	wire_max = 32;
-	fromwire_bitcoin_txid(&wire_ptr, &wire_max, &txid);
+	wire_max = 36;
+	fromwire_bitcoin_outpoint(&wire_ptr, &wire_max, &outpoint);
 
 	our_script = tal_dup_arr(tmpctx, const uint8_t, wire_ptr, script_size, 0);
 	their_script = tal_dup_arr(tmpctx, const uint8_t, wire_ptr + script_size,
@@ -79,15 +73,15 @@ void run(const uint8_t *data, size_t size)
 	/* We assert it's valid, so we can't throw garbage at the funding script.. */
 	pk1 = tal(tmpctx, struct pubkey);
 	pk2 = tal(tmpctx, struct pubkey);
-	pubkey_from_hexstr("034fede2c619f647fe7c01d40ae22e4c285291ca2ffb47937bbfb7d6e8285a081f",
-			   PUBKEY_CMPR_LEN, pk1);
-	pubkey_from_hexstr("028dfe31019dd61fa04c76ad065410e5d063ac2949c04c14b214c1b363e517452f",
-			   PUBKEY_CMPR_LEN, pk2);
+	assert(pubkey_from_hexstr("034fede2c619f647fe7c01d40ae22e4c285291ca2ffb47937bbfb7d6e8285a081f",
+				  2 * PUBKEY_CMPR_LEN, pk1));
+	assert(pubkey_from_hexstr("028dfe31019dd61fa04c76ad065410e5d063ac2949c04c14b214c1b363e517452f",
+				  2 * PUBKEY_CMPR_LEN, pk2));
 	funding_script = bitcoin_redeem_2of2(tmpctx, pk1, pk2);
 
-	create_close_tx(tmpctx, chainparams, our_script,
-			their_script, funding_script, &txid,
-			vout, funding, to_us, to_them, dust_limit);
+	create_close_tx(tmpctx, chainparams, NULL, NULL, our_script,
+			their_script, funding_script, &outpoint,
+			funding, to_us, to_them, dust_limit);
 
 	clean_tmpctx();
 }

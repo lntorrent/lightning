@@ -1,6 +1,7 @@
 COMMON_SRC_NOGEN :=				\
 	common/addr.c				\
 	common/amount.c				\
+	common/autodata.c			\
 	common/base32.c				\
 	common/base64.c				\
 	common/bech32.c				\
@@ -8,23 +9,30 @@ COMMON_SRC_NOGEN :=				\
 	common/bigsize.c			\
 	common/billboard.c			\
 	common/bip32.c				\
-	common/blinding.c			\
 	common/blindedpath.c			\
+	common/blindedpay.c			\
+	common/blinding.c			\
+	common/blockheight_states.c		\
 	common/bolt11.c				\
 	common/bolt11_json.c			\
 	common/bolt12.c				\
+	common/bolt12_id.c			\
 	common/bolt12_merkle.c			\
+	common/bolt12_proof.c			\
 	common/channel_config.c			\
 	common/channel_id.c			\
-	common/coin_mvt.c			\
+	common/channel_type.c			\
+	common/clock_time.c			\
 	common/close_tx.c			\
+	common/codex32.c			\
+	common/coin_mvt.c			\
 	common/configdir.c			\
-	common/crypto_state.c			\
-	common/crypto_sync.c			\
+	common/configvar.c			\
 	common/cryptomsg.c			\
 	common/daemon.c				\
 	common/daemon_conn.c			\
 	common/decode_array.c			\
+	common/deprecation.c			\
 	common/derive_basepoints.c		\
 	common/descriptor_checksum.c		\
 	common/dev_disconnect.c			\
@@ -33,55 +41,70 @@ COMMON_SRC_NOGEN :=				\
 	common/features.c			\
 	common/fee_states.c			\
 	common/fp16.c				\
-	common/gossip_rcvd_filter.c		\
 	common/gossip_store.c			\
+	common/gossmap.c			\
+	common/gossmods_listpeerchannels.c	\
 	common/hash_u5.c			\
 	common/hmac.c				\
-	common/hsm_encryption.c			\
+	common/hsm_capable.c			\
+	common/hsm_secret.c			\
 	common/htlc_state.c			\
 	common/htlc_trim.c			\
 	common/htlc_tx.c			\
 	common/htlc_wire.c			\
+	common/interactivetx.c			\
 	common/initial_channel.c		\
 	common/initial_commit_tx.c		\
-	common/io_lock.c			\
 	common/iso4217.c			\
-	common/json.c				\
-	common/json_helpers.c			\
+	common/json_blinded_path.c		\
+	common/json_channel_type.c		\
+	common/json_command.c			\
+	common/json_filter.c			\
+	common/json_param.c			\
+	common/json_parse.c			\
+	common/json_parse_simple.c		\
 	common/json_stream.c			\
-	common/json_tok.c			\
+	common/jsonrpc_io.c			\
 	common/key_derive.c			\
 	common/keyset.c				\
-	common/gossmap.c			\
+	common/lease_rates.c			\
 	common/memleak.c			\
+	common/mkdatastorekey.c			\
 	common/msg_queue.c			\
 	common/node_id.c			\
-	common/onion.c				\
+	common/onion_decode.c			\
+	common/onion_encode.c			\
 	common/onionreply.c			\
-	common/param.c				\
-	common/penalty_base.c			\
-	common/per_peer_state.c			\
+	common/onion_message.c			\
+	common/onion_message_parse.c		\
 	common/peer_billboard.c			\
 	common/peer_failed.c			\
+	common/peer_io.c			\
+	common/penalty_base.c			\
+	common/per_peer_state.c			\
 	common/permute_tx.c			\
 	common/ping.c				\
+	common/plugin.c				\
 	common/psbt_internal.c			\
+	common/psbt_keypath.c			\
 	common/psbt_open.c			\
-	common/private_channel_announcement.c	\
 	common/pseudorand.c			\
+	common/randbytes.c			\
 	common/random_select.c			\
 	common/read_peer_msg.c			\
 	common/route.c				\
+	common/sciddir_or_pubkey.c		\
 	common/setup.c				\
 	common/shutdown_scriptpubkey.c		\
-	common/socket_close.c			\
 	common/sphinx.c				\
+	common/splice_script.c			\
 	common/status.c				\
 	common/status_levels.c			\
 	common/status_wire.c			\
 	common/subdaemon.c			\
 	common/timeout.c			\
-	common/type_to_string.c			\
+	common/trace.c				\
+	common/tx_roles.c			\
 	common/utils.c				\
 	common/utxo.c				\
 	common/version.c			\
@@ -90,31 +113,47 @@ COMMON_SRC_NOGEN :=				\
 	common/wire_error.c
 
 
-COMMON_SRC_GEN := common/status_wiregen.c common/peer_status_wiregen.c
+COMMON_SRC_GEN := common/status_wiregen.c common/peer_status_wiregen.c common/scb_wiregen.c common/gossip_store_wiregen.c
 
 COMMON_HEADERS_NOGEN := $(COMMON_SRC_NOGEN:.c=.h)	\
 	common/closing_fee.h				\
+	common/crypto_state.h				\
 	common/ecdh.h					\
 	common/errcode.h				\
+	common/forward_failure_reason.h		\
 	common/gossip_constants.h			\
+	common/hash_str.h				\
+	common/hsm_version.h				\
 	common/htlc.h					\
-	common/json_command.h				\
 	common/jsonrpc_errors.h				\
-	common/overflows.h				\
-	common/tx_roles.h
+	common/overflows.h
 
-COMMON_HEADERS_GEN := common/htlc_state_names_gen.h common/status_wiregen.h common/peer_status_wiregen.h
+COMMON_HEADERS_GEN := common/htlc_state_names_gen.h common/status_wiregen.h common/peer_status_wiregen.h common/scb_wiregen.h common/gossip_store_wiregen.h
 
 COMMON_HEADERS := $(COMMON_HEADERS_GEN) $(COMMON_HEADERS_NOGEN)
 COMMON_SRC := $(COMMON_SRC_NOGEN) $(COMMON_SRC_GEN)
 
 COMMON_OBJS := $(COMMON_SRC:.c=.o)
 
-# Common objects depends on bitcoin/ external/ and ccan
-$(COMMON_OBJS): $(CCAN_HEADERS) $(BITCOIN_HEADERS) $(EXTERNAL_HEADERS) $(COMMON_HEADERS_GEN)
+common/scb_wiregen.h_args := -s
+common/scb_wiregen.c_args := -s
+
+# Check that all h and c files are in the Makefile!
+check-common-files:
+	@$(call VERBOSE, "checking common source", [ "$(filter-out $(COMMON_SRC), $(wildcard common/*.c))" = "" ])
+	@$(call VERBOSE, "checking common headers", [ "$(filter-out $(COMMON_HEADERS) $(COMMON_SRC:.c=.h), $(wildcard common/*.h))" = "" ])
+
+check-source: check-common-files
 
 # Only common/version.c can include this header.
 common/version.o: version_gen.h
+
+# Rebuild objects should this file change.
+$(COMMON_OBJS): common/Makefile
+
+# We make a static library, this way linker can discard unused parts.
+libcommon.a: $(COMMON_OBJS) $(WIRE_OBJS) $(BITCOIN_OBJS)
+	@$(call VERBOSE, "ar $@", $(AR) r $@ $?)
 
 ALL_C_HEADERS += $(COMMON_HEADERS)
 ALL_C_SOURCES += $(COMMON_SRC)
@@ -122,14 +161,13 @@ ALL_C_SOURCES += $(COMMON_SRC)
 common/htlc_state_names_gen.h: common/htlc_state.h ccan/ccan/cdump/tools/cdump-enumstr
 	ccan/ccan/cdump/tools/cdump-enumstr common/htlc_state.h > $@
 
-common/gossip_store.o: gossipd/gossip_store_wiregen.h
-
-check-source-bolt: $(COMMON_SRC_NOGEN:%=bolt-check/%) $(COMMON_HEADERS:%=bolt-check/%)
-check-whitespace: $(COMMON_SRC_NOGEN:%=check-whitespace/%) $(COMMON_HEADERS:%=check-whitespace/%)
+check-source-bolt: $(COMMON_SRC_NOGEN:%=bolt-check/%) $(COMMON_HEADERS_NOGEN:%=bolt-check/%)
+check-whitespace: $(COMMON_SRC_NOGEN:%=check-whitespace/%) $(COMMON_HEADERS_NOGEN:%=check-whitespace/%)
 
 clean: common-clean
 
 common-clean:
+	$(RM) libcommon.a
 	$(RM) common/gen*
 
 include common/test/Makefile

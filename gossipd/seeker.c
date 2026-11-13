@@ -1,26 +1,29 @@
 /* This contains the code which actively seeks out gossip from peers */
-#include <bitcoin/chainparams.h>
-#include <bitcoin/short_channel_id.h>
-#include <ccan/array_size/array_size.h>
+#include "config.h"
 #include <ccan/asort/asort.h>
-#include <ccan/list/list.h>
-#include <ccan/mem/mem.h>
+#include <ccan/intmap/intmap.h>
 #include <ccan/tal/str/str.h>
-#include <ccan/tal/tal.h>
+#include <common/clock_time.h>
+#include <common/daemon_conn.h>
 #include <common/decode_array.h>
-#include <common/pseudorand.h>
-#include <common/random_select.h>
+#include <common/gossmap.h>
+#include <common/memleak.h>
 #include <common/status.h>
 #include <common/timeout.h>
-#include <common/type_to_string.h>
+#include <common/utils.h>
 #include <gossipd/gossipd.h>
+#include <gossipd/gossipd_wiregen.h>
+#include <gossipd/gossmap_manage.h>
 #include <gossipd/queries.h>
-#include <gossipd/routing.h>
 #include <gossipd/seeker.h>
-#include <wire/peer_wire.h>
 
 #define GOSSIP_SEEKER_INTERVAL(seeker) \
-	DEV_FAST_GOSSIP((seeker)->daemon->rstate->dev_fast_gossip, 5, 60)
+	DEV_FAST_GOSSIP((seeker)->daemon->dev_fast_gossip, 5, 60)
+
+#define GOSSIP_SEEKER_RESYNC_INTERVAL(seeker) \
+	DEV_FAST_GOSSIP((seeker)->daemon->dev_fast_gossip, 30, 3600)
+
+#define SEEKER_GOSSIPERS 10
 
 enum seeker_state {
 	/* Still streaming gossip from single peer. */
@@ -42,10 +45,6 @@ enum seeker_state {
 	ASKING_FOR_STALE_SCIDS,
 };
 
-#if DEVELOPER
-bool dev_suppress_gossip;
-#endif
-
 /* Gossip we're seeking at the moment. */
 struct seeker {
 	struct daemon *daemon;
@@ -55,8 +54,12 @@ struct seeker {
 	/* Timer which checks on progress every minute */
 	struct oneshot *check_timer;
 
+	/* Full sync gossip from one peer every hour */
+	struct oneshot *sync_timer;
+
 	/* Channels we've heard about, but don't know (by scid). */
 	UINTMAP(bool) unknown_scids;
+	size_t num_unknown_scids;
 
 	/* Channels we've heard about newer timestamps for (by scid).  u8 is
 	 * query_flags. */
@@ -65,8 +68,11 @@ struct seeker {
 	/* Range of scid blocks we've probed. */
 	size_t scid_probe_start, scid_probe_end;
 
-	/* During startup, we ask a single peer for gossip. */
-	struct peer *random_peer_softref;
+	/* During startup, we ask a single peer for gossip (set to NULL if peer dies)*/
+	struct peer *random_peer;
+
+	/* The last peer we requested a full gossip sync from. */
+	struct peer *last_full_sync_peer;
 
 	/* This checks progress of our random peer */
 	size_t prev_gossip_count;
@@ -79,12 +85,14 @@ struct seeker {
 	 * missing channels. */
 	bool unknown_nodes;
 
-	/* Peers we've asked to stream us gossip */
-	struct peer *gossiper_softref[5];
+	/* Peers we've asked to stream us gossip (set to NULL if peer dies) */
+	struct peer **gossiper;
 
-	/* A peer that told us about unknown gossip. */
-	struct peer *preferred_peer_softref;
+	/* A peer that told us about unknown gossip (set to NULL if peer dies). */
+	struct peer *preferred_peer;
 
+	/* check_timer cycles since streaming began from the last new gossiper. */
+	u8 new_gossiper_elapsed;
 };
 
 /* Mutual recursion */
@@ -107,11 +115,11 @@ static bool selected_peer(struct seeker *seeker, struct peer *peer)
 	if (!peer)
 		return false;
 
-	set_softref(seeker, &seeker->random_peer_softref, peer);
+	seeker->random_peer = peer;
 
 	/* Give it some grace in case we immediately hit timer */
 	seeker->prev_gossip_count
-		= peer->gossip_counter - GOSSIP_SEEKER_INTERVAL(seeker);
+		= peer->query_reply_counter - GOSSIP_SEEKER_INTERVAL(seeker);
 	return true;
 }
 
@@ -143,24 +151,25 @@ struct seeker *new_seeker(struct daemon *daemon)
 
 	seeker->daemon = daemon;
 	uintmap_init(&seeker->unknown_scids);
+	seeker->num_unknown_scids = 0;
 	uintmap_init(&seeker->stale_scids);
-	seeker->random_peer_softref = NULL;
-	for (size_t i = 0; i < ARRAY_SIZE(seeker->gossiper_softref); i++)
-		seeker->gossiper_softref[i] = NULL;
-	seeker->preferred_peer_softref = NULL;
+	seeker->random_peer = NULL;
+	u32 gossipers = daemon->autoconnect_seeker_peers > SEEKER_GOSSIPERS ?
+			daemon->autoconnect_seeker_peers : SEEKER_GOSSIPERS;
+	seeker->gossiper = tal_arrz(seeker, struct peer *, gossipers);
+	seeker->preferred_peer = NULL;
 	seeker->unknown_nodes = false;
+	seeker->last_full_sync_peer = NULL;
+	seeker->new_gossiper_elapsed = 0;
 	set_state(seeker, STARTING_UP, NULL, "New seeker");
 	begin_check_timer(seeker);
+	seeker->sync_timer = NULL;
 	return seeker;
 }
 
 static void set_preferred_peer(struct seeker *seeker, struct peer *peer)
 {
-	if (seeker->preferred_peer_softref
-	    && seeker->preferred_peer_softref != peer) {
-		clear_softref(seeker, &seeker->preferred_peer_softref);
-		set_softref(seeker, &seeker->preferred_peer_softref, peer);
-	}
+	seeker->preferred_peer = peer;
 }
 
 /* Get a random peer, but try our preferred peer first, if any.  This
@@ -168,7 +177,9 @@ static void set_preferred_peer(struct seeker *seeker, struct peer *peer)
 static struct peer *random_seeker(struct seeker *seeker,
 				  bool (*check_peer)(const struct peer *peer))
 {
-	struct peer *peer = seeker->preferred_peer_softref;
+	struct peer *peer = seeker->preferred_peer;
+	struct peer *first;
+	struct peer_node_id_map_iter it;
 
 	/* 80% chance of immediately choosing a peer who reported the missing
 	 * stuff: they presumably can tell us more about it.  We don't
@@ -176,23 +187,28 @@ static struct peer *random_seeker(struct seeker *seeker,
 	 * invalid announcements to get chosen, and we don't handle that case
 	 * well yet. */
 	if (peer && check_peer(peer) && pseudorand(5) != 0) {
-		clear_softref(seeker, &seeker->random_peer_softref);
+		seeker->random_peer = NULL;
 		return peer;
 	}
 
-	return random_peer(seeker->daemon, check_peer);
+	/* Rotate through, so we don't favor a single peer. */
+	peer = first = first_random_peer(seeker->daemon, &it);
+	while (peer) {
+		if (check_peer(peer))
+			break;
+		peer = next_random_peer(seeker->daemon, first, &it);
+	}
+	return peer;
 }
 
-static bool peer_made_progress(struct seeker *seeker)
+static bool peer_made_progress(struct seeker *seeker, const struct peer *peer)
 {
-	const struct peer *peer = seeker->random_peer_softref;
-
 	/* Has it made progress (at least one valid update per second)?  If
 	 * not, we assume it's finished, and if it hasn't, we'll end up
 	 * querying backwards in next steps. */
-	if (peer->gossip_counter
+	if (peer->query_reply_counter
 	    >= seeker->prev_gossip_count + GOSSIP_SEEKER_INTERVAL(seeker)) {
-		seeker->prev_gossip_count = peer->gossip_counter;
+		seeker->prev_gossip_count = peer->query_reply_counter;
 		return true;
 	}
 
@@ -210,51 +226,64 @@ static void disable_gossip_stream(struct seeker *seeker, struct peer *peer)
 					     &chainparams->genesis_blockhash,
 					     UINT32_MAX,
 					     UINT32_MAX);
-	queue_peer_msg(peer, take(msg));
+	queue_peer_msg(peer->daemon, &peer->id, take(msg));
 }
 
-static void enable_gossip_stream(struct seeker *seeker, struct peer *peer)
+static void enable_gossip_stream(struct seeker *seeker, struct peer *peer,
+				 bool ask_for_all)
 {
-	/* We seek some way back, to take into account propagation time */
-	const u32 polltime = GOSSIP_SEEKER_INTERVAL(seeker) * 10;
-	u32 start = seeker->daemon->rstate->last_timestamp;
+	u32 start;
 	u8 *msg;
 
-#if DEVELOPER
-	if (dev_suppress_gossip)
-		return;
-#endif
+	/* If we have no gossip, always ask for everything */
+	if (!gossmap_manage_populated(peer->daemon->gm))
+		ask_for_all = true;
 
-	if (start > polltime)
-		start -= polltime;
-	else
+	/* Modern timestamp_filter is a trinary: 0 = all, FFFFFFFF = none,
+	 * other = from now on */
+	if (ask_for_all) {
 		start = 0;
+	} else {
+		/* Just in case they care */
+		start = clock_time().ts.tv_sec - GOSSIP_SEEKER_INTERVAL(seeker) * 10;
+	}
 
-	status_peer_debug(&peer->id, "seeker: starting gossip");
+	status_peer_debug(&peer->id, "seeker: starting gossip (%s)",
+			  ask_for_all ? "EVERYTHING" : "streaming");
 
 	/* This is allowed even if they don't understand it (odd) */
 	msg = towire_gossip_timestamp_filter(NULL,
 					     &chainparams->genesis_blockhash,
 					     start,
 					     UINT32_MAX);
-	queue_peer_msg(peer, take(msg));
+	queue_peer_msg(peer->daemon, &peer->id, take(msg));
 }
 
-static void normal_gossip_start(struct seeker *seeker, struct peer *peer)
+static void normal_gossip_start(struct seeker *seeker, struct peer *peer, bool ask_for_all)
 {
 	bool enable_stream = false;
 
+	/* BOLT-remove-old-features #7:
+	 * Understanding of messages used to be indicated with the `gossip_queries`
+	 * feature bit; now these messages are universally supported, that feature has
+	 * now been slightly repurposed.  Not offering this feature means a node is not
+	 * worth querying for gossip: either they do not store the entire gossip map, or
+	 * they are only connected to a single peer (this one).
+	 */
+	if (!peer->gossip_queries_feature)
+		return;
+
 	/* Make this one of our streaming gossipers if we aren't full */
-	for (size_t i = 0; i < ARRAY_SIZE(seeker->gossiper_softref); i++) {
-		if (seeker->gossiper_softref[i] == NULL) {
-			set_softref(seeker, &seeker->gossiper_softref[i], peer);
+	for (size_t i = 0; i < tal_count(seeker->gossiper); i++) {
+		if (seeker->gossiper[i] == NULL) {
+			seeker->gossiper[i] = peer;
 			enable_stream = true;
 			break;
 		}
 	}
 
 	if (enable_stream)
-		enable_gossip_stream(seeker, peer);
+		enable_gossip_stream(seeker, peer, ask_for_all);
 	else
 		disable_gossip_stream(seeker, peer);
 }
@@ -273,6 +302,7 @@ static struct short_channel_id *unknown_scids_remove(const tal_t *ctx,
 	while (uintmap_first(&seeker->unknown_scids, &scid)) {
 		scids[i].u64 = scid;
 		(void)uintmap_del(&seeker->unknown_scids, scid);
+		seeker->num_unknown_scids--;
 		if (++i == max)
 			break;
 	}
@@ -281,11 +311,12 @@ static struct short_channel_id *unknown_scids_remove(const tal_t *ctx,
 }
 
 /* We have selected this peer to stream us startup gossip */
-static void peer_gossip_startup(struct seeker *seeker, struct peer *peer)
+static void peer_gossip_startup(struct seeker *seeker, struct peer *peer,
+				bool ask_for_all)
 {
 	status_peer_debug(&peer->id, "seeker: chosen as startup peer");
 	selected_peer(seeker, peer);
-	normal_gossip_start(seeker, peer);
+	normal_gossip_start(seeker, peer, ask_for_all);
 }
 
 static bool peer_has_gossip_queries(const struct peer *peer)
@@ -448,37 +479,38 @@ static int cmp_scid(const struct short_channel_id *a,
 
 /* We can't ask for channels by node_id, so probe at random */
 static bool get_unannounced_nodes(const tal_t *ctx,
-				  struct routing_state *rstate,
+				  struct daemon *daemon,
 				  size_t max,
 				  struct short_channel_id **scids,
 				  u8 **query_flags)
 {
-	size_t num = 0;
-	u64 offset;
-	double total_weight = 0.0;
+	size_t num = 0, off, max_idx;
+	struct gossmap *gossmap = gossmap_manage_get_gossmap(daemon->gm);
 
-	/* Pick an example short_channel_id at random to query.  As a
-	 * side-effect this gets the node. */
+	/* No nodes?  Nothing to ask for */
+	max_idx = gossmap_max_node_idx(gossmap);
+	if (max_idx == 0 || max == 0)
+		return false;
+
+	/* Start at random index */
+	off = pseudorand(max_idx);
 	*scids = tal_arr(ctx, struct short_channel_id, max);
 
-	/* FIXME: This is inefficient!  Reuse next_block_range here! */
-	for (struct chan *c = uintmap_first(&rstate->chanmap, &offset);
-	     c;
-	     c = uintmap_after(&rstate->chanmap, &offset)) {
-		/* Local-only?  Don't ask. */
-		if (!is_chan_public(c))
+	for (size_t i = 0; i < max_idx; i++) {
+		const struct gossmap_node *node = gossmap_node_byidx(gossmap, (off + i) % max_idx);
+		const struct gossmap_chan *chan;
+
+		if (!node)
+			continue;
+		if (gossmap_node_announced(node))
 			continue;
 
-		if (c->nodes[0]->bcast.index && c->nodes[1]->bcast.index)
-			continue;
+		/* Query first chan. */
+		chan = gossmap_nth_chan(gossmap, node, 0, NULL);
+		(*scids)[num++] = gossmap_chan_scid(gossmap, chan);
 
-		if (num < max) {
-			(*scids)[num++] = c->scid;
-		} else {
-			/* Maybe replace one: approx. reservoir sampling */
-			if (random_select(1.0, &total_weight))
-				(*scids)[pseudorand(max)] = c->scid;
-		}
+		if (num == max)
+			break;
 	}
 
 	if (num == 0) {
@@ -489,18 +521,23 @@ static bool get_unannounced_nodes(const tal_t *ctx,
 	if (num < max)
 		tal_resize(scids, num);
 
-	/* Sort them into order. */
+	/* Sort them into order, and remove duplicates! */
 	asort(*scids, num, cmp_scid, NULL);
+	for (size_t i = 1; i < tal_count(*scids); i++) {
+		if (short_channel_id_eq((*scids)[i], (*scids)[i-1])) {
+			tal_arr_remove(scids, i);
+		}
+	}
 
 	/* Now get flags. */
-	*query_flags = tal_arr(ctx, u8, num);
+	*query_flags = tal_arr(ctx, u8, tal_count(*scids));
 	for (size_t i = 0; i < tal_count(*scids); i++) {
-		struct chan *c = get_channel(rstate, &(*scids)[i]);
+		const struct gossmap_chan *chan = gossmap_find_chan(gossmap, &(*scids)[i]);
 
 		(*query_flags)[i] = 0;
-		if (!c->nodes[0]->bcast.index)
+		if (!gossmap_node_announced(gossmap_nth_node(gossmap, chan, 0)))
 			(*query_flags)[i] |= SCID_QF_NODE1;
-		if (!c->nodes[1]->bcast.index)
+		if (!gossmap_node_announced(gossmap_nth_node(gossmap, chan, 1)))
 			(*query_flags)[i] |= SCID_QF_NODE2;
 	}
 	return true;
@@ -511,30 +548,31 @@ static void peer_gossip_probe_nannounces(struct seeker *seeker);
 
 static void nodeannounce_query_done(struct peer *peer, bool complete)
 {
-	struct seeker *seeker = peer->daemon->seeker;
-	struct routing_state *rstate = seeker->daemon->rstate;
+	struct daemon *daemon = peer->daemon;
+	struct seeker *seeker = daemon->seeker;
 	size_t new_nannounce = 0, num_scids;
+	struct gossmap *gossmap = gossmap_manage_get_gossmap(daemon->gm);
 
 	/* We might have given up on them, then they replied. */
-	if (seeker->random_peer_softref != peer) {
+	if (seeker->random_peer != peer) {
 		status_peer_debug(&peer->id, "seeker: belated reply: ignoring");
 		return;
 	}
 
-	clear_softref(seeker, &seeker->random_peer_softref);
+	seeker->random_peer = NULL;
 
 	num_scids = tal_count(seeker->nannounce_scids);
 	for (size_t i = 0; i < num_scids; i++) {
-		struct chan *c = get_channel(rstate,
-					     &seeker->nannounce_scids[i]);
+		struct gossmap_chan *c = gossmap_find_chan(gossmap,
+							   &seeker->nannounce_scids[i]);
 		/* Could have closed since we asked. */
 		if (!c)
 			continue;
 		if ((seeker->nannounce_query_flags[i] & SCID_QF_NODE1)
-		    && c->nodes[0]->bcast.index)
+		    && gossmap_node_announced(gossmap_nth_node(gossmap, c, 0)))
 			new_nannounce++;
 		if ((seeker->nannounce_query_flags[i] & SCID_QF_NODE2)
-		    && c->nodes[1]->bcast.index)
+		    && gossmap_node_announced(gossmap_nth_node(gossmap, c, 1)))
 			new_nannounce++;
 	}
 
@@ -561,7 +599,7 @@ static void nodeannounce_query_done(struct peer *peer, bool complete)
 	if (num_scids > 7000)
 		num_scids = 7000;
 
-	if (!get_unannounced_nodes(seeker, seeker->daemon->rstate, num_scids,
+	if (!get_unannounced_nodes(seeker, seeker->daemon, num_scids,
 				   &seeker->nannounce_scids,
 				   &seeker->nannounce_query_flags)) {
 		/* Nothing unknown at all?  Great, we're done */
@@ -594,26 +632,34 @@ static void peer_gossip_probe_nannounces(struct seeker *seeker)
 }
 
 /* They have update with this timestamp: do we want it? */
-static bool want_update(struct seeker *seeker,
-			u32 timestamp, const struct half_chan *hc)
+static bool want_update(struct gossmap *gossmap,
+			u32 timestamp,
+			const struct gossmap_chan *chan,
+			int dir)
 {
-	if (!is_halfchan_defined(hc))
+	u32 our_timestamp;
+
+	if (!gossmap_chan_set(chan, dir))
 		return timestamp != 0;
 
-	if (timestamp <= hc->bcast.timestamp)
+	gossmap_chan_get_update_details(gossmap, chan, dir, &our_timestamp,
+					NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+	if (timestamp <= our_timestamp)
 		return false;
 
-	return !would_ratelimit_cupdate(seeker->daemon->rstate, hc, timestamp);
+	return true;
 }
 
 /* They gave us timestamps.  Do we want updated versions? */
 static void check_timestamps(struct seeker *seeker,
-			     struct chan *c,
+			     struct gossmap *gossmap,
+			     struct gossmap_chan *c,
 			     const struct channel_update_timestamps *ts,
 			     struct peer *peer)
 {
 	u8 *stale;
 	u8 query_flag = 0;
+	struct short_channel_id scid;
 
 	/* BOLT #7:
 	 * * `timestamp_node_id_1` is the timestamp of the `channel_update`
@@ -623,46 +669,68 @@ static void check_timestamps(struct seeker *seeker,
 	 *    for `node_id_2`, or 0 if there was no `channel_update` from that
 	 *    node.
 	 */
-	if (want_update(seeker, ts->timestamp_node_id_1, &c->half[0]))
+	if (want_update(gossmap, ts->timestamp_node_id_1, c, 0))
 		query_flag |= SCID_QF_UPDATE1;
-	if (want_update(seeker, ts->timestamp_node_id_2, &c->half[1]))
+	if (want_update(gossmap, ts->timestamp_node_id_2, c, 1))
 		query_flag |= SCID_QF_UPDATE2;
 
 	if (!query_flag)
 		return;
 
 	/* Add in flags if we're already getting it. */
-	stale = uintmap_get(&seeker->stale_scids, c->scid.u64);
+	scid = gossmap_chan_scid(gossmap, c);
+	stale = uintmap_get(&seeker->stale_scids, scid.u64);
 	if (!stale) {
 		stale = talz(seeker, u8);
-		uintmap_add(&seeker->stale_scids, c->scid.u64, stale);
+		uintmap_add(&seeker->stale_scids, scid.u64, stale);
 		set_preferred_peer(seeker, peer);
 	}
 	*stale |= query_flag;
+}
+
+static bool add_unknown_scid(struct seeker *seeker,
+			     struct short_channel_id scid,
+			     struct peer *peer)
+{
+	/* We can't know everything! */
+	if (seeker->num_unknown_scids > 10000)
+		return false;
+
+	/* Check we're not already getting this one. */
+	if (!uintmap_add(&seeker->unknown_scids, scid.u64, true))
+		return false;
+
+	seeker->num_unknown_scids++;
+	set_preferred_peer(seeker, peer);
+	return true;
 }
 
 static void process_scid_probe(struct peer *peer,
 			       u32 first_blocknum, u32 number_of_blocks,
 			       const struct range_query_reply *replies)
 {
-	struct seeker *seeker = peer->daemon->seeker;
+	struct daemon *daemon = peer->daemon;
+	struct seeker *seeker = daemon->seeker;
 	bool new_unknown_scids = false;
+	struct gossmap *gossmap;
 
 	/* We might have given up on them, then they replied. */
-	if (seeker->random_peer_softref != peer)
+	if (seeker->random_peer != peer)
 		return;
 
-	clear_softref(seeker, &seeker->random_peer_softref);
+	seeker->random_peer = NULL;
+	gossmap = gossmap_manage_get_gossmap(daemon->gm);
 
 	for (size_t i = 0; i < tal_count(replies); i++) {
-		struct chan *c = get_channel(seeker->daemon->rstate,
-					     &replies[i].scid);
+		struct gossmap_chan *c = gossmap_find_chan(gossmap,
+							   &replies[i].scid);
 		if (c) {
-			check_timestamps(seeker, c, &replies[i].ts, peer);
+			check_timestamps(seeker, gossmap, c, &replies[i].ts, peer);
 			continue;
 		}
 
-		new_unknown_scids |= add_unknown_scid(seeker, &replies[i].scid,
+		new_unknown_scids |= add_unknown_scid(seeker,
+						      replies[i].scid,
 						      peer);
 	}
 
@@ -684,7 +752,7 @@ static void process_scid_probe(struct peer *peer,
 	}
 
 	/* Channel probe finished, try asking for 128 unannounced nodes. */
-	if (!get_unannounced_nodes(seeker, seeker->daemon->rstate, 128,
+	if (!get_unannounced_nodes(seeker, seeker->daemon, 128,
 				   &seeker->nannounce_scids,
 				   &seeker->nannounce_query_flags)) {
 		/* No unknown nodes.  Great! */
@@ -753,9 +821,65 @@ static void probe_many_random_scids(struct seeker *seeker)
 	return probe_random_scids(seeker, 10000);
 }
 
+/* Find a random node with an announcement. */
+static struct node_id *get_random_node(const tal_t *ctx,
+				       struct seeker *seeker)
+{
+	struct gossmap *gossmap = gossmap_manage_get_gossmap(seeker->daemon->gm);
+	struct gossmap_node *node = gossmap_random_node(gossmap);
+
+	if (!node)
+		return NULL;
+
+	for (int i = 0; i<20; i++) {
+		struct node_id id;
+
+		gossmap_node_get_id(gossmap, node, &id);
+
+		/* Make sure it *has* an announcement, and we're not
+		 * already connected */
+		if (!node_id_eq(&id, &seeker->daemon->id)
+		    && gossmap_node_get_announce(tmpctx, gossmap, node)
+		    && !find_peer(seeker->daemon, &id)) {
+			return tal_dup(ctx, struct node_id, &id);
+		}
+
+		node = gossmap_next_node(gossmap, node);
+		if (!node)
+			node = gossmap_first_node(gossmap);
+	}
+
+	return NULL;
+}
+
+/* Ask lightningd for more peers if we're short on gossip streamers. */
+static void maybe_get_new_peer(struct seeker *seeker)
+{
+	size_t connected_peers = peer_node_id_map_count(seeker->daemon->peers);
+	struct node_id *random_node;
+
+	/* Respect user-defined autoconnect peer limit. */
+	if (connected_peers >= seeker->daemon->autoconnect_seeker_peers)
+		return;
+
+	status_debug("seeker: need more peers for gossip (have %zu)",
+		     connected_peers);
+
+	random_node = get_random_node(tmpctx, seeker);
+	if (!random_node) {
+		status_debug("seeker: no more potential peers found");
+		return;
+	}
+
+	u8 *msg = towire_gossipd_connect_to_peer(NULL, random_node);
+	daemon_conn_send(seeker->daemon->master, take(msg));
+	tal_free(random_node);
+}
+
 static void check_firstpeer(struct seeker *seeker)
 {
-	struct peer *peer = seeker->random_peer_softref, *p;
+	struct peer *peer = seeker->random_peer;
+	struct peer_node_id_map_iter it;
 
 	/* It might have died, pick another. */
 	if (!peer) {
@@ -763,26 +887,33 @@ static void check_firstpeer(struct seeker *seeker)
 		/* No peer?  Wait for a new one to join. */
 		if (!peer) {
 			status_debug("seeker: no peers, waiting");
+			if (seeker->new_gossiper_elapsed)
+				maybe_get_new_peer(seeker);
+			else
+				seeker->new_gossiper_elapsed++;
 			return;
 		}
 
-		peer_gossip_startup(seeker, peer);
+		peer_gossip_startup(seeker, peer, false);
 		return;
 	}
 
 	/* If no progress, we assume it's finished, and if it hasn't,
 	 * we'll end up querying backwards in next steps. */
-	if (peer_made_progress(seeker))
+	if (peer_made_progress(seeker, peer))
 		return;
 
 	/* Other peers can gossip now. */
 	status_peer_debug(&peer->id, "seeker: startup peer finished");
-	clear_softref(seeker, &seeker->random_peer_softref);
-	list_for_each(&seeker->daemon->peers, p, list) {
+	seeker->random_peer = NULL;
+
+	for (struct peer *p = peer_node_id_map_first(seeker->daemon->peers, &it);
+	     p;
+	     p = peer_node_id_map_next(seeker->daemon->peers, &it)) {
 		if (p == peer)
 			continue;
 
-		normal_gossip_start(seeker, p);
+		normal_gossip_start(seeker, p, false);
 	}
 
 	/* Ask a random peer for all channels, in case we're missing */
@@ -796,7 +927,7 @@ static void check_firstpeer(struct seeker *seeker)
 static void check_probe(struct seeker *seeker,
 			void (*restart)(struct seeker *seeker))
 {
-	struct peer *peer = seeker->random_peer_softref;
+	struct peer *peer = seeker->random_peer;
 
 	/* It might have died, pick another. */
 	if (!peer) {
@@ -805,13 +936,13 @@ static void check_probe(struct seeker *seeker,
 	}
 
 	/* Is peer making progress with responses? */
-	if (peer_made_progress(seeker))
+	if (peer_made_progress(seeker, peer))
 		return;
 
 	status_peer_debug(&peer->id,
 			  "has only moved gossip %zu->%zu for probe, giving up on it",
-			  seeker->prev_gossip_count, peer->gossip_counter);
-	clear_softref(seeker, &seeker->random_peer_softref);
+			  seeker->prev_gossip_count, peer->query_reply_counter);
+	seeker->random_peer = NULL;
 	restart(seeker);
 }
 
@@ -819,47 +950,79 @@ static bool peer_is_not_gossipper(const struct peer *peer)
 {
 	const struct seeker *seeker = peer->daemon->seeker;
 
-	for (size_t i = 0; i < ARRAY_SIZE(seeker->gossiper_softref); i++) {
-		if (seeker->gossiper_softref[i] == peer)
+	/* BOLT-remove-old-features #7:
+	 * `gossip_queries`... Not offering this feature means a node is not
+	 * worth querying for gossip
+	 */
+	if (!peer->gossip_queries_feature)
+		return false;
+
+	for (size_t i = 0; i < tal_count(seeker->gossiper); i++) {
+		if (seeker->gossiper[i] == peer)
 			return false;
 	}
 	return true;
 }
 
-/* FIXME: We should look at gossip performance and replace the underperforming
- * peers in preference. */
+/* Allows evaluation of least useful gossip streamer. */
+static void reset_gossip_performance_metrics(struct seeker *seeker)
+{
+	seeker->new_gossiper_elapsed = 0;
+	for (size_t i = 0; i < tal_count(seeker->gossiper); i++) {
+		if (seeker->gossiper[i])
+			seeker->gossiper[i]->gossip_counter = 0;
+	}
+}
+
 static void maybe_rotate_gossipers(struct seeker *seeker)
 {
 	struct peer *peer;
-	size_t i;
+	size_t i, lowest_idx;
 
-	/* If all peers are gossiping, we're done */
+	seeker->new_gossiper_elapsed++;
+
+	/* If all (usable) peers are gossiping, we're done */
 	peer = random_seeker(seeker, peer_is_not_gossipper);
 	if (!peer)
 		return;
 
-	/* If we have a slot free, or ~ 1 per hour */
-	for (i = 0; i < ARRAY_SIZE(seeker->gossiper_softref); i++) {
-		if (!seeker->gossiper_softref[i]) {
+	/* If we have a slot free, fill it. */
+	for (i = 0; i < tal_count(seeker->gossiper); i++) {
+		if (!seeker->gossiper[i]) {
 			status_peer_debug(&peer->id, "seeker: filling slot %zu",
 					  i);
+			lowest_idx = i;
 			goto set_gossiper;
 		}
-		if (pseudorand(ARRAY_SIZE(seeker->gossiper_softref) * 60) == 0) {
-			status_peer_debug(&peer->id,
-					  "seeker: replacing slot %zu",
-					  i);
-			goto clear_and_set_gossiper;
+	}
+	/* Otherwise, rotate out worst gossiper every 30 minutes on average. */
+	if (pseudorand(25) != 0)
+		return;
+	/* Don't evaluate gossip performance at a faster rate than
+	 * new gossip is periodically emitted. */
+	if (seeker->new_gossiper_elapsed < 5)
+		return;
+	u32 lowest_count = UINT_MAX;
+	lowest_idx = 0;
+	for (size_t j = 0; j < tal_count(seeker->gossiper); j++) {
+		if (seeker->gossiper[j]->gossip_counter < lowest_count) {
+			lowest_count = seeker->gossiper[j]->gossip_counter;
+			lowest_idx = j;
 		}
 	}
-	return;
+	status_debug("seeker: ejecting worst gossiper %s - slot %zu: "
+		     "novel gossip count %zu over %u minutes",
+		     fmt_node_id(tmpctx, &seeker->gossiper[lowest_idx]->id),
+		     lowest_idx, seeker->gossiper[lowest_idx]->gossip_counter,
+		     seeker->new_gossiper_elapsed);
+	status_peer_debug(&peer->id, "seeker: replacing slot %zu",
+			  lowest_idx);
+	disable_gossip_stream(seeker, seeker->gossiper[lowest_idx]);
 
-clear_and_set_gossiper:
-	disable_gossip_stream(seeker, seeker->gossiper_softref[i]);
-	clear_softref(seeker, &seeker->gossiper_softref[i]);
 set_gossiper:
-	set_softref(seeker, &seeker->gossiper_softref[i], peer);
-	enable_gossip_stream(seeker, peer);
+	seeker->gossiper[lowest_idx] = peer;
+	enable_gossip_stream(seeker, peer, false);
+	reset_gossip_performance_metrics(seeker);
 }
 
 static bool seek_any_unknown_nodes(struct seeker *seeker)
@@ -875,11 +1038,6 @@ static bool seek_any_unknown_nodes(struct seeker *seeker)
 /* Periodic timer to see how our gossip is going. */
 static void seeker_check(struct seeker *seeker)
 {
-#if DEVELOPER
-	if (dev_suppress_gossip)
-		goto out;
-#endif
-
 	/* We don't do anything until we're synced. */
 	if (seeker->daemon->current_blockheight == 0)
 		goto out;
@@ -901,6 +1059,7 @@ static void seeker_check(struct seeker *seeker)
 		check_probe(seeker, peer_gossip_probe_nannounces);
 		break;
 	case NORMAL:
+		maybe_get_new_peer(seeker);
 		maybe_rotate_gossipers(seeker);
 		if (!seek_any_unknown_scids(seeker)
 		    && !seek_any_stale_scids(seeker))
@@ -912,6 +1071,51 @@ out:
 	begin_check_timer(seeker);
 }
 
+/* Mutual recursion */
+static void begin_sync_timer(struct seeker *seeker);
+
+/* Periodically ask for a full sync from a random peer to backfill anything
+ * we might have missed. */
+static void full_sync_random_peer(struct seeker *seeker)
+{
+	/* Select random peer */
+	struct peer *random_peer;
+	struct peer_node_id_map_iter it;
+	random_peer = first_random_peer(seeker->daemon, &it);
+	if (!random_peer) {
+		begin_sync_timer(seeker);
+		return;
+	}
+	/* Don't repeatedly resync from the same node. */
+	if (seeker->last_full_sync_peer && seeker->last_full_sync_peer == random_peer) {
+		struct peer *new_peer;
+		new_peer = next_random_peer(seeker->daemon, random_peer, &it);
+		if (new_peer)
+			random_peer = new_peer;
+		else {
+			begin_sync_timer(seeker);
+			return;
+		}
+	}
+	status_peer_debug(&random_peer->id,
+			  "seeker: chosen for periodic full sync");
+	normal_gossip_start(seeker,random_peer, true);
+	seeker->last_full_sync_peer = random_peer;
+	begin_sync_timer(seeker);
+}
+
+static void begin_sync_timer(struct seeker *seeker)
+{
+	if (seeker->sync_timer)
+		tal_free(seeker->sync_timer);
+	const u32 polltime = GOSSIP_SEEKER_RESYNC_INTERVAL(seeker);
+
+	seeker->sync_timer = new_reltimer(&seeker->daemon->timers,
+					  seeker,
+					  time_from_sec(polltime),
+					  full_sync_random_peer, seeker);
+}
+
 /* We get this when we have a new peer. */
 void seeker_setup_peer_gossip(struct seeker *seeker, struct peer *peer)
 {
@@ -919,18 +1123,17 @@ void seeker_setup_peer_gossip(struct seeker *seeker, struct peer *peer)
 	if (!peer->gossip_queries_feature)
 		return;
 
-#if DEVELOPER
-	if (dev_suppress_gossip)
-		return;
-#endif
 	/* Don't start gossiping until we're synced. */
 	if (seeker->daemon->current_blockheight == 0)
 		return;
 
 	switch (seeker->state) {
 	case STARTING_UP:
-		if (seeker->random_peer_softref == NULL)
-			peer_gossip_startup(seeker, peer);
+		if (seeker->random_peer == NULL) {
+			peer_gossip_startup(seeker, peer, true);
+			/* Get another full gossip sync later. */
+			begin_sync_timer(seeker);
+		}
 		/* Waiting for seeker_check to release us */
 		return;
 
@@ -940,7 +1143,7 @@ void seeker_setup_peer_gossip(struct seeker *seeker, struct peer *peer)
 	case NORMAL:
 	case ASKING_FOR_UNKNOWN_SCIDS:
 	case ASKING_FOR_STALE_SCIDS:
-		normal_gossip_start(seeker, peer);
+		normal_gossip_start(seeker, peer, false);
 		return;
 	}
 	abort();
@@ -950,35 +1153,50 @@ bool remove_unknown_scid(struct seeker *seeker,
 			 const struct short_channel_id *scid,
 			 bool found /*FIXME: use this info!*/)
 {
-	return uintmap_del(&seeker->unknown_scids, scid->u64);
-}
-
-bool add_unknown_scid(struct seeker *seeker,
-		      const struct short_channel_id *scid,
-		      struct peer *peer)
-{
-	/* Check we're not already getting this one. */
-	if (!uintmap_add(&seeker->unknown_scids, scid->u64, true))
+	if (!uintmap_del(&seeker->unknown_scids, scid->u64))
 		return false;
-
-	set_preferred_peer(seeker, peer);
+	seeker->num_unknown_scids--;
 	return true;
 }
 
 /* This peer told us about an update to an unknown channel.  Ask it for a
  * channel_announcement. */
 void query_unknown_channel(struct daemon *daemon,
-			   struct peer *peer,
-			   const struct short_channel_id *id)
+			   const struct node_id *source_peer,
+			   struct short_channel_id unknown_scid)
 {
-	/* Too many, or duplicate? */
-	if (!add_unknown_scid(daemon->seeker, id, peer))
-		return;
+	add_unknown_scid(daemon->seeker,
+			 unknown_scid,
+			 source_peer ? find_peer(daemon, source_peer) : NULL);
 }
 
 /* This peer told us about an unknown node.  Start probing it. */
-void query_unknown_node(struct seeker *seeker, struct peer *peer)
+void query_unknown_node(struct daemon *daemon,
+			const struct node_id *source_peer,
+			const struct node_id *unknown_node)
 {
-	seeker->unknown_nodes = true;
-	set_preferred_peer(seeker, peer);
+	daemon->seeker->unknown_nodes = true;
+	if (source_peer)
+		set_preferred_peer(daemon->seeker,
+				   find_peer(daemon, source_peer));
+}
+
+/* Peer has died, NULL out any pointers we have */
+void seeker_peer_gone(struct seeker *seeker, const struct peer *peer)
+{
+	if (seeker->random_peer == peer)
+		seeker->random_peer = NULL;
+
+	for (size_t i = 0; i < tal_count(seeker->gossiper); i++) {
+		if (seeker->gossiper[i] == peer)
+			seeker->gossiper[i] = NULL;
+	}
+
+	if (seeker->preferred_peer == peer)
+		seeker->preferred_peer = NULL;
+}
+
+void dev_seeker_memleak(struct htable *memtable, struct seeker *seeker)
+{
+	memleak_scan_uintmap(memtable, &seeker->stale_scids);
 }

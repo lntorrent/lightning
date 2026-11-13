@@ -1,29 +1,23 @@
 #include "config.h"
 #include <assert.h>
 #include <ccan/breakpoint/breakpoint.h>
-#include <ccan/endian/endian.h>
-#include <ccan/err/err.h>
 #include <ccan/fdpass/fdpass.h>
-#include <ccan/read_write_all/read_write_all.h>
 #include <ccan/tal/str/str.h>
 #include <common/daemon.h>
 #include <common/daemon_conn.h>
 #include <common/status.h>
 #include <common/status_wiregen.h>
 #include <common/utils.h>
+#include <common/version.h>
 #include <errno.h>
-#include <signal.h>
 #include <wire/peer_wire.h>
 #include <wire/wire_sync.h>
 
 static int status_fd = -1;
 static struct daemon_conn *status_conn;
 volatile bool logging_io = false;
+bool logging_trace = false;
 static bool was_logging_io;
-
-/* If we're more than this many msgs deep, don't add debug messages. */
-#define TRACE_QUEUE_LIMIT 20
-static size_t traces_suppressed;
 
 static void got_sigusr1(int signal UNUSED)
 {
@@ -59,6 +53,9 @@ void status_setup_sync(int fd)
 	assert(!status_conn);
 	status_fd = fd;
 	setup_logging_sighandler();
+
+	/* Send version now. */
+	status_send(take(towire_status_version(NULL, version())));
 }
 
 static void destroy_daemon_conn(struct daemon_conn *dc UNUSED)
@@ -75,6 +72,9 @@ void status_setup_async(struct daemon_conn *master)
 	tal_add_destructor(master, destroy_daemon_conn);
 
 	setup_logging_sighandler();
+
+	/* Send version now. */
+	status_send(take(towire_status_version(NULL, version())));
 }
 
 void status_send(const u8 *msg TAKES)
@@ -96,13 +96,25 @@ static void status_io_full(enum log_level iodir,
 	status_send(take(towire_status_io(NULL, iodir, peer, who, p)));
 }
 
+static bool status_peer_io_filter_packettype(const u8 *p)
+{
+	int msg_type = fromwire_peektype(p);
+	switch (msg_type) {
+	case WIRE_PING:
+	case WIRE_PONG:
+		return true;
+	}
+	return false;
+}
+
 static void status_peer_io_short(enum log_level iodir,
 				 const struct node_id *peer,
 				 const u8 *p)
 {
-	status_peer_debug(peer, "%s %s",
-			  iodir == LOG_IO_OUT ? "peer_out" : "peer_in",
-			  peer_wire_name(fromwire_peektype(p)));
+	if (!status_peer_io_filter_packettype(p))
+		status_peer_debug(peer, "%s %s",
+				  iodir == LOG_IO_OUT ? "peer_out" : "peer_in",
+				  peer_wire_name(fromwire_peektype(p)));
 }
 
 void status_peer_io(enum log_level iodir,
@@ -111,7 +123,7 @@ void status_peer_io(enum log_level iodir,
 {
 	report_logging_io("SIGUSR1");
 	if (logging_io)
-		status_io_full(iodir, NULL, "", p);
+		status_io_full(iodir, peer, "", p);
 	/* We get a huge amount of gossip; don't log it */
 	else if (!is_msg_for_gossipd(p))
 		status_peer_io_short(iodir, peer, p);
@@ -135,22 +147,10 @@ void status_vfmt(enum log_level level,
 {
 	char *str;
 
-	/* We only suppress async debug msgs.  IO messages are even spammier
-	 * but they only occur when explicitly asked for */
-	if (level == LOG_DBG && status_conn) {
-		size_t qlen = daemon_conn_queue_length(status_conn);
+	/* These are spammy, so only log if requested (or IO logging)*/
+	if (level == LOG_TRACE && (!logging_trace && !logging_io))
+		return;
 
-		/* Once suppressing, we keep suppressing until we're empty */
-		if (traces_suppressed && qlen == 0) {
-			size_t n = traces_suppressed;
-			traces_suppressed = 0;
-			/* Careful: recursion! */
-			status_debug("...[%zu debug messages suppressed]...", n);
-		} else if (traces_suppressed || qlen > TRACE_QUEUE_LIMIT) {
-			traces_suppressed++;
-			return;
-		}
-	}
 	str = tal_vfmt(NULL, fmt, ap);
 	status_send(take(towire_status_log(NULL, level, peer, str)));
 	tal_free(str);
@@ -218,4 +218,13 @@ void master_badmsg(u32 type_expected, const u8 *msg)
 	status_failed(STATUS_FAIL_MASTER_IO,
 		     "Error parsing %u: %s",
 		     type_expected, tal_hex(tmpctx, msg));
+}
+
+/* Print BROKEN status: callback for dump_memleak. */
+void memleak_status_broken(void *unused, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	status_vfmt(LOG_BROKEN, NULL, fmt, ap);
+	va_end(ap);
 }

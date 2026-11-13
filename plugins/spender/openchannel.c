@@ -1,17 +1,14 @@
 #include "config.h"
-#include <assert.h>
 #include <bitcoin/psbt.h>
 #include <ccan/ccan/array_size/array_size.h>
-#include <ccan/ccan/cast/cast.h>
 #include <ccan/ccan/mem/mem.h>
-#include <ccan/ccan/tal/str/str.h>
+#include <common/json_channel_type.h>
 #include <common/json_stream.h>
+#include <common/lease_rates.h>
 #include <common/psbt_open.h>
-#include <common/type_to_string.h>
-#include <common/utils.h>
+#include <inttypes.h>
 #include <plugins/spender/multifundchannel.h>
 #include <plugins/spender/openchannel.h>
-#include <wally_psbt.h>
 
 static struct list_head mfc_commands;
 
@@ -50,7 +47,7 @@ find_dest_by_channel_id(struct channel_id *cid)
  * the PSBT input/outputs in such a way that we can Do The
  * Right Thing for each of our peers.
  *
- * c-lightning will make sure that our peer isn't removing/adding
+ * Core Lightning will make sure that our peer isn't removing/adding
  * any updates that it's not allowed to (i.e. ours or a different
  * node's that we're pretending are 'ours').
  *
@@ -80,7 +77,7 @@ static bool update_parent_psbt(const tal_t *ctx,
 	tal_wally_start();
 	if (wally_psbt_clone_alloc(*parent_psbt, 0, &clone) != WALLY_OK)
 		abort();
-	tal_wally_end(tal_steal(ctx, clone));
+	tal_wally_end_onto(ctx, clone, struct wally_psbt);
 
 	/* This makes it such that we can reparent/steal added
 	 * inputs/outputs without impacting the 'original'. We
@@ -90,8 +87,9 @@ static bool update_parent_psbt(const tal_t *ctx,
 	if (wally_psbt_clone_alloc(new_node_psbt, 0, &new_node_copy)
 			!= WALLY_OK)
 		abort();
-	/* copy is cleaned up below */
-	tal_wally_end(NULL);
+	/* copy is cleaned up below, but we need parts we steal from it
+	 * owned by the clone.  */
+	tal_wally_end(clone);
 
 	changes = psbt_get_changeset(NULL, old_node_psbt,
 				     new_node_copy);
@@ -115,9 +113,16 @@ static bool update_parent_psbt(const tal_t *ctx,
 		if (s_idx != -1)
 			goto fail;
 
-		psbt_add_input(clone,
-			       &changes->added_ins[i].tx_input,
-			       idx);
+		const struct wally_psbt_input *input = &changes->added_ins[i].input;
+		struct bitcoin_outpoint outpoint;
+		wally_psbt_input_get_outpoint(input, &outpoint);
+		psbt_append_input(clone,
+					&outpoint,
+                    input->sequence,
+                    NULL /* scriptSig */,
+                    NULL /* input_wscript */,
+                    NULL /* redeemscript */);
+
 		/* Move the input over */
 		clone->inputs[idx] = *in;
 
@@ -175,9 +180,9 @@ static bool update_parent_psbt(const tal_t *ctx,
 		if (s_idx != -1)
 			goto fail;
 
-		psbt_add_output(clone,
-				&changes->added_outs[i].tx_output,
-				idx);
+		const struct wally_psbt_output *output = &changes->added_outs[i].output;
+		psbt_append_output(clone, output->script, amount_sat(output->amount));
+
 		/* Move output over */
 		clone->outputs[idx] = *out;
 
@@ -210,24 +215,9 @@ static bool update_parent_psbt(const tal_t *ctx,
 			goto fail;
 	}
 
-	/* We want to preserve the memory bits associated with
-	 * the inputs/outputs we just copied over when we free
-	 * the copy, so remove ones the *added* from the copy.
-	 * We go from the back since this will modify the indexes */
-	for (size_t i = tal_count(changes->added_ins) - 1;
-	     i > -1;
-	     i--) {
-		psbt_rm_input(new_node_copy,
-			      changes->added_ins[i].idx);
-	}
-	for (size_t i = tal_count(changes->added_outs) - 1;
-	     i > -1;
-	     i--) {
-		psbt_rm_output(new_node_copy,
-			      changes->added_outs[i].idx);
-	}
-
 	tal_free(changes);
+	/* All those new_node_copy children are owned by clone
+	 * already, so shallow copying them above was fine. */
 	tal_free(new_node_copy);
 
 	tal_free(*parent_psbt);
@@ -264,7 +254,7 @@ static bool update_node_psbt(const tal_t *ctx,
 	/* Only failure is alloc */
 	if (wally_psbt_clone_alloc(parent_psbt, 0, &clone) != WALLY_OK)
 		abort();
-	tal_wally_end(tal_steal(ctx, clone));
+	tal_wally_end_onto(ctx, clone, struct wally_psbt);
 
 	/* For every peer's input/output, flip the serial id
 	 * on the clone. They should all be present. */
@@ -340,8 +330,11 @@ openchannel_finished(struct multifundchannel_command *mfc)
 			struct json_stream *out;
 
 			plugin_log(mfc->cmd->plugin, LOG_DBG,
-				   "mfc %"PRIu64": %u failed, failing.",
-				   mfc->id, dest->index);
+				   "mfc %"PRIu64": %u failed, failing."
+				  " (%d) %s",
+				   mfc->id, dest->index,
+				   dest->error_code,
+				   dest->error_message);
 
 			out = jsonrpc_stream_fail_data(mfc->cmd,
 						       dest->error_code,
@@ -349,7 +342,9 @@ openchannel_finished(struct multifundchannel_command *mfc)
 			json_add_node_id(out, "id", &dest->id);
 			json_add_string(out, "method", "openchannel_signed");
 			if (dest->error_data)
-				json_add_jsonstr(out, "data", dest->error_data);
+				json_add_jsonstr(out, "data",
+						 dest->error_data,
+						 strlen(dest->error_data));
 			json_object_end(out);
 
 			return mfc_finished(mfc, out);
@@ -371,6 +366,7 @@ after_openchannel_signed(struct multifundchannel_command *mfc)
 
 static struct command_result *
 openchannel_signed_ok(struct command *cmd,
+		      const char *method,
 		      const char *buf,
 		      const jsmntok_t *result,
 		      struct multifundchannel_destination *dest)
@@ -411,6 +407,7 @@ openchannel_signed_ok(struct command *cmd,
 
 static struct command_result *
 openchannel_signed_err(struct command *cmd,
+		       const char *method,
 		       const char *buf,
 		       const jsmntok_t *error,
 		       struct multifundchannel_destination *dest)
@@ -432,11 +429,10 @@ openchannel_signed_dest(struct multifundchannel_destination *dest)
 		   "mfc %"PRIu64", dest %u: `openchannel_signed` %s "
 		   "psbt %s",
 		   mfc->id, dest->index,
-		   type_to_string(tmpctx, struct channel_id, &dest->channel_id),
-		   type_to_string(tmpctx, struct wally_psbt, dest->psbt));
+		   fmt_channel_id(tmpctx, &dest->channel_id),
+		   fmt_wally_psbt(tmpctx, dest->psbt));
 
-	req = jsonrpc_request_start(cmd->plugin,
-				    cmd,
+	req = jsonrpc_request_start(cmd,
 				    "openchannel_signed",
 				    &openchannel_signed_ok,
 				    &openchannel_signed_err,
@@ -444,7 +440,7 @@ openchannel_signed_dest(struct multifundchannel_destination *dest)
 	json_add_channel_id(req->js, "channel_id", &dest->channel_id);
 	json_add_psbt(req->js, "signed_psbt", dest->psbt);
 
-	send_outreq(cmd->plugin, req);
+	send_outreq(req);
 }
 
 struct command_result *
@@ -527,9 +523,9 @@ check_sigs_ready(struct multifundchannel_command *mfc)
 	return command_still_pending(mfc->cmd);
 }
 
-static void json_peer_sigs(struct command *cmd,
-			   const char *buf,
-			   const jsmntok_t *params)
+static struct command_result *json_peer_sigs(struct command *cmd,
+					     const char *buf,
+					     const jsmntok_t *params)
 {
 	struct channel_id cid;
 	const struct wally_psbt *psbt;
@@ -543,7 +539,7 @@ static void json_peer_sigs(struct command *cmd,
 			JSON_SCAN_TAL(cmd, json_to_psbt, &psbt));
 	if (err)
 		plugin_err(cmd->plugin,
-			   "`openchannel_peer_sigs` did not scan: %s",
+			   "`openchannel_peer_sigs` did not scan: %s. %.*s",
 			   err, json_tok_full_len(params),
 			   json_tok_full(buf, params));
 
@@ -554,8 +550,8 @@ static void json_peer_sigs(struct command *cmd,
 		plugin_log(cmd->plugin, LOG_DBG,
 			   "mfc ??: `openchannel_peer_sigs` no "
 			   "pending dest found for channel_id %s",
-			   type_to_string(tmpctx, struct channel_id, &cid));
-		return;
+			   fmt_channel_id(tmpctx, &cid));
+		return notification_handled(cmd);
 	}
 
 	plugin_log(cmd->plugin, LOG_DBG,
@@ -572,9 +568,8 @@ static void json_peer_sigs(struct command *cmd,
 			   "mfc %"PRIu64": Unable to combine signed "
 			   "PSBT with roll-up. "
 			   "Signed %s, prev %s", dest->mfc->id,
-			   type_to_string(tmpctx, struct wally_psbt, psbt),
-			   type_to_string(tmpctx, struct wally_psbt,
-					  dest->mfc->psbt));
+			   fmt_wally_psbt(tmpctx, psbt),
+			   fmt_wally_psbt(tmpctx, dest->mfc->psbt));
 
 	tal_wally_end(dest->mfc->psbt);
 
@@ -583,14 +578,18 @@ static void json_peer_sigs(struct command *cmd,
 	 * "UPDATED" still. We check that SIGNED is hit before
 	 * we mark ourselves as ready to send the sigs, so it's ok
 	 * to relax this check */
-	if (dest->state == MULTIFUNDCHANNEL_UPDATED)
+	if (dest->state != MULTIFUNDCHANNEL_SECURED)
 		dest->state = MULTIFUNDCHANNEL_SIGNED_NOT_SECURED;
 	else {
-		assert(dest->state == MULTIFUNDCHANNEL_SECURED);
 		dest->state = MULTIFUNDCHANNEL_SIGNED;
 	}
 
+	/* Possibly free up the struct command for the mfc that
+	 * we found.  */
 	check_sigs_ready(dest->mfc);
+
+	/* Free up the struct command for *this* call.  */
+	return notification_handled(cmd);
 }
 
 /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*
@@ -612,15 +611,13 @@ funding_transaction_established(struct multifundchannel_command *mfc)
 	plugin_log(mfc->cmd->plugin, LOG_DBG,
 		   "mfc %"PRIu64": funding tx %s",
 		   mfc->id,
-		   type_to_string(tmpctx, struct bitcoin_txid,
-				  mfc->txid));
+		   fmt_bitcoin_txid(tmpctx, mfc->txid));
 
 	/* If all we've got is v2 destinations, we're just waiting
 	 * for all of our peers to send us their sigs.
-	 * That callback triggers separately, so we just return
-	 * a 'still pending' here */
+	 * Let's check if we've gotten them yet */
 	if (dest_count(mfc, FUND_CHANNEL) == 0)
-		return command_still_pending(mfc->cmd);
+		return check_sigs_ready(mfc);
 
 	/* For any v1 destination, we need to update the destination
 	 * outnum with the correct outnum on the now-known
@@ -635,8 +632,8 @@ funding_transaction_established(struct multifundchannel_command *mfc)
 		for (size_t j = 0; j < mfc->psbt->num_outputs; j++) {
 			if (memeq(dest->funding_script,
 				  tal_bytelen(dest->funding_script),
-				  mfc->psbt->tx->outputs[j].script,
-				  mfc->psbt->tx->outputs[j].script_len))
+				  mfc->psbt->outputs[j].script,
+				  mfc->psbt->outputs[j].script_len))
 				dest->outnum = j;
 		}
 		if (dest->outnum == mfc->psbt->num_outputs)
@@ -661,6 +658,7 @@ openchannel_update_returned(struct multifundchannel_destination *dest)
 
 static struct command_result *
 openchannel_update_ok(struct command *cmd,
+		      const char *method,
 		      const char *buf,
 		      const jsmntok_t *result,
 		      struct multifundchannel_destination *dest)
@@ -672,7 +670,7 @@ openchannel_update_ok(struct command *cmd,
 	plugin_log(mfc->cmd->plugin, LOG_DBG,
 		   "mfc %"PRIu64", dest %u: openchannel_update %s returned.",
 		   mfc->id, dest->index,
-		   node_id_to_hexstr(tmpctx, &dest->id));
+		   fmt_node_id(tmpctx, &dest->id));
 
 	assert(!dest->updated_psbt);
 	psbt_tok = json_get_member(buf, result, "psbt");
@@ -754,6 +752,7 @@ openchannel_update_ok(struct command *cmd,
 
 static struct command_result *
 openchannel_update_err(struct command *cmd,
+		       const char *method,
 		       const char *buf,
 		       const jsmntok_t *error,
 		       struct multifundchannel_destination *dest)
@@ -773,11 +772,10 @@ openchannel_update_dest(struct multifundchannel_destination *dest)
 		   "mfc %"PRIu64", dest %u: `openchannel_update` %s "
 		   "with psbt %s",
 		   mfc->id, dest->index,
-		   node_id_to_hexstr(tmpctx, &dest->id),
-		   type_to_string(tmpctx, struct wally_psbt, dest->psbt));
+		   fmt_node_id(tmpctx, &dest->id),
+		   fmt_wally_psbt(tmpctx, dest->psbt));
 
-	req = jsonrpc_request_start(cmd->plugin,
-				    cmd,
+	req = jsonrpc_request_start(cmd,
 				    "openchannel_update",
 				    &openchannel_update_ok,
 				    &openchannel_update_err,
@@ -785,7 +783,7 @@ openchannel_update_dest(struct multifundchannel_destination *dest)
 	json_add_channel_id(req->js, "channel_id", &dest->channel_id);
 	json_add_psbt(req->js, "psbt", dest->psbt);
 
-	send_outreq(cmd->plugin, req);
+	send_outreq(req);
 }
 
 struct command_result *
@@ -808,12 +806,13 @@ perform_openchannel_update(struct multifundchannel_command *mfc)
 						     dest->error_message);
 
 		if (dest->state == MULTIFUNDCHANNEL_SECURED ||
-			dest->state == MULTIFUNDCHANNEL_SIGNED) {
+		    dest->state == MULTIFUNDCHANNEL_SIGNED) {
 			ready_count++;
 			continue;
 		}
 
 		assert(dest->state == MULTIFUNDCHANNEL_UPDATED ||
+		       dest->state == MULTIFUNDCHANNEL_SIGNED_NOT_SECURED ||
 			dest->state == MULTIFUNDCHANNEL_STARTED);
 	}
 
@@ -892,54 +891,34 @@ openchannel_init_done(struct multifundchannel_destination *dest)
 
 static struct command_result *
 openchannel_init_ok(struct command *cmd,
+		    const char *method,
 		    const char *buf,
 		    const jsmntok_t *result,
 		    struct multifundchannel_destination *dest)
 {
 	struct multifundchannel_command *mfc = dest->mfc;
-	const jsmntok_t *psbt_tok;
-	const jsmntok_t *channel_id_tok;
-	const jsmntok_t *funding_serial_tok;
+	const char *err;
 
 	plugin_log(mfc->cmd->plugin, LOG_DBG,
 		   "mfc %"PRIu64", dest %u: openchannel_init %s done.",
 		   mfc->id, dest->index,
-		   node_id_to_hexstr(tmpctx, &dest->id));
+		   fmt_node_id(tmpctx, &dest->id));
 
-	/* We've got the PSBT and channel_id here */
-	psbt_tok = json_get_member(buf, result, "psbt");
-	if (!psbt_tok)
+	err = json_scan(mfc, buf, result,
+			"{psbt:%,"
+			"channel_id:%,"
+			"funding_serial:%,"
+			"channel_type:{bits:%}}",
+			JSON_SCAN_TAL(mfc, json_to_psbt, &dest->updated_psbt),
+			JSON_SCAN(json_to_channel_id, &dest->channel_id),
+			JSON_SCAN(json_to_u64, &dest->funding_serial),
+			JSON_SCAN_TAL(mfc, json_bits_to_channel_type, &dest->channel_type));
+	if (err) {
 		plugin_err(cmd->plugin,
-			   "openchannel_init did not return "
-			   "'psbt': %.*s",
+			   "openchannel_init bad return %.*s: %s",
 			   json_tok_full_len(result),
-			   json_tok_full(buf, result));
-	dest->updated_psbt = json_to_psbt(dest->mfc, buf, psbt_tok);
-	if (!dest->updated_psbt)
-		plugin_err(cmd->plugin,
-			   "openchannel_init returned invalid "
-			   "'psbt': %.*s",
-			   json_tok_full_len(result),
-			   json_tok_full(buf, result));
-
-	channel_id_tok = json_get_member(buf, result, "channel_id");
-	if (!channel_id_tok)
-		plugin_err(cmd->plugin,
-			   "openchannel_init did not return "
-			   "'channel_id': %.*s",
-			   json_tok_full_len(result),
-			   json_tok_full(buf, result));
-	json_to_channel_id(buf, channel_id_tok, &dest->channel_id);
-
-	funding_serial_tok = json_get_member(buf, result,
-					     "funding_serial");
-	if (!funding_serial_tok)
-		plugin_err(cmd->plugin,
-			   "openchannel_init did not return "
-			   "'funding_serial': %.*s",
-			   json_tok_full_len(result),
-			   json_tok_full(buf, result));
-	json_to_u64(buf, funding_serial_tok, &dest->funding_serial);
+			   json_tok_full(buf, result), err);
+	}
 
 	dest->state = MULTIFUNDCHANNEL_STARTED;
 
@@ -956,12 +935,13 @@ openchannel_init_ok(struct command *cmd,
 	 * logic in `perform_openchannel_update` the same. */
 	tal_wally_start();
 	wally_psbt_clone_alloc(dest->updated_psbt, 0, &dest->psbt);
-	tal_wally_end(tal_steal(mfc, dest->updated_psbt));
+	tal_wally_end_onto(mfc, dest->updated_psbt, struct wally_psbt);
 	return openchannel_init_done(dest);
 }
 
 static struct command_result *
 openchannel_init_err(struct command *cmd,
+		     const char *method,
 		     const char *buf,
 		     const jsmntok_t *error,
 		     struct multifundchannel_destination *dest)
@@ -980,9 +960,9 @@ openchannel_init_dest(struct multifundchannel_destination *dest)
 	plugin_log(cmd->plugin, LOG_DBG,
 		   "mfc %"PRIu64", dest %u: openchannel_init %s.",
 		   mfc->id, dest->index,
-		   node_id_to_hexstr(tmpctx, &dest->id));
+		   fmt_node_id(tmpctx, &dest->id));
 
-	req = jsonrpc_request_start(cmd->plugin, cmd,
+	req = jsonrpc_request_start(cmd,
 				    "openchannel_init",
 				    &openchannel_init_ok,
 				    &openchannel_init_err,
@@ -996,7 +976,7 @@ openchannel_init_dest(struct multifundchannel_destination *dest)
 	/* Copy the original parent down */
 	tal_wally_start();
 	wally_psbt_clone_alloc(mfc->psbt, 0, &dest->psbt);
-	tal_wally_end(tal_steal(mfc, dest->psbt));
+	tal_wally_end_onto(mfc, dest->psbt, struct wally_psbt);
 
 	json_add_psbt(req->js, "initialpsbt", dest->psbt);
 	if (mfc->cmtmt_feerate_str)
@@ -1021,17 +1001,126 @@ openchannel_init_dest(struct multifundchannel_destination *dest)
 		plugin_log(cmd->plugin, LOG_INFORM,
 			   "Using openchannel for %s open, "
 			   "ignoring `push_msat` of %s",
-			   node_id_to_hexstr(tmpctx, &dest->id),
-			   type_to_string(tmpctx, struct amount_msat,
-					  &dest->push_msat));
+			   fmt_node_id(tmpctx, &dest->id),
+			   fmt_amount_msat(tmpctx, dest->push_msat));
 
-	return send_outreq(cmd->plugin, req);
+	/* Request some sats from the peer! */
+	if (!amount_sat_is_zero(dest->request_amt)) {
+		json_add_string(req->js, "request_amt",
+				fmt_amount_sat(tmpctx, dest->request_amt));
+		json_add_string(req->js, "compact_lease",
+				lease_rates_tohex(tmpctx, dest->rates));
+	}
+
+	if (dest->channel_type) {
+		json_add_channel_type_arr(req->js,
+					  "channel_type", dest->channel_type);
+	}
+	return send_outreq(req);
 }
 
-void openchannel_init(struct plugin *p, const char *b, const jsmntok_t *t)
+static struct command_result *psbt_error(struct command *aux_cmd,
+					 const char *methodname,
+					 const char *buf,
+					 const jsmntok_t *result,
+					 struct channel_id *cid)
+{
+	plugin_log(aux_cmd->plugin, LOG_UNUSUAL,
+		   "Failed %s for waiting channel %s: %.*s",
+		   methodname,
+		   fmt_channel_id(tmpctx, cid),
+		   json_tok_full_len(result),
+		   json_tok_full(buf, result));
+	return aux_command_done(aux_cmd);
+}
+
+static struct command_result *sendpsbt_done(struct command *aux_cmd,
+					    const char *methodname,
+					    const char *buf,
+					    const jsmntok_t *result,
+					    struct channel_id *cid)
+{
+	plugin_log(aux_cmd->plugin, LOG_INFORM,
+		   "Signed and sent psbt for waiting channel %s",
+		   fmt_channel_id(tmpctx, cid));
+	return aux_command_done(aux_cmd);
+}
+
+static struct command_result *signpsbt_done(struct command *aux_cmd,
+					    const char *methodname,
+					    const char *buf,
+					    const jsmntok_t *result,
+					    struct channel_id *cid)
+{
+	const jsmntok_t *psbttok = json_get_member(buf, result, "signed_psbt");
+	struct wally_psbt *psbt = json_to_psbt(tmpctx, buf, psbttok);
+	struct out_req *req;
+
+	req = jsonrpc_request_start(aux_cmd, "sendpsbt",
+				    sendpsbt_done, psbt_error,
+				    cid);
+	json_add_psbt(req->js, "psbt", psbt);
+	return send_outreq(req);
+}
+
+/* If there are any channels with unsigned PSBTs in AWAITING_LOCKIN,
+ * sign them now (assume we crashed) */
+static struct command_result *list_awaiting_channels(struct command *timer_cmd,
+						     void *unused UNUSED)
+{
+	const char *buf;
+	size_t i;
+	const jsmntok_t *resp, *t, *channels;
+
+	resp = jsonrpc_request_sync(tmpctx, timer_cmd,
+				     "listpeerchannels",
+				     NULL, &buf);
+	channels = json_get_member(buf, resp, "channels");
+	json_for_each_arr(i, t, channels) {
+		struct out_req *req;
+		const char *state;
+		struct channel_id cid;
+		struct command *aux_cmd;
+		struct wally_psbt *psbt;
+		bool withheld;
+
+		if (json_scan(tmpctx, buf, t, "{state:%,channel_id:%,funding:{withheld:%,psbt:%}}",
+			      JSON_SCAN_TAL(tmpctx, json_strdup, &state),
+			      JSON_SCAN(json_tok_channel_id, &cid),
+			      JSON_SCAN(json_to_bool, &withheld),
+			      JSON_SCAN_TAL(tmpctx, json_to_psbt, &psbt)) != NULL)
+			continue;
+
+		if (!streq(state, "CHANNELD_AWAITING_LOCKIN")
+		    && !streq(state, "DUALOPEND_AWAITING_LOCKIN"))
+			continue;
+
+		if (withheld)
+			continue;
+
+		/* Don't do this sync, as it can reasonably fail! */
+		aux_cmd = aux_command(timer_cmd);
+		req = jsonrpc_request_start(aux_cmd, "signpsbt",
+					    signpsbt_done, psbt_error,
+					    tal_dup(aux_cmd, struct channel_id, &cid));
+		json_add_psbt(req->js, "psbt", psbt);
+		send_outreq(req);
+	}
+
+	return timer_complete(timer_cmd);
+}
+
+void openchannel_init(struct command *init_cmd, const char *b, const jsmntok_t *t)
 {
 	/* Initialize our list! */
 	list_head_init(&mfc_commands);
+
+	/* Recover any waiting channel funding PSBTs after plugin startup.
+	 * Signing can be slow on large wallets, and doing it during init can block
+	 * other important builtins from completing their startup handshake. */
+	global_timer(init_cmd->plugin,
+		     time_from_sec(0),
+		     list_awaiting_channels, NULL);
 }
 
 const struct plugin_notification openchannel_notifs[] = {

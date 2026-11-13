@@ -1,16 +1,8 @@
 /* Generate various query messages. */
 #include "config.h"
-#include <assert.h>
-#include <bitcoin/address.h>
-#include <bitcoin/script.h>
-#include <bitcoin/short_channel_id.h>
-#include <bitcoin/tx.h>
-#include <ccan/crc32c/crc32c.h>
 #include <ccan/err/err.h>
 #include <ccan/str/hex/hex.h>
-#include <common/gossip_constants.h>
 #include <common/utils.h>
-#include <inttypes.h>
 #include <stdio.h>
 #include <wire/peer_wire.h>
 
@@ -25,7 +17,7 @@ int main(int argc, char *argv[])
 {
 	struct bitcoin_blkid chainhash;
 	const tal_t *ctx = tal(NULL, char);
-	const u8 *msg;
+	const u8 *msg = NULL;
 
 	setup_locale();
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY |
@@ -44,7 +36,7 @@ int main(int argc, char *argv[])
 						     strtol(argv[3], NULL, 0),
 						     strtol(argv[4], NULL, 0));
 	} else if (streq(argv[1], "query_channel_range")) {
-		struct tlv_query_channel_range_tlvs *tlvs;
+		struct tlv_query_channel_range_tlvs *tlvs = NULL;
 		if (argc == 5)
 			tlvs = NULL;
 		else if (argc == 6) {
@@ -58,7 +50,7 @@ int main(int argc, char *argv[])
 						 strtol(argv[4], NULL, 0),
 						 tlvs);
 	} else if (streq(argv[1], "query_short_channel_ids")) {
-		struct tlv_query_short_channel_ids_tlvs *tlvs;
+		struct tlv_query_short_channel_ids_tlvs *tlvs = NULL;
 		u8 *encoded;
 
 		if (argc == 4)

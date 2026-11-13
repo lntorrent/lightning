@@ -1,12 +1,9 @@
 #ifndef LIGHTNING_WIRE_WIRE_H
 #define LIGHTNING_WIRE_WIRE_H
 #include "config.h"
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
-#include <common/errcode.h>
+#include <common/jsonrpc_errors.h>
+#include <common/wireaddr.h>
 #include <secp256k1_recovery.h>
-#include <stdlib.h>
-#include <wire/tlvstream.h>
 
 struct ripemd160;
 struct sha256;
@@ -18,6 +15,8 @@ typedef char utf8;
 
 /* Read the type; returns -1 if not long enough.  cursor is a tal ptr. */
 int fromwire_peektype(const u8 *cursor);
+/* Same, but doesn't need to be a tal ptr */
+int fromwire_peektypen(const u8 *cursor, size_t len);
 void *fromwire_fail(const u8 **cursor, size_t *max);
 
 void towire(u8 **pptr, const void *data, size_t len);
@@ -31,12 +30,16 @@ void towire_u8(u8 **pptr, u8 v);
 void towire_u16(u8 **pptr, u16 v);
 void towire_u32(u8 **pptr, u32 v);
 void towire_u64(u8 **pptr, u64 v);
+void towire_s8(u8 **pptr, s8 v);
+void towire_s16(u8 **pptr, s16 v);
+void towire_s32(u8 **pptr, s32 v);
+void towire_s64(u8 **pptr, s64 v);
 void towire_tu16(u8 **pptr, u16 v);
 void towire_tu32(u8 **pptr, u32 v);
 void towire_tu64(u8 **pptr, u64 v);
 void towire_pad(u8 **pptr, size_t num);
 void towire_bool(u8 **pptr, bool v);
-void towire_errcode_t(u8 **pptr, errcode_t v);
+void towire_jsonrpc_errcode(u8 **pptr, enum jsonrpc_errcode v);
 
 void towire_u8_array(u8 **pptr, const u8 *arr, size_t num);
 void towire_utf8_array(u8 **pptr, const char *arr, size_t num);
@@ -49,11 +52,15 @@ u8 fromwire_u8(const u8 **cursor, size_t *max);
 u16 fromwire_u16(const u8 **cursor, size_t *max);
 u32 fromwire_u32(const u8 **cursor, size_t *max);
 u64 fromwire_u64(const u8 **cursor, size_t *max);
+s8 fromwire_s8(const u8 **cursor, size_t *max);
+s16 fromwire_s16(const u8 **cursor, size_t *max);
+s32 fromwire_s32(const u8 **cursor, size_t *max);
+s64 fromwire_s64(const u8 **cursor, size_t *max);
 u16 fromwire_tu16(const u8 **cursor, size_t *max);
 u32 fromwire_tu32(const u8 **cursor, size_t *max);
 u64 fromwire_tu64(const u8 **cursor, size_t *max);
 bool fromwire_bool(const u8 **cursor, size_t *max);
-errcode_t fromwire_errcode_t(const u8 **cursor, size_t *max);
+enum jsonrpc_errcode fromwire_jsonrpc_errcode(const u8 **cursor, size_t *max);
 void fromwire_secp256k1_ecdsa_signature(const u8 **cursor, size_t *max,
 					secp256k1_ecdsa_signature *signature);
 void fromwire_secp256k1_ecdsa_recoverable_signature(const u8 **cursor,
@@ -70,13 +77,4 @@ u8 *fromwire_tal_arrn(const tal_t *ctx,
 char *fromwire_wirestring(const tal_t *ctx, const u8 **cursor, size_t *max);
 void fromwire_siphash_seed(const u8 **cursor, size_t *max,
 			   struct siphash_seed *seed);
-
-#if !EXPERIMENTAL_FEATURES
-/* Stubs, as this subtype is only defined when EXPERIMENTAL_FEATURES */
-struct onionmsg_path;
-
-void towire_onionmsg_path(u8 **p, const struct onionmsg_path *onionmsg_path);
-struct onionmsg_path *
-fromwire_onionmsg_path(const tal_t *ctx, const u8 **cursor, size_t *plen);
-#endif /* EXPERIMENTAL_FEATURES */
 #endif /* LIGHTNING_WIRE_WIRE_H */

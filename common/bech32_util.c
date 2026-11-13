@@ -1,6 +1,7 @@
-#include "bech32_util.h"
+#include "config.h"
 #include <ccan/tal/str/str.h>
 #include <common/bech32.h>
+#include <common/bech32_util.h>
 
 static u8 get_bit(const u8 *src, size_t bitoff)
 {
@@ -30,12 +31,16 @@ static u8 get_u5_bit(const u5 *src, size_t bitoff)
         return ((src[bitoff / 5] >> (4 - (bitoff % 5))) & 1);
 }
 
-void bech32_pull_bits(u8 **data, const u5 *src, size_t nbits)
+bool bech32_pull_bits(u8 **data, const u5 *src, size_t nbits)
 {
         size_t i;
         size_t data_len = tal_count(*data);
+	size_t pad = nbits % 8;
 
-	/* We discard trailing bits. */
+	/* More than 4 padding bits means a superfluous u5 group was added. */
+	if (pad >= 5)
+		return false;
+
         for (i = 0; i + 8 <= nbits; i += 8) {
                 tal_resize(data, data_len+1);
                 (*data)[data_len] = 0;
@@ -45,6 +50,13 @@ void bech32_pull_bits(u8 **data, const u5 *src, size_t nbits)
                 }
                 data_len++;
         }
+
+	/* Padding bits must all be zero. */
+	for (size_t b = 0; b < pad; b++) {
+		if (get_u5_bit(src, i + b))
+			return false;
+	}
+	return true;
 }
 
 /* Returns a char, tracks case. */
@@ -81,9 +93,9 @@ bool from_bech32_charset(const tal_t *ctx,
 	u5data = tal_arr(NULL, u5, datalen);
 	for (size_t i = 0; i < datalen; i++) {
 		int c = sep[1+i];
-		if (c < 0 || c > 128)
-			goto fail;
 		c = fixup_char(c, &upper, &lower);
+		if (c < 0 || c >= 128)
+			goto fail;
 		if (bech32_charset_rev[c] == -1)
 			goto fail;
 		u5data[i] = bech32_charset_rev[c];
@@ -94,7 +106,10 @@ bool from_bech32_charset(const tal_t *ctx,
 		goto fail;
 
 	*data = tal_arr(ctx, u8, 0);
-	bech32_pull_bits(data, u5data, tal_bytelen(u5data) * 5);
+	if (!bech32_pull_bits(data, u5data, tal_bytelen(u5data) * 5)) {
+		tal_free(*data);
+		goto fail;
+	}
 	tal_free(u5data);
 	return true;
 
@@ -104,6 +119,17 @@ fail:
 	return false;
 }
 
+/* BOLT #12:
+ * # Encoding
+ *...
+ * ## Requirements
+ * Writers of a bolt12 string:
+ * - MUST either use all lowercase or all UPPERCASE.
+ * - SHOULD use uppercase for QR codes.
+ * - SHOULD use lower case otherwise.
+ * - MAY use `+`, optionally followed by whitespace, to separate large bolt12 strings.
+ */
+/* We use lower case, and we leave it to the caller to upcase (and +-break) if it wants */
 char *to_bech32_charset(const tal_t *ctx,
 			const char *hrp, const u8 *data)
 {

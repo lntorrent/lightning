@@ -7,6 +7,8 @@ enum log_level {
 	/* Logging all IO. */
 	LOG_IO_OUT,
 	LOG_IO_IN,
+	/* Extra-gory logging details for deep debugging */
+	LOG_TRACE,
 	/* Gory details which are mainly good for debugging. */
 	LOG_DBG,
 	/* Information about what's going in. */
@@ -17,6 +19,9 @@ enum log_level {
 	LOG_BROKEN
 };
 #define LOG_LEVEL_MAX LOG_BROKEN
+
+/* Things that can happen in real life, but we don't expect under CI. */
+#define CI_UNEXPECTED "That's weird: "
 
 const char *log_level_name(enum log_level level);
 bool log_level_parse(const char *levelstr, size_t len,

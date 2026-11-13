@@ -1,8 +1,6 @@
 #ifndef LIGHTNING_COMMON_DIJKSTRA_H
 #define LIGHTNING_COMMON_DIJKSTRA_H
 #include "config.h"
-#include <ccan/tal/tal.h>
-#include <ccan/typesafe_cb/typesafe_cb.h>
 #include <common/amount.h>
 
 struct gossmap;
@@ -21,29 +19,26 @@ dijkstra_(const tal_t *ctx,
 			     int dir,
 			     struct amount_msat amount,
 			     void *arg),
-	  u64 (*path_score)(u32 distance,
-			    struct amount_msat cost,
-			    struct amount_msat risk),
+	  u64 (*channel_score)(struct amount_msat fee,
+			       struct amount_msat risk,
+			       /* We want to know this to compare with channel capacity */
+			       struct amount_msat total,
+			       int dir,
+			       const struct gossmap_chan *c),
 	  void *arg);
 
 #define dijkstra(ctx, map, start, amount, riskfactor, channel_ok,	\
-		 path_score, arg)					\
+		 channel_score, arg)					\
 	dijkstra_((ctx), (map), (start), (amount), (riskfactor),	\
 		  typesafe_cb_preargs(bool, void *, (channel_ok), (arg), \
 				      const struct gossmap *,		\
 				      const struct gossmap_chan *,	\
 				      int, struct amount_msat),		\
-		  (path_score),						\
+		  (channel_score),					\
 		  (arg))
 
 /* Returns UINT_MAX if unreachable. */
 u32 dijkstra_distance(const struct dijkstra *dij, u32 node_idx);
-
-/* Total CLTV delay (0 if unreachable) */
-u32 dijkstra_delay(const struct dijkstra *dij, u32 node_idx);
-
-/* Total cost to get here (-1ULL if unreachable) */
-struct amount_msat dijkstra_amount(const struct dijkstra *dij, u32 node_idx);
 
 /* Best path we found to here */
 struct gossmap_chan *dijkstra_best_chan(const struct dijkstra *dij,

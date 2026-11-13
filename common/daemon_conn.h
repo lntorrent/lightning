@@ -2,8 +2,6 @@
 #define LIGHTNING_COMMON_DAEMON_CONN_H
 
 #include "config.h"
-#include <ccan/io/io.h>
-#include <ccan/short_types/short_types.h>
 #include <common/msg_queue.h>
 
 /**
@@ -51,6 +49,28 @@ void daemon_conn_send_fd(struct daemon_conn *dc, int fd);
  */
 struct io_plan *daemon_conn_read_next(struct io_conn *conn,
 				      struct daemon_conn *dc);
+
+/**
+ * daemon_conn_read_with_fd - Read a file descriptor, call again.
+ * (arg must be same as daemon_conn_new!)
+ * When recv() wants an fd with this message.
+ */
+#define daemon_conn_read_with_fd(conn, dc, recv_fd, arg)		\
+	daemon_conn_read_with_fd_((conn), (dc),				\
+				  typesafe_cb_preargs(struct io_plan *, void *, \
+						      (recv_fd), (arg),	\
+						      struct io_conn *,	\
+						      const u8 *,	\
+						      int),		\
+				  (arg))
+
+struct io_plan *daemon_conn_read_with_fd_(struct io_conn *conn,
+					  struct daemon_conn *dc,
+					  struct io_plan *(*recv_fd)(struct io_conn *,
+								     const u8 *,
+								     int fd,
+								     void *),
+					  void *arg);
 
 /**
  * daemon_conn_sync_flush - Flush connection by sending all messages now..

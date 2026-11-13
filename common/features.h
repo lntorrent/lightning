@@ -10,9 +10,12 @@ enum feature_place {
 	NODE_ANNOUNCE_FEATURE,
 	CHANNEL_FEATURE,
 	BOLT11_FEATURE,
+	BOLT12_OFFER_FEATURE,
+	BOLT12_INVREQ_FEATURE,
+	BOLT12_INVOICE_FEATURE,
+	CHANNEL_TYPE_FEATURE,
 };
-#define NUM_FEATURE_PLACE (BOLT11_FEATURE+1)
-
+#define NUM_FEATURE_PLACE (CHANNEL_TYPE_FEATURE+1)
 extern const char *feature_place_names[NUM_FEATURE_PLACE];
 
 /* The complete set of features for all contexts */
@@ -64,12 +67,27 @@ bool feature_check_depends(const u8 *their_features,
 const char **list_supported_features(const tal_t *ctx,
 				     const struct feature_set *fset);
 
+/* Give a name for this feature */
+const char *feature_name(const tal_t *ctx, size_t f);
+
 /* Low-level helpers to deal with big-endian bitfields. */
 bool feature_is_set(const u8 *features, size_t bit);
 void set_feature_bit(u8 **ptr, u32 bit);
 
 /* Given two featurebit vectors, combine them by applying a logical OR. */
 u8 *featurebits_or(const tal_t *ctx, const u8 *f1 TAKES, const u8 *f2 TAKES);
+/* Unset a given bit in a featurebits string */
+void featurebits_unset(u8 **ptr, size_t bit);
+
+/* Are these two feature bitsets functionally equal (one may have
+ * trailing zeroes)? */
+bool featurebits_eq(const u8 *f1, const u8 *f2);
+
+/* Good for debugging: returns comma-separated string of bits. */
+const char *fmt_featurebits(const tal_t *ctx, const u8 *featurebits);
+
+struct feature_set *feature_set_dup(const tal_t *ctx,
+				    const struct feature_set *other);
 
 /* BOLT #9:
  *
@@ -84,51 +102,59 @@ u8 *featurebits_or(const tal_t *ctx, const u8 *f1 TAKES, const u8 *f2 TAKES);
 
 /* BOLT #9:
  *
- * | Bits  | Name                             |...
- * | 0/1   | `option_data_loss_protect`       |...
- * | 3     | `initial_routing_sync`           |...
- * | 4/5   | `option_upfront_shutdown_script` |...
- * | 6/7   | `gossip_queries`                 |...
- * | 8/9   | `var_onion_optin`                |...
- * | 10/11 | `gossip_queries_ex`              |...
- * | 12/13 | `option_static_remotekey`        |...
+ * | Bits  | Name                              |...
+ * | 0/1   | `option_data_loss_protect`        |... ASSUMED ...
+ * | 4/5   | `option_upfront_shutdown_script`  |... IN ...
+ * | 6/7   | `gossip_queries`                  |...
+ * | 8/9   | `var_onion_optin`                 |... ASSUMED ...
+ * | 10/11 | `gossip_queries_ex`               |... IN ...
+ * | 12/13 | `option_static_remotekey`         |... ASSUMED ...
+ * | 14/15 | `payment_secret`                  |... ASSUMED ...
+ * | 16/17 | `basic_mpp`                       |... IN9 ...
+ * | 18/19 | `option_support_large_channel`    |... IN ...
+ * | 22/23 | `option_anchors`                  |... INT ...
+ * | 24/25 | `option_route_blinding`           |... IN9 ...
+ * | 26/27 | `option_shutdown_anysegwit`       |... IN ...
+ * | 28/29 | `option_dual_fund`                |... IN ...
+ * | 34/35 | `option_quiesce`                  |... IN ...
+ * | 38/39 | `option_onion_messages`           |... IN ...
+ * | 42/43 | `option_provide_storage`          |... IN ...
+ * | 44/45 | `option_channel_type`             |... ASSUMED ...
+ * | 46/47 | `option_scid_alias`               |... INT ...
+ * | 48/49 | `option_payment_metadata`         |... 9 ...
+ * | 50/51 | `option_zeroconf`                 |... INT ...
+ * | 60/61 | `option_simple_close`             |... IN ...
+ */
+/* BOLT-splice #9:
+ * | 62/63 | `option_splice`                   |... IN ...
  */
 #define OPT_DATA_LOSS_PROTECT			0
-#define OPT_INITIAL_ROUTING_SYNC		2
 #define OPT_UPFRONT_SHUTDOWN_SCRIPT		4
-#define OPT_GOSSIP_QUERIES			6
-#define OPT_VAR_ONION				8
+#define OPT_GOSSIP_QUERIES				6
+#define OPT_VAR_ONION					8
 #define OPT_GOSSIP_QUERIES_EX			10
 #define OPT_STATIC_REMOTEKEY			12
-
-/* BOLT #9:
- *
- * | 14/15 | `payment_secret` |... IN9 ...
- * | 16/17 | `basic_mpp`      |... IN9 ...
- * | 18/19 | `option_support_large_channel` |... IN ...
- * | 20/21 | `option_anchor_outputs` |... IN ...
- */
-#define OPT_PAYMENT_SECRET			14
-#define OPT_BASIC_MPP				16
-#define OPT_LARGE_CHANNELS			18
-#define OPT_ANCHOR_OUTPUTS			20
-
-/* BOLT-4e329271a358ee52bf43ddbd96776943c5d74508 #9:
- *
- * | 26/27 | `option_shutdown_anysegwit` |... IN ...
- */
+#define OPT_PAYMENT_SECRET				14
+#define OPT_BASIC_MPP					16
+#define OPT_LARGE_CHANNELS				18
+/* FIXME: Update name to OPT_ANCHORS once old anchors is removed! */
+#define OPT_ANCHORS_ZERO_FEE_HTLC_TX	22
+#define OPT_ROUTE_BLINDING 				24
 #define OPT_SHUTDOWN_ANYSEGWIT			26
+#define OPT_DUAL_FUND 					28
+#define OPT_QUIESCE 					34
+#define OPT_ONION_MESSAGES				38
+#define OPT_PROVIDE_STORAGE				42
+#define OPT_CHANNEL_TYPE				44
+#define OPT_SCID_ALIAS					46
+#define OPT_PAYMENT_METADATA			48
+#define OPT_ZEROCONF					50
+#define OPT_SIMPLE_CLOSE				60
+#define OPT_SPLICE						62
 
-/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #9:
- * | 28/29 | `option_dual_fund` | ... IN9 ...
- */
-#define OPT_DUAL_FUND 				28
-
-/* BOLT-9fc25cfd2895578c0b1ab701ebe6c1eb67a19623 #9:
- *
- * | 102/103 | `option_onion_messages` |... INC+ ...
- */
-#define OPT_ONION_MESSAGES			102
+/* The old pre-zero-fee-anchors were deprecated, and we never supported them
+ * outside experimental options */
+#define OPT_ANCHOR_OUTPUTS_DEPRECATED	20
 
 #define OPT_SHUTDOWN_WRONG_FUNDING		104
 

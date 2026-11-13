@@ -81,6 +81,10 @@ bool taken(const void *p)
 
 	memmove(&takenarr[i-1], &takenarr[i],
 		(--num_taken - (i - 1))*sizeof(takenarr[0]));
+	if (labelarr) {
+		memmove(&labelarr[i-1], &labelarr[i],
+			(num_taken - (i - 1))*sizeof(labelarr[0]));
+	}
 	return true;
 }
 
@@ -107,13 +111,14 @@ const char *taken_any(void)
 				return labelarr[i];
 	}
 
-	sprintf(pointer_buf, "%p", takenarr[0]);
+	snprintf(pointer_buf, sizeof(pointer_buf), "%p", takenarr[0]);
 	return pointer_buf;
 }
 
 void take_cleanup(void)
 {
 	max_taken = num_taken = 0;
+	allocfail = 0;
 	free(takenarr);
 	takenarr = NULL;
 	free(labelarr);

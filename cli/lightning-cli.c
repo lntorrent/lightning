@@ -2,29 +2,23 @@
  * Helper to submit via JSON-RPC and get back response.
  */
 #include "config.h"
-#include <assert.h>
+#include "config_cli.h"
 #include <ccan/asort/asort.h>
 #include <ccan/err/err.h>
 #include <ccan/json_escape/json_escape.h>
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
-#include <ccan/str/str.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
-#include <common/json.h>
 #include <common/json_command.h>
-#include <common/memleak.h>
-#include <common/status_levels.h>
+#include <common/node_id.h>
 #include <common/utils.h>
-#include <common/version.h>
 #include <libgen.h>
 #include <stdio.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 #define NO_ERROR 0
 #define ERROR_FROM_LIGHTNINGD 1
@@ -42,7 +36,7 @@ static size_t human_readable(const char *buffer, const jsmntok_t *t, char term)
 	case JSMN_PRIMITIVE:
 	case JSMN_STRING:
 		for (i = t->start; i < t->end; i++) {
-			/* We only translate \n and \t. */
+			/* We only translate \n, \t and remove other \s. */
 			if (buffer[i] == '\\' && i + 1 < t->end) {
 				if (buffer[i+1] == 'n') {
 					fputc('\n', stdout);
@@ -53,6 +47,7 @@ static size_t human_readable(const char *buffer, const jsmntok_t *t, char term)
 					i++;
 					continue;
 				}
+				i++;
 			}
 			fputc(buffer[i], stdout);
 		}
@@ -183,13 +178,9 @@ static void human_help(char *buffer, const jsmntok_t *result)
 	unsigned int i;
 	/* `curr` is used as a temporary token */
 	const jsmntok_t *curr;
-	const char *prev_cat;
 	/* Contains all commands objects, which have the following structure :
 	 * {
-	 *     "command": "The command name and usage",
-	 *     "category": "The command category",
-	 *     "description": "The command's description",
-	 *     "verbose": "The command's detailed description"
+	 *     "command": "The command name and usage"
 	 * }
 	 */
 	const jsmntok_t * help_array = json_get_member(buffer, result, "help");
@@ -202,22 +193,11 @@ static void human_help(char *buffer, const jsmntok_t *result)
 
 	asort(help, tal_count(help), compare_help, buffer);
 
-	prev_cat = "";
 	for (i = 0; i < tal_count(help); i++) {
-		const jsmntok_t *category, *command, *desc;
-
-		category = json_get_member(buffer, help[i], "category");
-		if (category && !json_tok_streq(buffer, category, prev_cat)) {
-			prev_cat = json_strdup(help, buffer, category);
-			printf("=== %s ===\n\n", prev_cat);
-		}
-
+		const jsmntok_t *command;
 		command = json_get_member(buffer, help[i], "command");
-		desc = json_get_member(buffer, help[i], "description");
-		printf("%.*s\n",
-		       command->end - command->start, buffer + command->start);
-		printf("    %.*s\n\n",
-		       desc->end - desc->start, buffer + desc->start);
+		human_readable(buffer, command, '\n');
+		printf("\n");
 	}
 	tal_free(help);
 
@@ -281,7 +261,14 @@ static bool is_literal(const char *arg)
 	if (arglen == 0) {
 		return false;
 	}
-	return strspn(arg, "0123456789") == arglen
+	/* A string of digits with a leading zero cannot be a literal unless it
+	 * is "0". It should be passed with quotes as it might encode a hex
+	 * data. */
+	if (strspn(arg, "0123456789") == arglen && arglen > 1 &&
+	    arg[0] == '0') {
+		return false;
+	}
+	return strspn(arg, "0123456789.") == arglen
 		|| streq(arg, "true")
 		|| streq(arg, "false")
 		|| streq(arg, "null")
@@ -313,7 +300,7 @@ try_exec_man (const char *page, char *relative_to) {
 	case 0:
 		/* child, run man command. */
 		if (relative_to != NULL) {
-			page = tal_fmt(page, "%s/../doc/%s.7", relative_to, page);
+			page = tal_fmt(page, "%s/%s.7", relative_to, page);
 			execlp("man", "man", "-l", page, (char *)NULL);
 		}
 		else {
@@ -391,7 +378,7 @@ static size_t read_nofail(int fd, void *buf, size_t len)
 	ssize_t i;
 	assert(len > 0);
 
-	i = read(fd, buf, len);
+	i = cli_read(fd, buf, len);
 	if (i == 0)
 		errx(ERROR_TALKING_TO_LIGHTNINGD,
 		     "reading response: socket closed");
@@ -549,7 +536,7 @@ static bool handle_notify(const char *buf, jsmntok_t *toks,
 		snprintf(totstr, sizeof(totstr), "%u", tot);
 		printf("%*u/%s ", (int)strlen(totstr), n+1, totstr);
 		memset(bar, ' ', sizeof(bar)-1);
-		memset(bar, '=', (double)strlen(bar) / (tot-1) * n);
+		memset(bar, '=', (double)(sizeof(bar)-1) / (tot-1) * n);
 		bar[sizeof(bar)-1] = '\0';
 		printf("|%s|", bar);
 		/* Leave bar there if it's finished. */
@@ -567,9 +554,15 @@ static bool handle_notify(const char *buf, jsmntok_t *toks,
 
 static void enable_notifications(int fd)
 {
-	const char *enable = "{ \"jsonrpc\": \"2.0\", \"method\": \"notifications\", \"id\": 0, \"params\": { \"enable\": true } }";
+	const char *enable;
 	char rbuf[100];
 
+	enable = tal_fmt(tmpctx,
+			 "{\"jsonrpc\":\"2.0\","
+			 "\"method\":\"notifications\","
+			 "\"id\":\"cli:notifications#%i\","
+			 "\"params\":{\"enable\":true}}",
+			 getpid());
 	if (!write_all(fd, enable, strlen(enable)))
 		err(ERROR_TALKING_TO_LIGHTNINGD, "Writing enable command");
 
@@ -577,7 +570,7 @@ static void enable_notifications(int fd)
 	memset(rbuf, 0, sizeof(rbuf));
 	while (!strends(rbuf, "\n\n")) {
 		size_t len = strlen(rbuf);
-		if (read(fd, rbuf + len, sizeof(rbuf) - len) < 0)
+		if (cli_read(fd, rbuf + len, sizeof(rbuf) - len) <= 0)
 			err(ERROR_TALKING_TO_LIGHTNINGD,
 			    "Reading enable response");
 	}
@@ -592,19 +585,55 @@ static char *opt_set_level(const char *arg, enum log_level *level)
 	return NULL;
 }
 
-static void opt_show_level(char buf[OPT_SHOW_LEN], const enum log_level *level)
+static bool opt_show_level(char *buf, size_t len, const enum log_level *level)
 {
 	if (*level == LOG_LEVEL_MAX + 1)
-		strncpy(buf, "none", OPT_SHOW_LEN-1);
+		strncpy(buf, "none", len);
 	else
-		strncpy(buf, log_level_name(*level), OPT_SHOW_LEN-1);
+		strncpy(buf, log_level_name(*level), len);
+	return true;
+}
+
+/* The standard opt_log_stderr_exit exits with status 1 */
+static void opt_log_stderr_exit_usage(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	fprintf(stderr, "\n");
+	va_end(ap);
+	exit(ERROR_USAGE);
+}
+
+struct commando {
+	const char *peer_id;
+	const char *rune;
+};
+
+static char *opt_set_commando(const char *arg, struct commando **commando)
+{
+	size_t idlen = strcspn(arg, ":");
+	*commando = tal(NULL, struct commando);
+
+	/* We don't use common/node_id.c here, to keep dependencies minimal */
+	if (idlen != PUBKEY_CMPR_LEN * 2)
+		return "Invalid peer id";
+	(*commando)->peer_id = tal_strndup(*commando, arg, idlen);
+
+	if (arg[idlen] == '\0')
+		(*commando)->rune = NULL;
+	else
+		(*commando)->rune = tal_strdup(*commando, arg + idlen + 1);
+
+	return NULL;
 }
 
 int main(int argc, char *argv[])
 {
 	setup_locale();
 
-	int fd, i;
+	int fd;
 	size_t off;
 	const char *method;
 	char *cmd, *resp, *idstr;
@@ -612,14 +641,15 @@ int main(int argc, char *argv[])
 	jsmntok_t *toks;
 	const jsmntok_t *result, *error, *id;
 	const tal_t *ctx = tal(NULL, char);
-	char *config_filename, *lightning_dir, *net_dir, *rpc_filename;
+	char *config_filename, *base_dir, *net_dir, *rpc_filename;
 	jsmn_parser parser;
 	int parserr;
 	enum format format = DEFAULT_FORMAT;
 	enum input input = DEFAULT_INPUT;
 	enum log_level notification_level = LOG_INFORM;
 	bool last_was_progress = false;
-	char *command = NULL;
+	char *command = NULL, *filter = NULL;
+	struct commando *commando = NULL;
 
 	err_set_progname(argv[0]);
 	jsmn_init(&parser);
@@ -628,9 +658,9 @@ int main(int argc, char *argv[])
 
 	setup_option_allocators();
 
-	initial_config_opts(ctx, argc, argv,
-			    &config_filename, &lightning_dir, &net_dir,
-			    &rpc_filename);
+	opt_exitcode = ERROR_USAGE;
+	minimal_config_opts(ctx, argc, argv, &config_filename, &base_dir,
+			    &net_dir, &rpc_filename);
 
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "<command> [<params>...]", "Show this message. Use the command help (without hyphens -- \"lightning-cli help\") to get a list of all RPC commands");
@@ -649,11 +679,18 @@ int main(int argc, char *argv[])
 	opt_register_arg("-N|--notifications", opt_set_level,
 			 opt_show_level, &notification_level,
 			 "Set notification level, or none");
+	opt_register_arg("-l|--filter", opt_set_charp,
+			 opt_show_charp, &filter,
+			 "Set JSON reply filter");
+	opt_register_arg("-c|--commando", opt_set_commando,
+			 NULL, &commando,
+			 "Send this as a commando command to nodeid:rune");
 
-	opt_register_version();
+	opt_early_parse(argc, argv, opt_log_stderr_exit_usage);
+	opt_parse(&argc, argv, opt_log_stderr_exit_usage);
 
-	opt_early_parse(argc, argv, opt_log_stderr_exit);
-	opt_parse(&argc, argv, opt_log_stderr_exit);
+	/* Make sure this is parented correctly if set! */
+	tal_steal(ctx, commando);
 
 	method = argv[1];
 	if (!method) {
@@ -666,16 +703,22 @@ int main(int argc, char *argv[])
 
 	/* Launch a manpage if we have a help command with an argument. We do
 	 * not need to have lightningd running in this case. */
-	if (streq(method, "help") && format == DEFAULT_FORMAT && argc >= 3) {
+	if (streq(method, "help") && format == DEFAULT_FORMAT && argc >= 3 && !commando) {
 		command = argv[2];
 		char *page = tal_fmt(ctx, "lightning-%s", command);
 
+		/* Try to find the page in the MANPATH and PATH. */
 		try_exec_man(page, NULL);
 
 		/* Try to find the page relative to this executable.
 		 * This handles the common scenario where lightning-cli
 		 * was built from source and hasn't been installed yet */
-		try_exec_man(page, dirname(argv[0]));
+		const char *dir = dirname(argv[0]);
+		try_exec_man(page, tal_fmt(page, "%s/../doc", dir));
+
+		/* Try to find the page relative to this executable, but in the
+		 * install directory hierarchy. */
+		try_exec_man(page, tal_fmt(page, "%s/../share/man/man7", dir));
 
 		tal_free(page);
 	}
@@ -701,14 +744,40 @@ int main(int argc, char *argv[])
 		err(ERROR_TALKING_TO_LIGHTNINGD,
 		    "Connecting to '%s'", rpc_filename);
 
-	idstr = tal_fmt(ctx, "lightning-cli-%i", getpid());
+	/* We use weird methodnames in test_misc.py::test_cli(), and then
+	 * complain the cln mangles it.  So omit method in that case */
+	if (json_escape_needed(method, strlen(method)))
+		idstr = tal_fmt(ctx, "cli:weirdmethod!#%i", getpid());
+	else
+		idstr = tal_fmt(ctx, "cli:%s#%i", method, getpid());
 
-	if (notification_level <= LOG_LEVEL_MAX)
+	/* FIXME: commando should support notifications! */
+	if (notification_level <= LOG_LEVEL_MAX && !commando)
 		enable_notifications(fd);
 
 	cmd = tal_fmt(ctx,
-		      "{ \"jsonrpc\" : \"2.0\", \"method\" : \"%s\", \"id\" : \"%s\", \"params\" :",
-		      json_escape(ctx, method)->s, idstr);
+		      "{ \"jsonrpc\" : \"2.0\", \"method\" : \"%s\", \"id\" : \"%s\",",
+		      commando ? "commando" : json_escape(ctx, method)->s,
+		      idstr);
+	if (filter && !commando)
+		tal_append_fmt(&cmd, "\"filter\": %s,", filter);
+	tal_append_fmt(&cmd, " \"params\" :");
+
+	if (commando) {
+		tal_append_fmt(&cmd, "{"
+			       " \"peer_id\": \"%s\","
+			       " \"method\": \"%s\",",
+			       commando->peer_id,
+			       json_escape(ctx, method)->s);
+		if (filter) {
+			tal_append_fmt(&cmd, "\"filter\": %s,", filter);
+		}
+		if (commando->rune) {
+			tal_append_fmt(&cmd, " \"rune\": \"%s\",",
+				       commando->rune);
+		}
+		tal_append_fmt(&cmd, " \"params\": ");
+	}
 
 	if (input == DEFAULT_INPUT) {
 		/* Hacky autodetect; only matters if more than single arg */
@@ -720,7 +789,7 @@ int main(int argc, char *argv[])
 
 	if (input == KEYWORDS) {
 		tal_append_fmt(&cmd, "{ ");
-		for (i = 2; i < argc; i++) {
+		for (size_t i = 2; i < argc; i++) {
 			const char *eq = strchr(argv[i], '=');
 
 			if (!eq)
@@ -735,10 +804,14 @@ int main(int argc, char *argv[])
 		tal_append_fmt(&cmd, "} }");
 	} else {
 		tal_append_fmt(&cmd, "[ ");
-		for (i = 2; i < argc; i++)
+		for (size_t i = 2; i < argc; i++)
 			add_input(&cmd, argv[i], i, argc);
 		tal_append_fmt(&cmd, "] }");
 	}
+
+	/* For commando, "params" we just populated is inside real "params" */
+	if (commando)
+		tal_append_fmt(&cmd, "}");
 
 	toks = json_parse_simple(ctx, cmd, strlen(cmd));
 	if (toks == NULL)
@@ -761,7 +834,7 @@ int main(int argc, char *argv[])
 	while (parserr <= 0) {
 		/* Read more if parser says, or we have 0 tokens. */
 		if (parserr == 0 || parserr == JSMN_ERROR_PART) {
-			ssize_t i = read(fd, resp + off, tal_bytelen(resp) - 1 - off);
+			ssize_t i = cli_read(fd, resp + off, tal_bytelen(resp) - 1 - off);
 			if (i == 0)
 				errx(ERROR_TALKING_TO_LIGHTNINGD,
 				     "reading response: socket closed");
@@ -799,10 +872,8 @@ int main(int argc, char *argv[])
 		default:
 			if (handle_notify(resp, toks, notification_level,
 					  &last_was_progress)) {
-				/* +2 for \n\n */
-				size_t len = toks[0].end - toks[0].start + 2;
-				memmove(resp, resp + len, off - len);
-				off -= len;
+				memmove(resp, resp + toks[0].end, off - toks[0].end);
+				off -= toks[0].end;
 				jsmn_init(&parser);
 				toks[0].type = JSMN_UNDEFINED;
 				/* Don't force another read! */
@@ -860,7 +931,7 @@ int main(int argc, char *argv[])
 		}
 		tal_free(ctx);
 		opt_free_table();
-		return 0;
+		return NO_ERROR;
 	}
 
 	if (format == RAW)
@@ -872,5 +943,5 @@ int main(int argc, char *argv[])
 	}
 	tal_free(ctx);
 	opt_free_table();
-	return 1;
+	return ERROR_FROM_LIGHTNINGD;
 }

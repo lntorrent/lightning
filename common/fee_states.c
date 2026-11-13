@@ -1,8 +1,8 @@
+#include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
 #include <common/fee_states.h>
-#include <common/type_to_string.h>
 #include <wire/wire.h>
 
 /* If we're the finder, it's like an HTLC we added, if they are, it's like
@@ -47,10 +47,9 @@ struct fee_states *dup_fee_states(const tal_t *ctx,
 		return cast_const(struct fee_states *,
 				  tal_steal(ctx, fee_states));
 	n = tal_dup(ctx, struct fee_states, fee_states);
-	for (size_t i = 0; i < ARRAY_SIZE(n->feerate); i++) {
-		if (n->feerate[i])
-			n->feerate[i] = tal_dup(n, u32, n->feerate[i]);
-	}
+	for (size_t i = 0; i < ARRAY_SIZE(n->feerate); i++)
+		n->feerate[i] = tal_dup_or_null(n, u32, n->feerate[i]);
+
 	return n;
 }
 
@@ -71,6 +70,20 @@ u32 get_feerate(const struct fee_states *fee_states,
 
 	/* Some feerate should always be set! */
 	abort();
+}
+
+/* Are feerates all agreed by both sides? */
+bool feerate_changes_done(const struct fee_states *fee_states,
+			  bool ignore_uncommitted)
+{
+	size_t num_feerates = 0;
+	for (size_t i = 0; i < ARRAY_SIZE(fee_states->feerate); i++) {
+		if (ignore_uncommitted
+		    && (i == RCVD_ADD_HTLC || i == SENT_ADD_HTLC))
+			continue;
+		num_feerates += (fee_states->feerate[i] != NULL);
+	}
+	return num_feerates == 1;
 }
 
 void start_fee_update(struct fee_states *fee_states,
@@ -143,8 +156,40 @@ bool fee_states_valid(const struct fee_states *fee_states, enum side opener)
 	return fee_states->feerate[last_fee_state(opener)] != NULL;
 }
 
-static const char *fmt_fee_states(const tal_t *ctx,
-				  const struct fee_states *fee_states)
+/* The calculation starts with a 100% margin at very low fees, since
+ * they are likely to rise, and can do so quickly, whereas on the
+ * higher fee side, asking for a 100% margin is excessive, so ask for
+ * a 10% margin. In-between these two regions we interpolate
+ * linearly. Notice that minfeerate and maxfeerate are just the
+ * markers of the linear interpolation, they don't have to correspond
+ * to actual feerates seen in the network. */
+u32 marginal_feerate(u32 current_feerate)
+{
+	const u32 minfeerate = 253, maxfeerate = 45000;
+
+#ifdef TEST_ALLOW_ZERO_FEERATE
+	/* The BOLT test for commitment transactions does this. */
+	if (current_feerate == 0)
+		return 0;
+#endif
+	/* This could happen in future if we celebrate sub-sat summer! */
+	if (current_feerate < minfeerate)
+		current_feerate = minfeerate;
+	if (current_feerate > maxfeerate) {
+		u64 marginal = ((u64)current_feerate * 11) / 10;
+		if (marginal > UINT32_MAX)
+			return UINT32_MAX;
+		return marginal;
+	}
+
+	/* min gives 1, max gives 0.1 */
+	double proportion = 1.0 - ((double)current_feerate - minfeerate) / (maxfeerate - minfeerate) * 0.9;
+
+	return current_feerate + proportion * current_feerate;
+}
+
+char *fmt_fee_states(const tal_t *ctx,
+		     const struct fee_states *fee_states)
 {
 	char *ret = tal_strdup(ctx, "{");
 	for (enum htlc_state i = 0; i < ARRAY_SIZE(fee_states->feerate); i++) {
@@ -156,4 +201,3 @@ static const char *fmt_fee_states(const tal_t *ctx,
 	tal_append_fmt(&ret, " }");
 	return ret;
 }
-REGISTER_TYPE_TO_STRING(fee_states, fmt_fee_states);

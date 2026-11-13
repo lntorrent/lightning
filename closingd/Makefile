@@ -8,60 +8,26 @@ CLOSINGD_SRC := closingd/closingd.c	\
 CLOSINGD_OBJS := $(CLOSINGD_SRC:.c=.o)
 $(CLOSINGD_OBJS): $(CLOSINGD_HEADERS)
 
+# Simple close daemon
+SIMPLECLOSED_HEADERS := closingd/simpleclosed_wiregen.h
+
+SIMPLECLOSED_SRC := closingd/simpleclosed.c	\
+	$(SIMPLECLOSED_HEADERS:.h=.c)
+
+SIMPLECLOSED_OBJS := $(SIMPLECLOSED_SRC:.c=.o)
+$(SIMPLECLOSED_OBJS): $(SIMPLECLOSED_HEADERS)
+
 # Make sure these depend on everything.
-ALL_C_SOURCES += $(CLOSINGD_SRC)
-ALL_C_HEADERS += $(CLOSINGD_HEADERS)
-ALL_PROGRAMS += lightningd/lightning_closingd
+ALL_C_SOURCES += $(CLOSINGD_SRC) $(SIMPLECLOSED_SRC)
+ALL_C_HEADERS += $(CLOSINGD_HEADERS) $(SIMPLECLOSED_HEADERS)
+ALL_PROGRAMS += lightningd/lightning_closingd lightningd/lightning_simpleclosed
 
 # Here's what lightningd depends on
-LIGHTNINGD_CONTROL_HEADERS += closingd/closingd_wiregen.h
-LIGHTNINGD_CONTROL_OBJS += closingd/closingd_wiregen.o
+LIGHTNINGD_CONTROL_HEADERS += closingd/closingd_wiregen.h closingd/simpleclosed_wiregen.h
+LIGHTNINGD_CONTROL_OBJS += closingd/closingd_wiregen.o closingd/simpleclosed_wiregen.o
 
-# Common source we use.
-CLOSINGD_COMMON_OBJS :=				\
-	common/amount.o				\
-	common/base32.o				\
-	common/bigsize.o			\
-	common/bip32.o				\
-	common/channel_id.o			\
-	common/close_tx.o			\
-	common/crypto_state.o			\
-	common/crypto_sync.o			\
-	common/cryptomsg.o			\
-	common/daemon.o				\
-	common/daemon_conn.o			\
-	common/dev_disconnect.o			\
-	common/derive_basepoints.o		\
-	common/peer_status_wiregen.o		\
-	common/status_wiregen.o			\
-	common/gossip_rcvd_filter.o		\
-	common/gossip_store.o			\
-	common/htlc_wire.o			\
-	common/key_derive.o			\
-	common/memleak.o			\
-	common/msg_queue.o			\
-	common/node_id.o			\
-	common/onionreply.o			\
-	common/peer_billboard.o			\
-	common/peer_failed.o			\
-	common/per_peer_state.o			\
-	common/permute_tx.o			\
-	common/psbt_open.o			\
-	common/pseudorand.o			\
-	common/read_peer_msg.o			\
-	common/setup.o				\
-	common/socket_close.o			\
-	common/status.o				\
-	common/status_wire.o			\
-	common/subdaemon.o			\
-	common/type_to_string.o			\
-	common/utils.o				\
-	common/utxo.o				\
-	common/version.o			\
-	common/wire_error.o			\
-	common/wireaddr.o			\
-	gossipd/gossipd_peerd_wiregen.o
+lightningd/lightning_closingd: $(CLOSINGD_OBJS) $(HSMD_CLIENT_OBJS) libcommon.a
 
-lightningd/lightning_closingd: $(CLOSINGD_OBJS) $(WIRE_ONION_OBJS) $(CLOSINGD_COMMON_OBJS) $(WIRE_OBJS) $(BITCOIN_OBJS) $(HSMD_CLIENT_OBJS)
+lightningd/lightning_simpleclosed: $(SIMPLECLOSED_OBJS) $(HSMD_CLIENT_OBJS) libcommon.a
 
 -include closingd/test/Makefile

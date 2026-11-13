@@ -62,8 +62,14 @@ void *rbuf_fill_all(struct rbuf *rbuf)
 void *rbuf_fill(struct rbuf *rbuf)
 {
 	if (!rbuf_len(rbuf)) {
-		if (get_more(rbuf) < 0)
+		ssize_t r = get_more(rbuf);
+		if (r < 0)
 			return NULL;
+		/* EOF: documented NULL with errno 0. */
+		if (r == 0) {
+			errno = 0;
+			return NULL;
+		}
 	}
 	return rbuf_start(rbuf);
 }
@@ -74,9 +80,11 @@ char *rbuf_read_str(struct rbuf *rbuf, char term)
 	ssize_t r = 0;
 	size_t prev = 0;
 
-	while (!(p = memchr(membuf_elems(&rbuf->m) + prev,
-			    term,
-			    membuf_num_elems(&rbuf->m) - prev))) {
+	/* memchr(NULL, ..., 0) is illegal.  FML. */
+	while (membuf_num_elems(&rbuf->m) == prev
+	       || !(p = memchr(membuf_elems(&rbuf->m) + prev,
+			       term,
+			       membuf_num_elems(&rbuf->m) - prev))) {
 		prev += r;
 		r = get_more(rbuf);
 		if (r < 0)

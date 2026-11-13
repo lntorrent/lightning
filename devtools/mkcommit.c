@@ -8,27 +8,23 @@
    0000000000000000000000000000000000000000000000000000000000000020 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000021 0000000000000000000000000000000000000000000000000000000000000022 0000000000000000000000000000000000000000000000000000000000000023 0000000000000000000000000000000000000000000000000000000000000024 \
    0000000000000000000000000000000000000000000000000000000000000010 FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF 0000000000000000000000000000000000000000000000000000000000000011 0000000000000000000000000000000000000000000000000000000000000012 0000000000000000000000000000000000000000000000000000000000000013 0000000000000000000000000000000000000000000000000000000000000014
  */
-#include <bitcoin/chainparams.h>
+#include "config.h"
 #include <bitcoin/script.h>
-#include <bitcoin/tx.h>
 #include <ccan/cast/cast.h>
 #include <ccan/err/err.h>
 #include <ccan/opt/opt.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/full_channel.h>
-#include <common/amount.h>
-#include <common/channel_id.h>
-#include <common/derive_basepoints.h>
+#include <common/blockheight_states.h>
+#include <common/channel_type.h>
 #include <common/fee_states.h>
 #include <common/htlc_wire.h>
 #include <common/key_derive.h>
-#include <common/keyset.h>
 #include <common/status.h>
-#include <common/type_to_string.h>
+#include <common/utils.h>
 #include <common/version.h>
 #include <inttypes.h>
-#include <stdarg.h>
 #include <stdio.h>
 
 static bool verbose = false;
@@ -103,29 +99,29 @@ static void print_basepoints(const char *desc,
 
 	printf("## %s\n", desc);
 	printf("# funding_privkey=%s\n",
-	       type_to_string(NULL, struct secret, &secrets->funding_privkey.secret));
+	       fmt_secret(NULL, &secrets->funding_privkey.secret));
 	printf("funding_pubkey=%s\n",
-	       type_to_string(NULL, struct pubkey, fundingkey));
+	       fmt_pubkey(NULL, fundingkey));
 	printf("# revocation_basepoint_secret=%s\n",
-	       type_to_string(NULL, struct secret,
+	       fmt_secret(NULL,
 			      &secrets->revocation_basepoint_secret));
 	printf("revocation_basepoint=%s\n",
-	       type_to_string(NULL, struct pubkey, &basepoints->revocation));
+	       fmt_pubkey(NULL, &basepoints->revocation));
 	printf("# payment_basepoint_secret=%s\n",
-	       type_to_string(NULL, struct secret,
+	       fmt_secret(NULL,
 			      &secrets->payment_basepoint_secret));
 	printf("payment_basepoint=%s\n",
-	       type_to_string(NULL, struct pubkey, &basepoints->payment));
+	       fmt_pubkey(NULL, &basepoints->payment));
 	printf("# delayed_payment_basepoint_secret=%s\n",
-	       type_to_string(NULL, struct secret,
+	       fmt_secret(NULL,
 			      &secrets->delayed_payment_basepoint_secret));
 	printf("delayed_payment_basepoint=%s\n",
-	       type_to_string(NULL, struct pubkey, &basepoints->delayed_payment));
+	       fmt_pubkey(NULL, &basepoints->delayed_payment));
 	printf("# htlc_basepoint_secret=%s\n",
-	       type_to_string(NULL, struct secret,
+	       fmt_secret(NULL,
 			      &secrets->htlc_basepoint_secret));
 	printf("htlc_basepoint=%s\n",
-	       type_to_string(NULL, struct pubkey, &basepoints->htlc));
+	       fmt_pubkey(NULL, &basepoints->htlc));
 	if (!per_commit_secret(shaseed, &per_commitment_secret, commitnum))
 		errx(1, "Bad deriving %s per_commitment_secret #%"PRIu64,
 		     desc, commitnum);
@@ -133,13 +129,13 @@ static void print_basepoints(const char *desc,
 		errx(1, "Bad deriving %s per_commitment_point #%"PRIu64,
 		     desc, commitnum);
 	printf("# shachain seed=%s\n",
-	       type_to_string(NULL, struct sha256, shaseed));
+	       fmt_sha256(NULL, shaseed));
 	printf("# per_commitment_secret %"PRIu64"=%s\n",
 	       commitnum,
-	       type_to_string(NULL, struct secret,  &per_commitment_secret));
+	       fmt_secret(NULL,  &per_commitment_secret));
 	printf("per_commitment_point %"PRIu64"=%s\n\n",
 	       commitnum,
-	       type_to_string(NULL, struct pubkey, &per_commitment_point));
+	       fmt_pubkey(NULL, &per_commitment_point));
 }
 
 static int parse_config(char *argv[],
@@ -153,6 +149,7 @@ static int parse_config(char *argv[],
 	config->max_htlc_value_in_flight = AMOUNT_MSAT(-1ULL);
 	config->htlc_minimum = AMOUNT_MSAT(0);
 	config->max_accepted_htlcs = 483;
+	config->max_dust_htlc_exposure_msat = AMOUNT_MSAT(-1ULL);
 
 	config->to_self_delay = atoi(argv[argnum]);
 	argnum++;
@@ -198,9 +195,9 @@ static int parse_htlc(char *argv[], struct existing_htlc ***htlcs)
 
 	printf("# HTLC %"PRIu64": %s amount=%s preimage=%s payment_hash=%s cltv=%u\n",
 	       exist->id, argv[0],
-	       type_to_string(tmpctx, struct amount_msat, &exist->amount),
-	       type_to_string(tmpctx, struct preimage, exist->payment_preimage),
-	       type_to_string(tmpctx, struct sha256, &exist->payment_hash),
+	       fmt_amount_msat(tmpctx, exist->amount),
+	       fmt_preimage(tmpctx, exist->payment_preimage),
+	       fmt_sha256(tmpctx, &exist->payment_hash),
 	       exist->cltv_expiry);
 
 	tal_arr_expand(htlcs, exist);
@@ -232,7 +229,7 @@ static char *sig_notation(const struct sha256_double *hash,
 			  const struct bitcoin_signature *sig)
 {
 	const char *pstr = tal_hexstr(NULL, privkey->secret.data, sizeof(privkey->secret.data));
-	const char *hstr = type_to_string(NULL, struct sha256_double, hash);
+	const char *hstr = fmt_sha256_double(NULL, hash);
 
 	if (verbose)
 		return tal_fmt(NULL,
@@ -252,8 +249,7 @@ int main(int argc, char *argv[])
 	u64 commitnum;
 	struct amount_sat funding_amount;
 	struct channel_id cid;
-	struct bitcoin_txid funding_txid;
-	unsigned int funding_outnum;
+	struct bitcoin_outpoint funding;
 	u32 feerate_per_kw;
 	struct pubkey local_per_commit_point, remote_per_commit_point;
 	struct bitcoin_signature local_sig, remote_sig;
@@ -270,7 +266,10 @@ int main(int argc, char *argv[])
 	struct privkey local_htlc_privkey, remote_htlc_privkey;
 	struct pubkey local_htlc_pubkey, remote_htlc_pubkey;
 	bool option_static_remotekey = false, option_anchor_outputs = false;
+	const struct channel_type *channel_type;
 	struct sha256_double hash;
+	u32 blockheight = 0;
+	int local_anchor_outnum;
 
 	setup_locale();
 	chainparams = chainparams_for_network("bitcoin");
@@ -304,7 +303,7 @@ int main(int argc, char *argv[])
 			   "Use option_static_remotekey generation rules");
 	opt_register_noarg("--option-anchor-outputs", opt_set_bool,
 			   &option_anchor_outputs,
-			   "Use option_anchor_outputs generation rules");
+			   "Use option_anchors_zero_fee_htlc_tx generation rules");
 	opt_register_version();
 
 	opt_parse(&argc, argv, opt_log_stderr_exit);
@@ -315,10 +314,10 @@ int main(int argc, char *argv[])
 	argnum = 1;
 	commitnum = atol(argv[argnum++]);
 	if (!bitcoin_txid_from_hex(argv[argnum],
-				   strlen(argv[argnum]), &funding_txid))
+				   strlen(argv[argnum]), &funding.txid))
 		errx(1, "Bad funding-txid");
 	argnum++;
-	funding_outnum = atoi(argv[argnum++]);
+	funding.n = atoi(argv[argnum++]);
 	if (!parse_amount_sat(&funding_amount, argv[argnum], strlen(argv[argnum])))
 		errx(1, "Bad funding-amount");
 	argnum++;
@@ -389,11 +388,21 @@ int main(int argc, char *argv[])
 			 &remotebase, &funding_remotekey, commitnum);
 
 	/* FIXME: option for v2? */
-	derive_channel_id(&cid, &funding_txid, funding_outnum);
+	derive_channel_id(&cid, &funding);
+
+	if (option_anchor_outputs)
+		channel_type = channel_type_anchors_zero_fee_htlc(NULL);
+	else if (option_static_remotekey)
+		channel_type = channel_type_static_remotekey(NULL);
+	else
+		channel_type = channel_type_none_obsolete(NULL);
 
 	channel = new_full_channel(NULL,
 				   &cid,
-				   &funding_txid, funding_outnum, 1,
+				   &funding, 1,
+				   take(new_height_states(NULL, fee_payer,
+							  &blockheight)),
+				   0, /* Defaults to no lease */
 				   funding_amount,
 				   local_msat,
 				   take(new_fee_states(NULL, fee_payer,
@@ -401,8 +410,8 @@ int main(int argc, char *argv[])
 				   &localconfig, &remoteconfig,
 				   &localbase, &remotebase,
 				   &funding_localkey, &funding_remotekey,
-				   option_static_remotekey,
-				   option_anchor_outputs,
+				   channel_type,
+				   false,
 				   fee_payer);
 
 	if (!channel_force_htlcs(channel,
@@ -413,15 +422,16 @@ int main(int argc, char *argv[])
 	if (!per_commit_point(&localseed, &local_per_commit_point, commitnum))
 		errx(1, "Bad deriving local per-commitment-point");
 
-	local_txs = channel_txs(NULL, &htlcmap, NULL, &funding_wscript, channel,
+	local_txs = channel_txs(NULL, &channel->funding, channel->funding_sats,
+				&htlcmap, NULL, &funding_wscript, channel,
 				&local_per_commit_point, commitnum,
-				LOCAL);
+				LOCAL, 0, 0, &local_anchor_outnum, NULL);
 
 	printf("## local_commitment\n"
 	       "# input amount %s, funding_wscript %s, pubkey %s\n",
-	       type_to_string(NULL, struct amount_sat, &funding_amount),
+	       fmt_amount_sat(NULL, funding_amount),
 	       tal_hex(NULL, funding_wscript),
-	       type_to_string(NULL, struct pubkey, &funding_localkey));
+	       fmt_pubkey(NULL, &funding_localkey));
 	printf("# unsigned local commitment tx: %s\n",
 	       tal_hex(NULL, linearize_tx(NULL, local_txs[0])));
 
@@ -523,15 +533,16 @@ int main(int argc, char *argv[])
 	/* Create the remote commitment tx */
 	if (!per_commit_point(&remoteseed, &remote_per_commit_point, commitnum))
 		errx(1, "Bad deriving remote per-commitment-point");
-	remote_txs = channel_txs(NULL, &htlcmap, NULL, &funding_wscript, channel,
+	remote_txs = channel_txs(NULL, &channel->funding, channel->funding_sats,
+				 &htlcmap, NULL, &funding_wscript, channel,
 				 &remote_per_commit_point, commitnum,
-				 REMOTE);
+				 REMOTE, 0, 0, &local_anchor_outnum, NULL);
 
 	printf("## remote_commitment\n"
 	       "# input amount %s, funding_wscript %s, key %s\n",
-	       type_to_string(NULL, struct amount_sat, &funding_amount),
+	       fmt_amount_sat(NULL, funding_amount),
 	       tal_hex(NULL, funding_wscript),
-	       type_to_string(NULL, struct pubkey, &funding_remotekey));
+	       fmt_pubkey(NULL, &funding_remotekey));
 	printf("# unsigned remote commitment tx: %s\n",
 	       tal_hex(NULL, linearize_tx(NULL, remote_txs[0])));
 

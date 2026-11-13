@@ -1,42 +1,49 @@
-#include <bitcoin/chainparams.h>
-#include <bitcoin/preimage.h>
-#include <ccan/array_size/array_size.h>
+#include "config.h"
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/json_out/json_out.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
-#include <ccan/time/time.h>
-#include <ccan/utf8/utf8.h>
-#include <common/blindedpath.h>
-#include <common/bolt11.h>
-#include <common/bolt12.h>
+#include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
-#include <common/dijkstra.h>
+#include <common/clock_time.h>
+#include <common/features.h>
 #include <common/gossmap.h>
+#include <common/json_param.h>
 #include <common/json_stream.h>
-#include <common/memleak.h>
+#include <common/onion_message.h>
 #include <common/overflows.h>
-#include <common/route.h>
-#include <common/type_to_string.h>
-#include <common/utils.h>
-#include <errno.h>
+#include <common/randbytes.h>
 #include <inttypes.h>
-#include <plugins/libplugin.h>
-#include <secp256k1_schnorrsig.h>
+#include <plugins/establish_onion_path.h>
+#include <plugins/fetchinvoice.h>
+#include <plugins/offers.h>
 
-static struct gossmap *global_gossmap;
-static struct node_id local_id;
 static LIST_HEAD(sent_list);
 
 struct sent {
 	/* We're in sent_invreqs, awaiting reply. */
 	struct list_node list;
-	/* The blinding factor used by reply. */
-	struct pubkey reply_blinding;
+	/* The secret used by reply */
+	struct secret *reply_secret;
 	/* The command which sent us. */
 	struct command *cmd;
 	/* The offer we are trying to get an invoice/payment for. */
 	struct tlv_offer *offer;
+
+	/* Blinded paths they told us to use (if any) */
+	struct blinded_path **their_paths;
+	/* Direct destination (used iff no their_paths) */
+	struct pubkey *direct_dest;
+	/* Key we expect to sign the invoice: the offer_issuer_id if
+	 * present, otherwise the end blinded path we sent to. */
+	struct pubkey *issuer_key;
+
+	/* When creating blinded return path, use scid not pubkey for intro node. */
+	struct short_channel_id_dir *dev_path_use_scidd;
+
+	/* Force reply path, for testing. */
+	struct pubkey *dev_reply_path;
 
 	/* The invreq we sent, OR the invoice we sent */
 	struct tlv_invoice_request *invreq;
@@ -48,39 +55,15 @@ struct sent {
 	u32 wait_timeout;
 };
 
-static struct sent *find_sent(const struct pubkey *blinding)
+static struct sent *find_sent_by_secret(const struct secret *pathsecret)
 {
 	struct sent *i;
 
 	list_for_each(&sent_list, i, list) {
-		if (pubkey_eq(&i->reply_blinding, blinding))
+		if (i->reply_secret && secret_eq_consttime(i->reply_secret, pathsecret))
 			return i;
 	}
 	return NULL;
-}
-
-static const char *field_diff_(const tal_t *a, const tal_t *b,
-			       const char *fieldname)
-{
-	/* One is set and the other isn't? */
-	if ((a == NULL) != (b == NULL))
-		return fieldname;
-	if (!memeq(a, tal_bytelen(a), b, tal_bytelen(b)))
-		return fieldname;
-	return NULL;
-}
-
-#define field_diff(a, b, fieldname) \
-	field_diff_(a->fieldname, b->fieldname, #fieldname)
-
-/* Returns true if b is a with something appended. */
-static bool description_is_appended(const char *a, const char *b)
-{
-	if (!a || !b)
-		return false;
-	if (tal_bytelen(b) < tal_bytelen(a))
-		return false;
-	return memeq(a, tal_bytelen(a), b, tal_bytelen(a));
 }
 
 /* Hack to suppress warnings when we finish a different command */
@@ -106,14 +89,14 @@ static struct command_result *handle_error(struct command *cmd,
 
 	data = json_tok_bin_from_hex(cmd, buf, errtok);
 	dlen = tal_bytelen(data);
-	err = tlv_invoice_error_new(cmd);
 	details = json_out_new(cmd);
 
 	plugin_log(cmd->plugin, LOG_DBG, "errtok = %.*s",
 		   json_tok_full_len(errtok),
 		   json_tok_full(buf, errtok));
 	json_out_start(details, NULL, '{');
-	if (!fromwire_invoice_error(&data, &dlen, err)) {
+	err = fromwire_tlv_invoice_error(cmd, &data, &dlen);
+	if (!err) {
 		plugin_log(cmd->plugin, LOG_DBG,
 			   "Invalid invoice_error %.*s",
 			   json_tok_full_len(errtok),
@@ -148,12 +131,38 @@ static struct command_result *handle_error(struct command *cmd,
 	return command_hook_success(cmd);
 }
 
+/* BOLT #12:
+ * - if the invoice is a response to an `invoice_request`:
+ *    - MUST reject the invoice if all fields in ranges 0 to 159 and 1000000000 to 2999999999 (inclusive) do not exactly match the invoice request.
+ */
+static bool invoice_matches_request(struct command *cmd,
+				    const u8 *invbin,
+				    const struct tlv_invoice_request *invreq)
+{
+	size_t ir_len1, ir_len2, ir_start1, ir_start2;
+	size_t inv_len1, inv_len2, inv_start1, inv_start2;
+	u8 *wire;
+
+	/* We linearize then strip signature.  This is dumb! */
+	wire = tal_arr(tmpctx, u8, 0);
+	towire_tlv_invoice_request(&wire, invreq);
+	ir_len1 = tlv_span(wire, 0, 159, &ir_start1);
+	ir_len2 = tlv_span(wire, 1000000000, 2999999999, &ir_start2);
+
+	inv_len1 = tlv_span(invbin, 0, 159, &inv_start1);
+	inv_len2 = tlv_span(invbin, 1000000000, 2999999999, &inv_start2);
+	return memeq(wire + ir_start1, ir_len1,
+		     invbin + inv_start1, inv_len1)
+		&& memeq(wire + ir_start2, ir_len2,
+			 invbin + inv_start2, inv_len2);
+}
+
 static struct command_result *handle_invreq_response(struct command *cmd,
 						     struct sent *sent,
 						     const char *buf,
 						     const jsmntok_t *om)
 {
-	const u8 *invbin;
+	const u8 *invbin, *cursor;
 	const jsmntok_t *invtok;
 	size_t len;
 	struct tlv_invoice *inv;
@@ -161,6 +170,12 @@ static struct command_result *handle_invreq_response(struct command *cmd,
 	struct json_stream *out;
 	const char *badfield;
 	u64 *expected_amount;
+	const struct recurrence *recurrence;
+	u64 starttime, endtime;
+	u64 next_counter, next_period_idx;
+	u64 paywindow_start, paywindow_end;
+	bool have_next_period = false;
+	char *error;
 
 	invtok = json_get_member(buf, om, "invoice");
 	if (!invtok) {
@@ -177,182 +192,196 @@ static struct command_result *handle_invreq_response(struct command *cmd,
 	}
 
 	invbin = json_tok_bin_from_hex(cmd, buf, invtok);
+	cursor = invbin;
 	len = tal_bytelen(invbin);
-	inv = tlv_invoice_new(cmd);
- 	if (!fromwire_invoice(&invbin, &len, inv)) {
+ 	inv = fromwire_tlv_invoice(cmd, &cursor, &len);
+	if (!inv) {
 		badfield = "invoice";
 		goto badinv;
 	}
 
-	/* BOLT-offers #12:
-	 * - MUST reject the invoice unless `node_id` is equal to the offer.
+	/* Raw send?  Just fwd reply. */
+	if (plugin_developer_mode(cmd->plugin) && !sent->offer) {
+		out = jsonrpc_stream_success(sent->cmd);
+		json_add_string(out, "invoice", invoice_encode(tmpctx, inv));
+		discard_result(command_finished(sent->cmd, out));
+		return command_hook_success(cmd);
+	}
+
+	/* BOLT #12:
+	 * - if the invoice is a response to an `invoice_request`:
+	 * - MUST reject the invoice if all fields in ranges 0 to 159 and
+         *   1000000000 to 2999999999 (inclusive) do not exactly match the
+         *   invoice request.
 	 */
-	if (!pubkey32_eq(sent->offer->node_id, inv->node_id)) {
-		badfield = "node_id";
+	if (!invoice_matches_request(cmd, invbin, sent->invreq)) {
+		badfield = "invoice_request match";
 		goto badinv;
 	}
 
-	/* BOLT-offers #12:
+	/* BOLT #12:
+	 * A reader of an invoice:
+	 *   - MUST reject the invoice if `invoice_amount` is not present.
+	 *   - MUST reject the invoice if `invoice_created_at` is not present.
+	 *   - MUST reject the invoice if `invoice_payment_hash` is not present.
+	 *   - MUST reject the invoice if `invoice_node_id` is not present.
+	 */
+	if (!inv->invoice_amount) {
+		badfield = "invoice_amount";
+		goto badinv;
+	}
+	if (!inv->invoice_created_at) {
+		badfield = "invoice_amount";
+		goto badinv;
+	}
+	if (!inv->invoice_payment_hash) {
+		badfield = "invoice_payment_hash";
+		goto badinv;
+	}
+	if (!inv->invoice_node_id) {
+		badfield = "invoice_node_id";
+		goto badinv;
+	}
+	/* BOLT #12:
+	 * - if `offer_issuer_id` is present (invoice_request for an offer):
+	 *   - MUST reject the invoice if `invoice_node_id` is not equal to `offer_issuer_id`
+	 * - otherwise, if `offer_paths` is present (invoice_request for an offer without id):
+	 *   - MUST reject the invoice if `invoice_node_id` is not equal to the final
+	 *    `blinded_node_id` it sent the invoice request to.
+	 */
+	/* Either way, we save the expected id in issuer_key */
+	if (!pubkey_eq(inv->invoice_node_id, sent->issuer_key)) {
+		badfield = "invoice_node_id";
+		goto badinv;
+	}
+
+	/* BOLT #12:
 	 *   - MUST reject the invoice if `signature` is not a valid signature
-	 *      using `node_id` as described in [Signature Calculation]
+	 *      using `invoice_node_id` as described in [Signature Calculation]
 	 */
 	merkle_tlv(inv->fields, &merkle);
 	sighash_from_merkle("invoice", "signature", &merkle, &sighash);
 
 	if (!inv->signature
-	    || secp256k1_schnorrsig_verify(secp256k1_ctx, inv->signature->u8,
-					   sighash.u.u8, &inv->node_id->pubkey) != 1) {
+	    || !check_schnorr_sig(&sighash, &inv->invoice_node_id->pubkey, inv->signature)) {
 		badfield = "signature";
 		goto badinv;
 	}
 
-	/* BOLT-offers #12:
-	 * - MUST reject the invoice if `msat` is not present.
-	 */
-	if (!inv->amount) {
-		badfield = "amount";
-		goto badinv;
-	}
-
-	/* BOLT-offers #12:
-	 * - MUST reject the invoice unless `offer_id` is equal to the id of the
-	 *   offer.
-	 */
-	if ((badfield = field_diff(sent->invreq, inv, offer_id)))
-		goto badinv;
-
-	/* BOLT-offers #12:
-	 * - if the invoice is a reply to an `invoice_request`:
-	 *...
-	 *   - MUST reject the invoice unless the following fields are equal or
-	 *     unset exactly as they are in the `invoice_request:`
-	 *     - `quantity`
-	 *     - `recurrence_counter`
-	 *     - `recurrence_start`
-	 *     - `payer_key`
-	 *     - `payer_info`
-	 */
-	if ((badfield = field_diff(sent->invreq, inv, quantity)))
-		goto badinv;
-	if ((badfield = field_diff(sent->invreq, inv, recurrence_counter)))
-		goto badinv;
-	if ((badfield = field_diff(sent->invreq, inv, recurrence_start)))
-		goto badinv;
-	if ((badfield = field_diff(sent->invreq, inv, payer_key)))
-		goto badinv;
-	if ((badfield = field_diff(sent->invreq, inv, payer_info)))
-		goto badinv;
-
-	/* Get the amount we expected. */
-	if (sent->offer->amount && !sent->offer->currency) {
+	/* Get the amount we expected: firstly, if that's what we sent,
+	 * secondly, if specified in the invoice. */
+	if (inv->invreq_amount) {
+		expected_amount = tal_dup(tmpctx, u64, inv->invreq_amount);
+	} else if (inv->offer_amount && !inv->offer_currency) {
 		expected_amount = tal(tmpctx, u64);
 
-		*expected_amount = *sent->offer->amount;
-		if (sent->invreq->quantity) {
+		*expected_amount = *inv->offer_amount;
+		if (inv->invreq_quantity) {
 			/* We should never have sent this! */
 			if (mul_overflows_u64(*expected_amount,
-					      *sent->invreq->quantity)) {
+					      *inv->invreq_quantity)) {
 				badfield = "quantity overflow";
 				goto badinv;
 			}
-			*expected_amount *= *sent->invreq->quantity;
+			*expected_amount *= *inv->invreq_quantity;
 		}
 	} else
 		expected_amount = NULL;
 
-	/* BOLT-offers #12:
-	 * - if the offer contained `recurrence`:
-	 *   - MUST reject the invoice if `recurrence_basetime` is not set.
+	recurrence = invoice_recurrence(inv);
+
+	/* BOLT-recurrence #12:
+	 * - if `offer_recurrence_optional` or `offer_recurrence_compulsory` are present:
+	 *    - MUST reject the invoice if `invoice_recurrence_basetime` is not present.
 	 */
-	if (sent->invreq->recurrence_counter && !inv->recurrence_basetime) {
-		badfield = "recurrence_basetime";
+	if (recurrence && !inv->invoice_recurrence_basetime) {
+		badfield = "invoice_recurrence_basetime";
 		goto badinv;
 	}
 
-	/* BOLT-offers #12:
-	 * - SHOULD confirm authorization if the `description` does not exactly
-	 *   match the `offer`
-	 *   - MAY highlight if `description` has simply had a change appended.
-	 */
-	/* We highlight these changes to the caller, for them to handle */
-	out = jsonrpc_stream_success(sent->cmd);
-	json_add_string(out, "invoice", invoice_encode(tmpctx, inv));
-	json_object_start(out, "changes");
-	if (field_diff(sent->offer, inv, description)) {
-		/* Did they simply append? */
-		if (description_is_appended(sent->offer->description,
-					    inv->description)) {
-			size_t off = tal_bytelen(sent->offer->description);
-			json_add_stringn(out, "description_appended",
-					 inv->description + off,
-					 tal_bytelen(inv->description) - off);
-		} else if (!inv->description)
-			json_add_stringn(out, "description_removed",
-					 sent->offer->description,
-					 tal_bytelen(sent->offer->description));
-		else
-			json_add_stringn(out, "description",
-					 inv->description,
-					 tal_bytelen(inv->description));
+	/* CLN's recurrence policy */
+	if (inv->invoice_recurrence_basetime &&
+	    *inv->invoice_recurrence_basetime > OFFER_RECURRENCE_MAX_BASETIME) {
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "invoice_recurrence_basetime (%" PRIu64
+			   ") exceeds CLN maximum %" PRIu64,
+			   *inv->invoice_recurrence_basetime,
+			   (u64)OFFER_RECURRENCE_MAX_BASETIME);
+		badfield = "invoice_recurrence_basetime";
+		goto badinv;
 	}
 
-	/* BOLT-offers #12:
-	 * - SHOULD confirm authorization if `vendor` does not exactly
-	 *   match the `offer`
-	 */
-	if (field_diff(sent->offer, inv, vendor)) {
-		if (!inv->vendor)
-			json_add_stringn(out, "vendor_removed",
-					 sent->offer->vendor,
-					 tal_bytelen(sent->offer->vendor));
-		else
-			json_add_stringn(out, "vendor",
-					 inv->vendor,
-					 tal_bytelen(inv->vendor));
+	error = invoice_check_recurrence_policy(tmpctx, inv);
+	if (error) {
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "invoice recurrence policy check failed: %s", error);
+		badfield = "recurrence";
+		goto badinv;
 	}
-	/* BOLT-offers #12:
-	 *   - SHOULD confirm authorization if `msat` is not within the amount
-	 *     range authorized.
-	 */
-	/* We always tell them this unless it's trivial to calc and
-	 * exactly as expected. */
-	if (!expected_amount || *inv->amount != *expected_amount)
-		json_add_amount_msat_only(out, "msat",
-					  amount_msat(*inv->amount));
-	json_object_end(out);
 
-	/* We tell them about next period at this point, if any. */
-	if (sent->offer->recurrence) {
-		u64 next_counter, next_period_idx;
-		u64 paywindow_start, paywindow_end;
+	if (recurrence) {
+		next_counter = *inv->invreq_recurrence_counter + 1;
 
-		next_counter = *sent->invreq->recurrence_counter + 1;
-		if (sent->invreq->recurrence_start)
-			next_period_idx = *sent->invreq->recurrence_start
+		if (inv->invreq_recurrence_start)
+			next_period_idx = *inv->invreq_recurrence_start
 				+ next_counter;
 		else
 			next_period_idx = next_counter;
 
+		if (!inv->offer_recurrence_limit ||
+		    next_period_idx <= *inv->offer_recurrence_limit) {
+			have_next_period = true;
+
+			if (!offer_period_start(
+				&starttime, *inv->invoice_recurrence_basetime,
+				next_period_idx, recurrence) ||
+			    !offer_period_start(
+				&endtime, *inv->invoice_recurrence_basetime,
+				next_period_idx + 1, recurrence)) {
+				badfield = "invoice_recurrence_basetime or "
+					   "next_period_idx";
+				goto badinv;
+			}
+			endtime -= 1;
+
+			if (!offer_period_paywindow(
+				recurrence, inv->offer_recurrence_paywindow,
+				inv->offer_recurrence_base,
+				*inv->invoice_recurrence_basetime,
+				next_period_idx, &paywindow_start,
+				&paywindow_end)) {
+				badfield = "invoice_recurrence_basetime or "
+					   "next_period_idx";
+				goto badinv;
+			}
+		}
+	}
+
+	out = jsonrpc_stream_success(sent->cmd);
+	json_add_string(out, "invoice", invoice_encode(tmpctx, inv));
+	json_object_start(out, "changes");
+	/* BOLT #12:
+	 *   - SHOULD confirm authorization if `invoice_amount`.`msat` is not within
+	 *     the amount range authorized.
+	 */
+	/* We always tell them this unless it's trivial to calc and
+	 * exactly as expected. */
+	if (!expected_amount || *inv->invoice_amount != *expected_amount) {
+		json_add_amount_msat(out, "amount_msat",
+				     amount_msat(*inv->invoice_amount));
+	}
+	json_object_end(out);
+
+	/* We tell them about next period at this point, if any. */
+	if (recurrence) {
 		/* If this was the last, don't tell them about a next! */
-		if (!sent->offer->recurrence_limit
-		    || next_period_idx <= *sent->offer->recurrence_limit) {
+		if (have_next_period) {
 			json_object_start(out, "next_period");
 			json_add_u64(out, "counter", next_counter);
-			json_add_u64(out, "starttime",
-				     offer_period_start(*inv->recurrence_basetime,
-							next_period_idx,
-							sent->offer->recurrence));
-			json_add_u64(out, "endtime",
-				     offer_period_start(*inv->recurrence_basetime,
-							next_period_idx + 1,
-							sent->offer->recurrence) - 1);
 
-			offer_period_paywindow(sent->offer->recurrence,
-					       sent->offer->recurrence_paywindow,
-					       sent->offer->recurrence_base,
-					       *inv->recurrence_basetime,
-					       next_period_idx,
-					       &paywindow_start, &paywindow_end);
+			json_add_u64(out, "starttime", starttime);
+			json_add_u64(out, "endtime", endtime);
+
 			json_add_u64(out, "paywindow_start", paywindow_start);
 			json_add_u64(out, "paywindow_end", paywindow_end);
 			json_object_end(out);
@@ -373,32 +402,31 @@ badinv:
 	return command_hook_success(cmd);
 }
 
-static struct command_result *recv_onion_message(struct command *cmd,
-						 const char *buf,
-						 const jsmntok_t *params)
+struct command_result *handle_invoice_onion_message(struct command *cmd,
+						    const char *buf,
+						    const jsmntok_t *om,
+						    const struct secret *pathsecret)
 {
-	const jsmntok_t *om, *blindingtok;
 	struct sent *sent;
-	struct pubkey blinding;
 	struct command_result *err;
 
-	om = json_get_member(buf, params, "onion_message");
-	blindingtok = json_get_member(buf, om, "blinding_in");
-	if (!blindingtok || !json_to_pubkey(buf, blindingtok, &blinding))
-		return command_hook_success(cmd);
+	/* BOLT #4:
+	 * - otherwise (it is the final node):
+	 *   - if `path_id` is set and corresponds to a path the reader has previously published in a `reply_path`:
+	 *     - if the onion message is not a reply to that previous onion:
+	 *       - MUST ignore the onion message
+	 *   - otherwise (unknown or unset `path_id`):
+	 *     - if the onion message is a reply to an onion message which contained a `path_id`:
+	 *       - MUST respond (or not respond) exactly as if it did not send the initial onion message.
+	 */
+	/* We unmarshal the path_id into our secret: if it is NULL or wrong, we exit here */
+	sent = find_sent_by_secret(pathsecret);
+	if (!sent)
+		return NULL;
 
-	sent = find_sent(&blinding);
-	if (!sent) {
-		plugin_log(cmd->plugin, LOG_DBG,
-			   "No match for onion %.*s",
-			   json_tok_full_len(om),
-			   json_tok_full(buf, om));
-		return command_hook_success(cmd);
-	}
-
-	plugin_log(cmd->plugin, LOG_DBG, "Received onion message: %.*s",
-		   json_tok_full_len(params),
-		   json_tok_full(buf, params));
+	plugin_log(cmd->plugin, LOG_DBG, "Received onion message reply for invoice_request: %.*s",
+		   json_tok_full_len(om),
+		   json_tok_full(buf, om));
 
 	err = handle_error(cmd, sent, buf, om);
 	if (err)
@@ -407,7 +435,7 @@ static struct command_result *recv_onion_message(struct command *cmd,
 	if (sent->invreq)
 		return handle_invreq_response(cmd, sent, buf, om);
 
-	return command_hook_success(cmd);
+	return NULL;
 }
 
 static void destroy_sent(struct sent *sent)
@@ -416,44 +444,36 @@ static void destroy_sent(struct sent *sent)
 }
 
 /* We've received neither a reply nor a payment; return failure. */
-static void timeout_sent_invreq(struct sent *sent)
+static struct command_result *timeout_sent_invreq(struct command *timer_cmd,
+						  struct sent *sent)
 {
 	/* This will free sent! */
 	discard_result(command_fail(sent->cmd, OFFER_TIMEOUT,
 				    "Timeout waiting for response"));
+	return timer_complete(timer_cmd);
+}
+
+static struct command_result *cancelrecurringinvoice_done(struct command *cmd,
+							  struct sent *sent)
+{
+	return command_success(cmd,
+			       json_out_obj(cmd, "bolt12",
+					    invrequest_encode(tmpctx, sent->invreq)));
 }
 
 static struct command_result *sendonionmsg_done(struct command *cmd,
+						const char *method UNUSED,
 						const char *buf UNUSED,
 						const jsmntok_t *result UNUSED,
 						struct sent *sent)
 {
-	tal_steal(cmd, plugin_timer(cmd->plugin,
-				    time_from_sec(sent->wait_timeout),
-				    timeout_sent_invreq, sent));
-	sent->cmd = cmd;
-	list_add_tail(&sent_list, &sent->list);
-	tal_add_destructor(sent, destroy_sent);
+	if (sent->invreq && sent->invreq->invreq_recurrence_cancel)
+		return cancelrecurringinvoice_done(cmd, sent);
+
+	command_timer(cmd,
+		      time_from_sec(sent->wait_timeout),
+		      timeout_sent_invreq, sent);
 	return command_still_pending(cmd);
-}
-
-static void init_gossmap(struct plugin *plugin)
-{
-	global_gossmap
-		= notleak_with_children(gossmap_load(NULL,
-						     GOSSIP_STORE_FILENAME));
-	if (!global_gossmap)
-		plugin_err(plugin, "Could not load gossmap %s: %s",
-			   GOSSIP_STORE_FILENAME, strerror(errno));
-}
-
-static struct gossmap *get_gossmap(struct plugin *plugin)
-{
-	if (!global_gossmap)
-		init_gossmap(plugin);
-	else
-		gossmap_refresh(global_gossmap);
-	return global_gossmap;
 }
 
 static struct command_result *param_offer(struct command *cmd,
@@ -462,19 +482,8 @@ static struct command_result *param_offer(struct command *cmd,
 					  const jsmntok_t *tok,
 					  struct tlv_offer **offer)
 {
-	char *fail;
+	const char *fail;
 
-	/* BOLT-offers #12:
-	 * - if `features` contains unknown _odd_ bits that are non-zero:
-	 *  - MUST ignore the bit.
-	 * - if `features` contains unknown _even_ bits that are non-zero:
-	 *  - MUST NOT respond to the offer.
-	 *  - SHOULD indicate the unknown bit to the user.
-	 */
-	/* BOLT-offers #12:
-	 *   - MUST NOT set or imply any `chain_hash` not set or implied by
-	 *     the offer.
-	 */
 	*offer = offer_decode(cmd, buffer + tok->start, tok->end - tok->start,
 			      plugin_feature_set(cmd->plugin), chainparams,
 			      &fail);
@@ -483,194 +492,239 @@ static struct command_result *param_offer(struct command *cmd,
 					     tal_fmt(cmd,
 						     "Unparsable offer: %s",
 						     fail));
-
-	/* BOLT-offers #12:
-	 *
-	 *  - if `node_id`, `description` or `signature` is not set:
-	 *    - MUST NOT respond to the offer.
-	 */
-	/* Note: offer_decode checks `signature` */
-	if (!(*offer)->node_id)
-		return command_fail_badparam(cmd, name, buffer, tok,
-					     "Offer does not contain a node_id");
-
-	if (!(*offer)->description)
-		return command_fail_badparam(cmd, name, buffer, tok,
-					     "Offer does not contain a description");
 	return NULL;
 }
 
-static bool can_carry_onionmsg(const struct gossmap *map,
-			       const struct gossmap_chan *c,
-			       int dir,
-			       struct amount_msat amount UNUSED,
-			       void *arg UNUSED)
+static struct blinded_path *make_reply_path(const tal_t *ctx,
+					    struct plugin *plugin,
+					    const struct sent *sent,
+					    const struct pubkey *path,
+					    struct secret *reply_secret)
 {
-	const struct gossmap_node *n;
-	/* Don't use it if either side says it's disabled */
-	if (!c->half[dir].enabled || !c->half[!dir].enabled)
-		return false;
+	struct pubkey *ids;
 
-	/* Check features of recipient */
-	n = gossmap_nth_node(map, c, !dir);
-	return n && gossmap_node_get_feature(map, n, OPT_ONION_MESSAGES) != -1;
-}
+	assert(tal_count(path) > 0);
 
-/* make_blindedpath only needs pubkeys */
-static const struct pubkey *route_backwards(const tal_t *ctx,
-					    const struct gossmap *gossmap,
-					    struct route **r)
-{
-	struct pubkey *rarr;
+	randbytes(reply_secret, sizeof(struct secret));
 
-	rarr = tal_arr(ctx, struct pubkey, tal_count(r));
-	for (size_t i = 0; i < tal_count(r); i++) {
-		const struct gossmap_node *dst;
-		struct node_id id;
+	if (sent->dev_reply_path) {
+		ids = sent->dev_reply_path;
+	} else if (tal_count(path) == 1) {
+		/* Talking to ourselves?  Reverse is the same */
+		ids = tal_dup_talarr(tmpctx, struct pubkey, path);
+	} else {
+		size_t nhops = tal_count(path), start;
+		struct node_id second_last;
 
-		dst = gossmap_nth_node(gossmap, r[i]->c, r[i]->dir);
-		gossmap_node_get_id(gossmap, dst, &id);
-		/* We're going backwards */
-		if (!pubkey_from_node_id(&rarr[tal_count(rarr) - 1 - i], &id))
-			abort();
+		/* Usually we have path A->B->C and we make
+		 * reply B->A.  But if B is not public,
+		 * we need to use the full thing.
+		 *
+		 * This happens when we connect directly to the
+		 * head of a blinded path, but we're not a public
+		 * node.
+		 */
+		node_id_from_pubkey(&second_last, &path[nhops-2]);
+		if (!gossmap_find_node(get_gossmap(plugin), &second_last))
+			start = nhops - 1;
+		else
+			start = nhops - 2;
+
+		/* FIXME: Could create an independent reply path, not just
+		 * reverse existing. */
+		ids = tal_arr(tmpctx, struct pubkey, start + 1);
+		for (int i = start; i >= 0; i--)
+			ids[start - i] = path[i];
 	}
 
-	return rarr;
+	plugin_log(plugin, LOG_DBG, "Reply path:");
+	for (size_t i = 0; i < tal_count(ids); i++)
+		plugin_log(plugin, LOG_DBG, "...%s", fmt_pubkey(tmpctx, &ids[i]));
+
+	/* Reply path */
+	return incoming_message_blinded_path(ctx, ids, NULL, reply_secret);
+}
+
+/* Container while we're establishing paths */
+struct establishing_paths {
+	/* Index into sent->their_paths, if that's not NULL */
+	int which_blinded_path;
+	struct sent *sent;
+	struct tlv_onionmsg_tlv *final_tlv;
+	/* Do we want a reply? */
+	bool want_reply;
+	struct command_result *(*done)(struct command *cmd,
+				       const char *method UNUSED,
+				       const char *buf UNUSED,
+				       const jsmntok_t *result UNUSED,
+				       struct sent *sent);
+};
+
+static const struct blinded_path *current_their_path(const struct establishing_paths *epaths)
+{
+	if (epaths->sent->direct_dest)
+		return NULL;
+	assert(epaths->which_blinded_path < tal_count(epaths->sent->their_paths));
+	return epaths->sent->their_paths[epaths->which_blinded_path];
+}
+
+static struct command_result *establish_path_done(struct command *cmd,
+						  const struct pubkey *path,
+						  struct establishing_paths *epaths)
+{
+	struct onion_message *omsg;
+	struct sent *sent = epaths->sent;
+	struct tlv_onionmsg_tlv *final_tlv = epaths->final_tlv;
+
+	/* Create transient secret so we can validate reply! */
+	sent->reply_secret = tal(sent, struct secret);
+
+	assert(tal_count(path) > 0);
+
+	/* Add reply path to final_tlv (it already contains invoice_request/invoice) */
+	if (epaths->want_reply) {
+		final_tlv->reply_path = make_reply_path(final_tlv, cmd->plugin, sent, path, sent->reply_secret);
+
+		/* Replace first hop with scidd if they said to */
+		if (sent->dev_path_use_scidd)
+			sciddir_or_pubkey_from_scidd(&final_tlv->reply_path->first_node_id,
+						     sent->dev_path_use_scidd);
+	}
+
+	/* Put in list so we recognize reply onion message.  Note: because
+	 * onion message notification comes from a different fd than the one
+	 * we send this command to, it can actually be processed *before* we
+	 * call done() */
+	sent->cmd = cmd;
+	list_add_tail(&sent_list, &sent->list);
+	tal_add_destructor(sent, destroy_sent);
+
+	omsg = outgoing_onion_message(tmpctx, path, NULL, current_their_path(epaths), final_tlv);
+	return inject_onionmessage(cmd, omsg, epaths->done, forward_error, sent);
+}
+
+/* Mutual recursion */
+static struct command_result *try_establish(struct command *cmd,
+					    struct establishing_paths *epaths);
+
+static struct command_result *establish_path_fail(struct command *cmd,
+						  const char *why,
+						  struct establishing_paths *epaths)
+{
+	const struct blinded_path *bpath = current_their_path(epaths);
+
+	/* No blinded paths?  We fail to establish connection directly */
+	if (epaths->sent->direct_dest) {
+		return command_fail(cmd, OFFER_ROUTE_NOT_FOUND,
+				    "Failed: could not route or connect directly to %s: %s",
+				    fmt_pubkey(tmpctx, epaths->sent->direct_dest), why);
+	}
+
+	plugin_log(cmd->plugin, LOG_DBG, "establish path to %s failed: %s",
+		   fmt_sciddir_or_pubkey(tmpctx, &bpath->first_node_id), why);
+	if (epaths->which_blinded_path == tal_count(epaths->sent->their_paths) - 1) {
+		return command_fail(cmd, OFFER_ROUTE_NOT_FOUND,
+				    "Failed: could not route or connect directly to blinded path at %s: %s",
+				    fmt_sciddir_or_pubkey(tmpctx, &bpath->first_node_id),
+				    why);
+	}
+
+	/* Try the next one */
+	epaths->which_blinded_path++;
+	return try_establish(cmd, epaths);
+}
+
+static struct command_result *try_establish(struct command *cmd,
+					    struct establishing_paths *epaths)
+{
+	const struct offers_data *od = get_offers_data(cmd->plugin);
+	struct pubkey target;
+
+	if (epaths->sent->direct_dest) {
+		target = *epaths->sent->direct_dest;
+	} else {
+		const struct blinded_path *bpath = current_their_path(epaths);
+		struct sciddir_or_pubkey first = bpath->first_node_id;
+		if (!gossmap_scidd_pubkey(get_gossmap(cmd->plugin), &first))
+			return establish_path_fail(cmd, "Cannot resolve scidd", epaths);
+		target = first.pubkey;
+		/* BOLT #12:
+		 *     - if `offer_issuer_id` is present (invoice_request for an offer):
+		 *       - MUST reject the invoice if `invoice_node_id` is not equal to `offer_issuer_id`
+		 *     - otherwise, if `offer_paths` is present (invoice_request for an offer without id):
+		 *       - MUST reject the invoice if `invoice_node_id` is not equal to the final `blinded_node_id` it sent the invoice request to.
+		 */
+		if (epaths->sent->offer && !epaths->sent->offer->offer_issuer_id)
+			epaths->sent->issuer_key = &bpath->path[tal_count(bpath->path)-1]->blinded_node_id;
+	}
+
+	return establish_onion_path(cmd, get_gossmap(cmd->plugin), &od->id, &target,
+				    od->disable_connect,
+				    establish_path_done,
+				    establish_path_fail,
+				    epaths);
 }
 
 static struct command_result *send_message(struct command *cmd,
 					   struct sent *sent,
-					   const char *msgfield,
-					   const u8 *msgval,
+					   bool want_reply,
+					   struct tlv_onionmsg_tlv *final_tlv STEALS,
 					   struct command_result *(*done)
 					   (struct command *cmd,
+					    const char *method UNUSED,
 					    const char *buf UNUSED,
 					    const jsmntok_t *result UNUSED,
 					    struct sent *sent))
 {
-	const struct gossmap_node *dst;
-	struct gossmap *gossmap = get_gossmap(cmd->plugin);
-	const struct pubkey *backwards;
-	struct onionmsg_path **path;
-	struct pubkey blinding;
-	struct out_req *req;
-	struct node_id dstid, *nodes;
+	struct establishing_paths *epaths = tal(sent, struct establishing_paths);
 
-	/* FIXME: Use blinded path if avail. */
-	gossmap_guess_node_id(gossmap, sent->offer->node_id, &dstid);
-	dst = gossmap_find_node(gossmap, &dstid);
-	if (!dst) {
-		/* Try direct. */
-		struct pubkey *us = tal_arr(tmpctx, struct pubkey, 1);
-		if (!pubkey_from_node_id(&us[0], &local_id))
-			abort();
-		backwards = us;
+	epaths->which_blinded_path = 0;
+	epaths->sent = sent;
+	epaths->final_tlv = tal_steal(epaths, final_tlv);
+	epaths->done = done;
+	epaths->want_reply = want_reply;
 
-		nodes = tal_arr(tmpctx, struct node_id, 1);
-		/* We don't know the pubkey y-sign, but sendonionmessage will
-		 * fix it up if we guess wrong. */
-		nodes[0].k[0] = SECP256K1_TAG_PUBKEY_EVEN;
-		secp256k1_xonly_pubkey_serialize(secp256k1_ctx,
-						 nodes[0].k+1,
-						 &sent->offer->node_id->pubkey);
-	} else {
-		struct route **r;
-		const struct dijkstra *dij;
-		const struct gossmap_node *src;
-
-		/* If we don't exist in gossip, routing can't happen. */
-		src = gossmap_find_node(gossmap, &local_id);
-		if (!src)
-			return command_fail(cmd, PAY_ROUTE_NOT_FOUND,
-					    "We don't have any channels");
-
-		dij = dijkstra(tmpctx, gossmap, dst, AMOUNT_MSAT(0), 0,
-			       can_carry_onionmsg, route_score_shorter, NULL);
-
-		r = route_from_dijkstra(tmpctx, gossmap, dij, src);
-		if (!r)
-			/* FIXME: try connecting directly. */
-			return command_fail(cmd, OFFER_ROUTE_NOT_FOUND,
-					    "Can't find route");
-
-		backwards = route_backwards(tmpctx, gossmap, r);
-		nodes = tal_arr(tmpctx, struct node_id, tal_count(r));
-		for (size_t i = 0; i < tal_count(r); i++) {
-			gossmap_node_get_id(gossmap,
-					    gossmap_nth_node(gossmap, r[i]->c, !r[i]->dir),
-					    &nodes[i]);
-		}
-	}
-
-	/* FIXME: Maybe we should allow this? */
-	if (tal_bytelen(backwards) == 0)
-		return command_fail(cmd, PAY_ROUTE_NOT_FOUND,
-				    "Refusing to talk to ourselves");
-
-	/* Ok, now make reply for onion_message */
-	path = make_blindedpath(tmpctx, backwards, &blinding,
-				&sent->reply_blinding);
-
-	req = jsonrpc_request_start(cmd->plugin, cmd, "sendonionmessage",
-				    done,
-				    forward_error,
-				    sent);
-	json_array_start(req->js, "hops");
-	for (size_t i = 0; i < tal_count(nodes); i++) {
-		json_object_start(req->js, NULL);
-		json_add_node_id(req->js, "id", &nodes[i]);
-		if (i == tal_count(nodes) - 1)
-			json_add_hex_talarr(req->js, msgfield, msgval);
-		json_object_end(req->js);
-	}
-	json_array_end(req->js);
-
-	json_object_start(req->js, "reply_path");
-	json_add_pubkey(req->js, "blinding", &blinding);
-	json_array_start(req->js, "path");
-	for (size_t i = 0; i < tal_count(path); i++) {
-		json_object_start(req->js, NULL);
-		json_add_pubkey(req->js, "id", &path[i]->node_id);
-		if (path[i]->enctlv)
-			json_add_hex_talarr(req->js, "enctlv", path[i]->enctlv);
-		json_object_end(req->js);
-	}
-	json_array_end(req->js);
-	json_object_end(req->js);
-	return send_outreq(cmd->plugin, req);
+	return try_establish(cmd, epaths);
 }
 
 /* We've received neither a reply nor a payment; return failure. */
-static void timeout_sent_inv(struct sent *sent)
+static struct command_result *timeout_sent_inv(struct command *timer_cmd,
+					       struct sent *sent)
 {
 	struct json_out *details = json_out_new(sent);
 
+	json_out_start(details, NULL, '{');
 	json_out_addstr(details, "invstring", invoice_encode(tmpctx, sent->inv));
+	json_out_end(details, '}');
+
 	/* This will free sent! */
 	discard_result(command_done_err(sent->cmd, OFFER_TIMEOUT,
 					"Failed: timeout waiting for response",
 					details));
+	return timer_complete(timer_cmd);
 }
 
 static struct command_result *prepare_inv_timeout(struct command *cmd,
+						  const char *method UNUSED,
 						  const char *buf UNUSED,
 						  const jsmntok_t *result UNUSED,
 						  struct sent *sent)
 {
-	tal_steal(cmd, plugin_timer(cmd->plugin,
-				    time_from_sec(sent->wait_timeout),
-				    timeout_sent_inv, sent));
-	return sendonionmsg_done(cmd, buf, result, sent);
+	command_timer(cmd,
+		      time_from_sec(sent->wait_timeout),
+		      timeout_sent_inv, sent);
+	return sendonionmsg_done(cmd, method, buf, result, sent);
 }
 
 static struct command_result *invreq_done(struct command *cmd,
+					  const char *method,
 					  const char *buf,
 					  const jsmntok_t *result,
 					  struct sent *sent)
 {
+	struct tlv_onionmsg_tlv *payload;
 	const jsmntok_t *t;
-	char *fail;
-	u8 *rawinvreq;
+	const char *fail;
 
 	/* Get invoice request */
 	t = json_get_member(buf, result, "bolt12");
@@ -699,267 +753,608 @@ static struct command_result *invreq_done(struct command *cmd,
 				    json_tok_full(buf, t),
 				    fail);
 
-	/* Now that's given us the previous base, check this is an OK time
-	 * to request an invoice. */
-	if (sent->invreq->recurrence_counter) {
-		u64 *base;
-		const jsmntok_t *pbtok;
-		u64 period_idx = *sent->invreq->recurrence_counter;
+	payload = tlv_onionmsg_tlv_new(sent);
+	payload->invoice_request = tal_arr(payload, u8, 0);
+	towire_tlv_invoice_request(&payload->invoice_request, sent->invreq);
 
-		if (sent->invreq->recurrence_start)
-			period_idx += *sent->invreq->recurrence_start;
+	/* BOLT #12:
+	 *   - if it chooses to send an invoice request, it sends an onion message:
+	 *     - if `offer_paths` is set:
+	 *       - MUST send the onion message via any path in `offer_paths` to the final
+	 *         `onion_msg_hop`.`blinded_node_id` in that path
+	 *     - otherwise:
+	 *       - MUST send the onion message to `offer_issuer_id`
+	 */
+	/* Don't expect a reply message for cancel */
+	return send_message(cmd, sent,
+			    sent->invreq->invreq_recurrence_cancel ? false : true,
+			    payload, sendonionmsg_done);
+}
 
-		/* BOLT-offers #12:
-		 * - if the offer contained `recurrence_limit`:
-		 *   - MUST NOT send an `invoice_request` for a period greater
-		 *     than `max_period`
-		 */
-		if (sent->offer->recurrence_limit
-		    && period_idx > *sent->offer->recurrence_limit)
-			return command_fail(cmd, LIGHTNINGD,
-					    "Can't send invreq for period %"
-					    PRIu64" (limit %u)",
-					    period_idx,
-					    *sent->offer->recurrence_limit);
+static struct command_result *param_dev_scidd(struct command *cmd, const char *name,
+					      const char *buffer, const jsmntok_t *tok,
+					      struct short_channel_id_dir **scidd)
+{
+	if (!plugin_developer_mode(cmd->plugin))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "not available outside --developer mode");
 
-		/* BOLT-offers #12:
-		 * - SHOULD NOT send an `invoice_request` for a period which has
-		 *   already passed.
-		 */
-		/* If there's no recurrence_base, we need a previous payment
-		 * for this: fortunately createinvoicerequest does that
-		 * lookup. */
-		pbtok = json_get_member(buf, result, "previous_basetime");
-		if (pbtok) {
-			base = tal(tmpctx, u64);
-			json_to_u64(buf, pbtok, base);
-		} else if (sent->offer->recurrence_base)
-			base = &sent->offer->recurrence_base->basetime;
-		else {
-			/* happens with *recurrence_base == 0 */
-			assert(*sent->invreq->recurrence_counter == 0);
-			base = NULL;
-		}
+	*scidd = tal(cmd, struct short_channel_id_dir);
+	if (short_channel_id_dir_from_str(buffer + tok->start, tok->end - tok->start, *scidd))
+		return NULL;
 
-		if (base) {
-			u64 period_start, period_end, now = time_now().ts.tv_sec;
-			offer_period_paywindow(sent->offer->recurrence,
-					       sent->offer->recurrence_paywindow,
-					       sent->offer->recurrence_base,
-					       *base, period_idx,
-					       &period_start, &period_end);
-			if (now < period_start)
-				return command_fail(cmd, LIGHTNINGD,
-						    "Too early: can't send until time %"
-						    PRIu64" (in %"PRIu64" secs)",
-						    period_start,
-						    period_start - now);
-			if (now > period_end)
-				return command_fail(cmd, LIGHTNINGD,
-						    "Too late: expired time %"
-						    PRIu64" (%"PRIu64" secs ago)",
-						    period_end,
-						    now - period_end);
-		}
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a short_channel_id of form NxNxN/dir");
+}
+
+static struct command_result *param_dev_reply_path(struct command *cmd, const char *name,
+						   const char *buffer, const jsmntok_t *tok,
+						   struct pubkey **path)
+{
+	size_t i;
+	const jsmntok_t *t;
+
+	if (!plugin_developer_mode(cmd->plugin))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "not available outside --developer mode");
+
+	if (tok->type != JSMN_ARRAY)
+		return command_fail_badparam(cmd, name, buffer, tok, "Must be array");
+
+	*path = tal_arr(cmd, struct pubkey, tok->size);
+
+	json_for_each_arr(i, t, tok) {
+		if (!json_to_pubkey(buffer, t, &(*path)[i]))
+			return command_fail_badparam(cmd, name, buffer, t, "invalid pubkey");
 	}
+	return NULL;
+}
 
-	rawinvreq = tal_arr(tmpctx, u8, 0);
-	towire_invoice_request(&rawinvreq, sent->invreq);
-	return send_message(cmd, sent, "invoice_request", rawinvreq,
-			    sendonionmsg_done);
+static bool payer_key(const struct offers_data *od,
+		      const u8 *public_tweak, size_t public_tweak_len,
+		      struct pubkey *key)
+{
+	struct sha256 tweakhash;
+
+	bolt12_alias_tweak(&od->nodealias_base, public_tweak, public_tweak_len,
+			   &tweakhash);
+
+	*key = od->id;
+	return secp256k1_ec_pubkey_tweak_add(secp256k1_ctx,
+					     &key->pubkey,
+					     tweakhash.u.u8) == 1;
+}
+
+/* BOLT #12:
+ * - MUST set `invreq_metadata` to an unpredictable series of bytes.
+ */
+/* Derive metadata (and thus temp key) from offer data and label
+ * as payer_id must be same for all recurring payments. */
+static u8 *recurrence_invreq_metadata(const tal_t *ctx,
+				      const struct tlv_invoice_request *invreq,
+				      const struct secret *nodealias_base,
+				      const struct json_escape *rec_label)
+{
+	struct sha256 offer_id, tweak;
+	u8 *tweak_input;
+
+	/* Use "offer_id || label" as tweak input */
+	invreq_offer_id(invreq, &offer_id);
+	tweak_input = tal_arr(tmpctx, u8,
+			      sizeof(offer_id) + strlen(rec_label->s));
+	memcpy(tweak_input, &offer_id, sizeof(offer_id));
+	memcpy(tweak_input + sizeof(offer_id),
+	       rec_label->s,
+	       strlen(rec_label->s));
+
+	bolt12_alias_tweak(nodealias_base,
+			   tweak_input,
+			   tal_bytelen(tweak_input),
+			   &tweak);
+	return (u8 *)tal_dup(invreq, struct sha256, &tweak);
+}
+
+static struct command_result *param_bip353(struct command *cmd, const char *name,
+					   const char *buffer, const jsmntok_t *tok,
+					   struct bip_353_name **bip353)
+{
+	char *str, *at;
+
+	/* BOLT #12:
+	 *  - if it received the offer from which it constructed this
+	 *    `invoice_request` using BIP 353 resolution:
+	 *     - MUST include `invreq_bip_353_name` with,
+	 *       - `name` set to the post-₿, pre-@ part of the BIP 353 HRN,
+	 *       - `domain` set to the post-@ part of the BIP 353 HRN.
+	 */
+	str = json_strdup(tmpctx, buffer, tok);
+	if (!utf8_check(str, strlen(str)))
+		return command_fail_badparam(cmd, name, buffer, tok, "invalid UTF-8");
+
+	at = strchr(str, '@');
+	if (!at)
+		return command_fail_badparam(cmd, name, buffer, tok, "missing @");
+
+	/* Strip ₿ if present (0xE2 0x82 0xBF) */
+	if (strstarts(str, "₿"))
+		str += strlen("₿");
+
+	*bip353 = tal(cmd, struct bip_353_name);
+	/* Not nul-terminated! */
+	(*bip353)->name
+		= tal_dup_arr(*bip353, u8, (const u8 *)str, at - str, 0);
+	(*bip353)->domain
+		= tal_dup_arr(*bip353, u8,  (const u8 *)at + 1, strlen(at + 1), 0);
+
+	return NULL;
 }
 
 /* Fetches an invoice for this offer, and makes sure it corresponds. */
-static struct command_result *json_fetchinvoice(struct command *cmd,
-						const char *buffer,
-						const jsmntok_t *params)
+struct command_result *json_fetchinvoice(struct command *cmd,
+					 const char *buffer,
+					 const jsmntok_t *params)
 {
+	const struct offers_data *od = get_offers_data(cmd->plugin);
 	struct amount_msat *msat;
-	const char *rec_label;
+	const char *payer_note;
+	struct json_escape *rec_label;
+	u8 *payer_metadata;
 	struct out_req *req;
 	struct tlv_invoice_request *invreq;
 	struct sent *sent = tal(cmd, struct sent);
+	struct bip_353_name *bip353;
 	u32 *timeout;
+	u64 *quantity;
+	u32 *recurrence_counter, *recurrence_start;
+	char *error;
 
-	invreq = tlv_invoice_request_new(sent);
-	if (!param(cmd, buffer, params,
-		   p_req("offer", param_offer, &sent->offer),
-		   p_opt("msatoshi", param_msat, &msat),
-		   p_opt("quantity", param_u64, &invreq->quantity),
-		   p_opt("recurrence_counter", param_number,
-			 &invreq->recurrence_counter),
-		   p_opt("recurrence_start", param_number,
-			 &invreq->recurrence_start),
-		   p_opt("recurrence_label", param_string, &rec_label),
-		   p_opt_def("timeout", param_number, &timeout, 60),
+	if (!param_check(cmd, buffer, params,
+			 p_req("offer", param_offer, &sent->offer),
+			 p_opt("amount_msat", param_msat, &msat),
+			 p_opt("quantity", param_u64, &quantity),
+			 p_opt("recurrence_counter", param_number, &recurrence_counter),
+			 p_opt("recurrence_start", param_number, &recurrence_start),
+			 p_opt("recurrence_label", param_label, &rec_label),
+			 p_opt_def("timeout", param_number, &timeout, 60),
+			 p_opt("payer_note", param_string, &payer_note),
+			 p_opt("payer_metadata", param_bin_from_hex, &payer_metadata),
+			 p_opt("bip353", param_bip353, &bip353),
+			 p_opt("dev_path_use_scidd", param_dev_scidd, &sent->dev_path_use_scidd),
+			 p_opt("dev_reply_path", param_dev_reply_path, &sent->dev_reply_path),
 		   NULL))
 		return command_param_failed();
 
+	error = offer_check_recurrence_policy(tmpctx, sent->offer);
+	if (error) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "offer doesn't satisfy CLN's recurrence policy: %s", error);
+	}
+
 	sent->wait_timeout = *timeout;
+	sent->their_paths = sent->offer->offer_paths;
+	if (sent->their_paths)
+		sent->direct_dest = NULL;
+	else
+		sent->direct_dest = sent->offer->offer_issuer_id;
+	/* This is NULL if offer_issuer_id is missing, and set by try_establish */
+	sent->issuer_key = sent->offer->offer_issuer_id;
 
-	/* BOLT-offers #12:
-	 *  - MUST set `offer_id` to the merkle root of the offer as described
-	 *    in [Signature Calculation](#signature-calculation).
+	/* BOLT #12:
+	 *   - if the current time is after `offer_absolute_expiry`:
+	 *     - MUST NOT respond to the offer.
 	 */
-	invreq->offer_id = tal(invreq, struct sha256);
-	merkle_tlv(sent->offer->fields, invreq->offer_id);
-
-	/* Check if they are trying to send us money. */
-	if (sent->offer->send_invoice)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Offer wants an invoice, not invoice_request");
-
-	/* BOLT-offers #12:
-	 * - SHOULD not respond to an offer if the current time is after
-	 *   `absolute_expiry`.
+	/* BOLT-recurrence #12:
+	 *   - if the current time is after `offer_absolute_expiry`:
+	 *      - MUST NOT make an initial response to the offer
+	 *        (i.e. continuing an existing offer with recurrence is ok)
 	 */
-	if (sent->offer->absolute_expiry
-	    && time_now().ts.tv_sec > *sent->offer->absolute_expiry)
+	if (sent->offer->offer_absolute_expiry
+	    && clock_time().ts.tv_sec > *sent->offer->offer_absolute_expiry
+	    && (!recurrence_counter || *recurrence_counter == 0)) {
 		return command_fail(cmd, OFFER_EXPIRED, "Offer expired");
+	}
 
-	/* BOLT-offers #12:
-	 * - if the offer did not specify `amount`:
-	 *   - MUST specify `amount`.`msat` in multiples of the minimum
-	 *     lightning-payable unit (e.g. milli-satoshis for bitcoin) for the
-	 *     first `chains` entry.
-	 * - otherwise:
-	 *   - MAY omit `amount`.
-	 *     - if it sets `amount`:
-	 *       - MUST specify `amount`.`msat` as greater or equal to amount
-	 *         expected by the offer (before any proportional period amount).
+	if (recurrence_counter &&
+	    *recurrence_counter > OFFER_RECURRENCE_MAX_PERIOD_IDX) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "recurrence_counter %u exceeds CLN maximum %" PRIu64,
+		    *recurrence_counter, (u64)OFFER_RECURRENCE_MAX_PERIOD_IDX);
+	}
+	if (recurrence_start &&
+	    *recurrence_start > OFFER_RECURRENCE_MAX_PERIOD_IDX) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "recurrence_start %u exceeds CLN maximum %" PRIu64,
+		    *recurrence_start, (u64)OFFER_RECURRENCE_MAX_PERIOD_IDX);
+	}
+	if (recurrence_counter && recurrence_start) {
+		u64 period_idx = *recurrence_counter + (u64)*recurrence_start;
+		if (period_idx > OFFER_RECURRENCE_MAX_PERIOD_IDX) {
+			return command_fail(
+			    cmd, JSONRPC2_INVALID_PARAMS,
+			    "recurrence_start (%u) + recurrence_counter (%u) "
+			    "exceeds CLN maximum %" PRIu64,
+			    *recurrence_start, *recurrence_counter,
+			    (u64)OFFER_RECURRENCE_MAX_PERIOD_IDX);
+		}
+	}
+
+	/* BOLT #12:
+	 * The writer:
+	 *  - if it is responding to an offer:
+	 *    - MUST copy all fields from the offer (including unknown fields).
 	 */
-	if (sent->offer->amount) {
+	invreq = invoice_request_for_offer(sent, sent->offer);
+	invreq->invreq_recurrence_counter = tal_steal(invreq, recurrence_counter);
+	invreq->invreq_recurrence_start = tal_steal(invreq, recurrence_start);
+	invreq->invreq_quantity = tal_steal(invreq, quantity);
+	invreq->invreq_bip_353_name = tal_steal(invreq, bip353);
+
+	/* BOLT-recurrence #12:
+	 * - if `offer_amount` is not present:
+	 *       - MUST specify `invreq_amount`.
+	 *     - otherwise:
+	 *       - MAY omit `invreq_amount`.
+	 *       - if it sets `invreq_amount`:
+	 *         - MUST specify `invreq_amount`.`msat` as greater or equal to
+	 *           amount expected by `offer_amount` (and, if present,
+	 *          `offer_currency` and `invreq_quantity`).
+	 */
+	if (invreq->offer_amount) {
 		/* FIXME: Check after quantity? */
 		if (msat) {
-			invreq->amount = tal_dup(invreq, u64,
-						 &msat->millisatoshis); /* Raw: tu64 */
+			invreq->invreq_amount = tal_dup(invreq, u64,
+							&msat->millisatoshis); /* Raw: tu64 */
 		}
 	} else {
 		if (!msat)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "msatoshi parameter required");
-		invreq->amount = tal_dup(invreq, u64,
-					 &msat->millisatoshis); /* Raw: tu64 */
+					    "amount_msat parameter required");
+		invreq->invreq_amount = tal_dup(invreq, u64,
+						&msat->millisatoshis); /* Raw: tu64 */
 	}
 
-	/* BOLT-offers #12:
-	 *   - if the offer had a `quantity_min` or `quantity_max` field:
-	 *     - MUST set `quantity`
-	 *     - MUST set it within that (inclusive) range.
-	 *   - otherwise:
-	 *     - MUST NOT set `quantity`
+	/* BOLT #12:
+	 * - if `offer_quantity_max` is present:
+	 *    - MUST set `invreq_quantity` to greater than zero.
+	 *    - if `offer_quantity_max` is non-zero:
+	 *      - MUST set `invreq_quantity` less than or equal to
+	 *       `offer_quantity_max`.
 	 */
-	if (sent->offer->quantity_min || sent->offer->quantity_max) {
-		if (!invreq->quantity)
+	if (invreq->offer_quantity_max) {
+		if (!invreq->invreq_quantity)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "quantity parameter required");
-		if (sent->offer->quantity_min
-		    && *invreq->quantity < *sent->offer->quantity_min)
+		if (*invreq->invreq_quantity == 0)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "quantity must be >= %"PRIu64,
-					    *sent->offer->quantity_min);
-		if (sent->offer->quantity_max
-		    && *invreq->quantity > *sent->offer->quantity_max)
+					    "quantity parameter must be non-zero");
+		if (*invreq->offer_quantity_max
+		    && *invreq->invreq_quantity > *invreq->offer_quantity_max)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "quantity must be <= %"PRIu64,
-					    *sent->offer->quantity_max);
+					    *invreq->offer_quantity_max);
 	} else {
-		if (invreq->quantity)
+		if (invreq->invreq_quantity)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "quantity parameter unnecessary");
 	}
 
-	/* BOLT-offers #12:
-	 * - if the offer contained `recurrence`:
+	/* BOLT-recurrence #12:
+	 * - if `offer_recurrence_optional` or `offer_recurrence_compulsory` are present:
 	 */
-	if (sent->offer->recurrence) {
-		/* BOLT-offers #12:
+	if (invreq_recurrence(invreq)) {
+		/* BOLT-recurrence #12:
 		 *    - for the initial request:
 		 *...
-		 *      - MUST set `recurrence_counter` `counter` to 0.
+		 *      - MUST set `invreq_recurrence_counter` `counter` to 0.
 		 */
-		/* BOLT-offers #12:
+		/* BOLT-recurrence #12:
 		 *    - for any successive requests:
 		 *...
-		 *      - MUST set `recurrence_counter` `counter` to one greater
+		 *      - MUST set `invreq_recurrence_counter` `counter` to one greater
 		 *        than the highest-paid invoice.
 		 */
-		if (!invreq->recurrence_counter)
+		if (!invreq->invreq_recurrence_counter)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "needs recurrence_counter");
 
-		/* BOLT-offers #12:
-		 *    - if the offer contained `recurrence_base` with
-		 *      `start_any_period` non-zero:
-		 *      - MUST include `recurrence_start`
+		if (payer_metadata)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Cannot set payer_metadata for recurring offers");
+
+		/* BOLT-recurrence #12:
+		 * - if `offer_recurrence_base` is present:
+		 *   - MUST include `invreq_recurrence_start`
 		 *...
 		 *    - otherwise:
-		 *      - MUST NOT include `recurrence_start`
+		 *      - MUST NOT include `invreq_recurrence_start`
 		 */
-		if (sent->offer->recurrence_base
-		    && sent->offer->recurrence_base->start_any_period) {
-			if (!invreq->recurrence_start)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "needs recurrence_start");
+		if (invreq->offer_recurrence_base) {
+			if (!invreq->invreq_recurrence_start)
+				invreq->invreq_recurrence_start = talz(invreq, u32);
 		} else {
-			if (invreq->recurrence_start)
+			if (invreq->invreq_recurrence_start)
 				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 						    "unnecessary recurrence_start");
 		}
 
 		/* recurrence_label uniquely identifies this series of
-		 * payments. */
+		 * payments */
 		if (!rec_label)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "needs recurrence_label");
-	} else {
-		/* BOLT-offers #12:
-		 * - otherwise:
-		 *   - MUST NOT set `recurrence_counter`.
-		 *...
-		 *   - MUST NOT set `recurrence_start`
-		 */
-		if (invreq->recurrence_counter)
+
+		invreq->invreq_metadata
+			= recurrence_invreq_metadata(invreq, invreq,
+						     &od->nodealias_base,
+						     rec_label);
+
+		error = invreq_check_recurrence_policy(tmpctx, invreq);
+		if (error) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "unnecessary recurrence_counter");
-		if (invreq->recurrence_start)
+					    "invoice request doesn't satisfy "
+					    "CLN's recurrence policy: %s",
+					    error);
+		}
+	} else {
+		/* BOLT-recurrence #12:
+		 * - otherwise:
+		 *   - MUST NOT set `invreq_recurrence_counter`.
+		 *   - MUST NOT set `invreq_recurrence_start`
+		 *   - MUST NOT set `invreq_recurrence_cancel`
+		 */
+		if (invreq->invreq_recurrence_counter)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "unnecessary invreq_recurrence_counter");
+		if (invreq->invreq_recurrence_start)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "unnecessary invreq_recurrence_start");
+		if (invreq->invreq_recurrence_cancel)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "unnecessary invreq_recurrence_cancel");
+
+		/* if the payer force to use the payer_metadata */
+		if (payer_metadata) {
+			invreq->invreq_metadata = tal_steal(invreq, payer_metadata);
+		} else {
+			/* BOLT #12:
+			 * - MUST set `invreq_metadata` to an unpredictable series of
+			 *   bytes.
+			 */
+			invreq->invreq_metadata = tal_arr(invreq, u8, 16);
+			randbytes(invreq->invreq_metadata,
+				    tal_bytelen(invreq->invreq_metadata));
+		}
+	}
+
+	/* We derive transient payer_id from invreq_metadata */
+	invreq->invreq_payer_id = tal(invreq, struct pubkey);
+	if (!payer_key(od, invreq->invreq_metadata,
+		       tal_bytelen(invreq->invreq_metadata),
+		       invreq->invreq_payer_id)) {
+		/* Doesn't happen! */
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invalid tweak for payer_id");
+	}
+
+	/* BOLT #12:
+	 *
+	 * - if `offer_chains` is set:
+	 *   - MUST set `invreq_chain` to one of `offer_chains` unless that
+	 *     chain is bitcoin, in which case it SHOULD omit `invreq_chain`.
+	 * - otherwise:
+	 *   - if it sets `invreq_chain` it MUST set it to bitcoin.
+	 */
+	/* We already checked that we're compatible chain, in param_offer */
+	if (!streq(chainparams->network_name, "bitcoin")) {
+		invreq->invreq_chain = tal_dup(invreq, struct bitcoin_blkid,
+					       &chainparams->genesis_blockhash);
+	}
+
+	/* BOLT #12:
+	 *   - if it supports bolt12 invoice request features:
+	 *     - MUST set `invreq_features`.`features` to the bitmap of features.
+	 */
+	invreq->invreq_features
+		= plugin_feature_set(cmd->plugin)->bits[BOLT12_OFFER_FEATURE];
+
+	/* invreq->invreq_payer_note is not a nul-terminated string! */
+	if (payer_note)
+		invreq->invreq_payer_note = tal_dup_arr(invreq, utf8,
+							payer_note,
+							strlen(payer_note),
+							0);
+
+	error = invreq_check_recurrence_policy(tmpctx, invreq);
+	if (error) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invoice request does not satisfy CLN "
+				    "recurrence policy: %s",
+				    error);
+	}
+
+	/* If only checking, we're done now */
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	/* Make the invoice request (fills in payer_key and payer_info) */
+	req = jsonrpc_request_start(cmd, "createinvoicerequest",
+				    &invreq_done,
+				    &forward_error,
+				    sent);
+
+	/* We don't want this is the database: that's only for ones we publish */
+	json_add_string(req->js, "bolt12", invrequest_encode(tmpctx, invreq));
+	json_add_bool(req->js, "savetodb", false);
+	if (rec_label)
+		json_add_escaped_string(req->js, "label", rec_label);
+	return send_outreq(req);
+}
+
+struct command_result *json_cancelrecurringinvoice(struct command *cmd,
+						   const char *buffer,
+						   const jsmntok_t *params)
+{
+	const struct offers_data *od = get_offers_data(cmd->plugin);
+	const char *payer_note;
+	struct json_escape *rec_label;
+	struct out_req *req;
+	struct tlv_invoice_request *invreq;
+	struct sent *sent = tal(cmd, struct sent);
+	struct bip_353_name *bip353;
+	u32 *recurrence_counter, *recurrence_start;
+
+	if (!param_check(cmd, buffer, params,
+			 p_req("offer", param_offer, &sent->offer),
+			 p_req("recurrence_counter", param_number, &recurrence_counter),
+			 p_req("recurrence_label", param_label, &rec_label),
+			 p_opt("recurrence_start", param_number, &recurrence_start),
+			 p_opt("payer_note", param_string, &payer_note),
+			 p_opt("bip353", param_bip353, &bip353),
+			 NULL))
+		return command_param_failed();
+
+	sent->their_paths = sent->offer->offer_paths;
+	if (sent->their_paths)
+		sent->direct_dest = NULL;
+	else
+		sent->direct_dest = sent->offer->offer_issuer_id;
+	/* This is NULL if offer_issuer_id is missing, and set by try_establish */
+	sent->issuer_key = sent->offer->offer_issuer_id;
+
+	/* BOLT #12:
+	 * The writer:
+	 *  - if it is responding to an offer:
+	 *    - MUST copy all fields from the offer (including unknown fields).
+	 */
+	invreq = invoice_request_for_offer(sent, sent->offer);
+	invreq->invreq_recurrence_counter = tal_steal(invreq, recurrence_counter);
+	invreq->invreq_recurrence_start = tal_steal(invreq, recurrence_start);
+	invreq->invreq_bip_353_name = tal_steal(invreq, bip353);
+	invreq->invreq_recurrence_cancel = talz(invreq, struct tlv_invoice_request_invreq_recurrence_cancel);
+
+	/* BOLT-recurrence #12:
+	 * - if it sets `invreq_recurrence_cancel`:
+	 *...
+	 *   - MAY omit `invreq_amount` and `invreq_quantity`.
+	 */
+	/* And we do */
+	if (!invreq_recurrence(invreq))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Not a recurring offer");
+
+	/* BOLT-recurrence #12:
+	 * - if `offer_recurrence_optional` or `offer_recurrence_compulsory` are present:
+	 *    - for the initial request:
+	 *...
+	 *      - MUST set `invreq_recurrence_counter` `counter` to 0.
+	 *      - MUST NOT set `invreq_recurrence_cancel`.
+	 */
+	if (*invreq->invreq_recurrence_counter == 0)
+		return command_fail_badparam(cmd, "recurrence_counter", buffer, params,
+					     "Must be non-zero");
+
+	/* BOLT-recurrence #12:
+	 * - if `offer_recurrence_base` is present:
+	 *   - MUST include `invreq_recurrence_start`
+	 *...
+	 *    - otherwise:
+	 *      - MUST NOT include `invreq_recurrence_start`
+	 */
+	if (invreq->offer_recurrence_base) {
+		if (!invreq->invreq_recurrence_start)
+			invreq->invreq_recurrence_start = talz(invreq, u32);
+	} else {
+		if (invreq->invreq_recurrence_start)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "unnecessary recurrence_start");
 	}
 
-	/* BOLT-offers #12:
-	 *
-	 * - if the chain for the invoice is not solely bitcoin:
-	 *   - MUST specify `chains` the offer is valid for.
-	 * - otherwise:
-	 *   - the bitcoin chain is implied as the first and only entry.
-	 */
-	if (!streq(chainparams->network_name, "bitcoin")) {
-		invreq->chains = tal_arr(invreq, struct bitcoin_blkid, 1);
-		invreq->chains[0] = chainparams->genesis_blockhash;
+	invreq->invreq_metadata
+		= recurrence_invreq_metadata(invreq, invreq,
+					     &od->nodealias_base,
+					     rec_label);
+
+	/* We derive transient payer_id from invreq_metadata */
+	invreq->invreq_payer_id = tal(invreq, struct pubkey);
+	if (!payer_key(od, invreq->invreq_metadata,
+		       tal_bytelen(invreq->invreq_metadata),
+		       invreq->invreq_payer_id)) {
+		/* Doesn't happen! */
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invalid tweak for payer_id");
 	}
 
-	invreq->features
-		= plugin_feature_set(cmd->plugin)->bits[BOLT11_FEATURE];
+	/* BOLT-recurrence #12:
+	 * - if `offer_recurrence_base` is present:
+	 *   - MUST include `invreq_recurrence_start`
+	 *...
+	 *    - otherwise:
+	 *      - MUST NOT include `invreq_recurrence_start`
+	 */
+	if (invreq->offer_recurrence_base) {
+		if (!invreq->invreq_recurrence_start)
+			invreq->invreq_recurrence_start = talz(invreq, u32);
+	} else {
+		if (invreq->invreq_recurrence_start)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "unnecessary recurrence_start");
+	}
+
+	/* BOLT #12:
+	 *
+	 * - if `offer_chains` is set:
+	 *   - MUST set `invreq_chain` to one of `offer_chains` unless that
+	 *     chain is bitcoin, in which case it SHOULD omit `invreq_chain`.
+	 * - otherwise:
+	 *   - if it sets `invreq_chain` it MUST set it to bitcoin.
+	 */
+	/* We already checked that we're compatible chain, in param_offer */
+	if (!streq(chainparams->network_name, "bitcoin")) {
+		invreq->invreq_chain = tal_dup(invreq, struct bitcoin_blkid,
+					       &chainparams->genesis_blockhash);
+	}
+
+	/* BOLT #12:
+	 *   - if it supports bolt12 invoice request features:
+	 *     - MUST set `invreq_features`.`features` to the bitmap of features.
+	 */
+	invreq->invreq_features
+		= plugin_feature_set(cmd->plugin)->bits[BOLT12_OFFER_FEATURE];
+
+	/* invreq->invreq_payer_note is not a nul-terminated string! */
+	if (payer_note)
+		invreq->invreq_payer_note = tal_dup_arr(invreq, utf8,
+							payer_note,
+							strlen(payer_note),
+							0);
+
+	/* If only checking, we're done now */
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
 
 	/* Make the invoice request (fills in payer_key and payer_info) */
-	req = jsonrpc_request_start(cmd->plugin, cmd, "createinvoicerequest",
+	req = jsonrpc_request_start(cmd, "createinvoicerequest",
 				    &invreq_done,
 				    &forward_error,
 				    sent);
+
+	/* We don't want this is the database: that's only for ones we publish */
 	json_add_string(req->js, "bolt12", invrequest_encode(tmpctx, invreq));
-	if (rec_label)
-		json_add_string(req->js, "recurrence_label", rec_label);
-	return send_outreq(cmd->plugin, req);
+	json_add_bool(req->js, "savetodb", false);
+	json_add_escaped_string(req->js, "label", rec_label);
+	return send_outreq(req);
 }
 
 /* FIXME: Using a hook here is not ideal: technically it doesn't mean
  * it's actually hit the db!  But using waitinvoice is also suboptimal
  * because we don't have libplugin infra to cancel a pending req (and I
  * want to rewrite our wait* API anyway) */
-static struct command_result *invoice_payment(struct command *cmd,
-					      const char *buf,
-					      const jsmntok_t *params)
+struct command_result *invoice_payment(struct command *cmd,
+				       const char *buf,
+				       const jsmntok_t *params)
 {
 	struct sent *i;
 	const jsmntok_t *ptok, *preimagetok, *msattok;
@@ -989,25 +1384,26 @@ static struct command_result *invoice_payment(struct command *cmd,
 			continue;
 
 		/* It was paid!  Success.  Return as per waitinvoice. */
-		req = jsonrpc_request_start(cmd->plugin, i->cmd, "waitinvoice",
+		req = jsonrpc_request_start(i->cmd, "waitinvoice",
 					    &forward_result,
 					    &forward_error,
 					    i);
 		json_add_escaped_string(req->js, "label", i->inv_label);
-		discard_result(send_outreq(cmd->plugin, req));
+		discard_result(send_outreq(req));
 		break;
 	}
 	return command_hook_success(cmd);
 }
 
 static struct command_result *createinvoice_done(struct command *cmd,
+						 const char *method,
 						 const char *buf,
 						 const jsmntok_t *result,
 						 struct sent *sent)
 {
+	struct tlv_onionmsg_tlv *payload;
 	const jsmntok_t *invtok = json_get_member(buf, result, "bolt12");
-	char *fail;
-	u8 *rawinv;
+	const char *fail;
 
 	/* Replace invoice with signed one */
 	tal_free(sent->inv);
@@ -1027,9 +1423,23 @@ static struct command_result *createinvoice_done(struct command *cmd,
 				    "Bad createinvoice response %s", fail);
 	}
 
-	rawinv = tal_arr(tmpctx, u8, 0);
-	towire_invoice(&rawinv, sent->inv);
-	return send_message(cmd, sent, "invoice", rawinv, prepare_inv_timeout);
+	/* BOLT #12:
+	 *     - if it sends an invoice in response:
+	 *       - MUST use `invreq_paths` if present, otherwise MUST use
+	 *         `invreq_payer_id` as the node id to send to.
+	 */
+	sent->their_paths = sent->invreq->invreq_paths;
+	if (sent->their_paths)
+		sent->direct_dest = NULL;
+	else
+		sent->direct_dest = sent->invreq->invreq_payer_id;
+
+	payload = tlv_onionmsg_tlv_new(sent);
+
+	payload->invoice = tal_arr(payload, u8, 0);
+	towire_tlv_invoice(&payload->invoice, sent->inv);
+
+	return send_message(cmd, sent, true, payload, prepare_inv_timeout);
 }
 
 static struct command_result *sign_invoice(struct command *cmd,
@@ -1038,357 +1448,290 @@ static struct command_result *sign_invoice(struct command *cmd,
 	struct out_req *req;
 
 	/* Get invoice signature and put in db so we can receive payment */
-	req = jsonrpc_request_start(cmd->plugin, cmd, "createinvoice",
+	req = jsonrpc_request_start(cmd, "createinvoice",
 				    &createinvoice_done,
 				    &forward_error,
 				    sent);
 	json_add_string(req->js, "invstring", invoice_encode(tmpctx, sent->inv));
 	json_add_preimage(req->js, "preimage", &sent->inv_preimage);
 	json_add_escaped_string(req->js, "label", sent->inv_label);
-	return send_outreq(cmd->plugin, req);
+	return send_outreq(req);
 }
 
-static bool json_to_bip340sig(const char *buffer, const jsmntok_t *tok,
-			      struct bip340sig *sig)
+static struct command_result *param_invreq(struct command *cmd,
+					   const char *name,
+					   const char *buffer,
+					   const jsmntok_t *tok,
+					   struct tlv_invoice_request **invreq)
 {
-	return hex_decode(buffer + tok->start, tok->end - tok->start,
-			  sig->u8, sizeof(sig->u8));
+	const char *fail;
+	int badf;
+	struct sha256 merkle, sighash;
+
+	/* BOLT #12:
+	 *   - if `invreq_chain` is not present:
+	 *     - MUST reject the invoice request if bitcoin is not a supported chain.
+	 *   - otherwise:
+	 *     - MUST reject the invoice request if `invreq_chain`.`chain` is not a
+	 *       supported chain.
+	 */
+	*invreq = invrequest_decode(cmd,
+				    buffer + tok->start, tok->end - tok->start,
+				    plugin_feature_set(cmd->plugin),
+				    chainparams,
+				    &fail);
+	if (!*invreq)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     tal_fmt(cmd,
+						     "Unparsable invoice_request: %s",
+						     fail));
+	/* BOLT #12:
+	 * The reader:
+	 *   - MUST reject the invoice request if `invreq_payer_id` or `invreq_metadata`
+	 *     are not present.
+	 *   - MUST reject the invoice request if any non-signature TLV fields are outside the inclusive ranges: 0 to 159 and 1000000000 to 2999999999
+	 *   - if `invreq_features` contains unknown _odd_ bits that are
+	 *     non-zero:
+	 *     - MUST ignore the bit.
+	 *   - if `invreq_features` contains unknown _even_ bits that are
+	 *     non-zero:
+	 *     - MUST reject the invoice request.
+	 */
+	if (!(*invreq)->invreq_payer_id)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Missing invreq_payer_id");
+
+	if (!(*invreq)->invreq_metadata)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Missing invreq_metadata");
+
+	if (any_field_outside_range((*invreq)->fields, true,
+				    0, 159,
+				    1000000000, 2999999999)) {
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Invalid high-numbered fields");
+	}
+
+	badf = features_unsupported(plugin_feature_set(cmd->plugin),
+				    (*invreq)->invreq_features,
+				    BOLT12_INVREQ_FEATURE);
+	if (badf != -1) {
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     tal_fmt(tmpctx,
+						     "unknown feature %i",
+						     badf));
+	}
+
+	/* BOLT #12:
+	 * - MUST reject the invoice request if `signature` is not correct as detailed in [Signature
+	 *   Calculation](#signature-calculation) using the `invreq_payer_id`.
+	 */
+	merkle_tlv((*invreq)->fields, &merkle);
+	sighash_from_merkle("invoice_request", "signature", &merkle, &sighash);
+
+	if (!(*invreq)->signature)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Missing signature");
+	if (!check_schnorr_sig(&sighash,
+			       &(*invreq)->invreq_payer_id->pubkey,
+			       (*invreq)->signature))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Invalid signature");
+
+	/* Plugin handles these automatically, you shouldn't send one
+	 * manually. */
+	if ((*invreq)->offer_issuer_id || (*invreq)->offer_paths) {
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "This is based on an offer?");
+	}
+
+	/* BOLT #12:
+	 *  - otherwise (no `offer_issuer_id` or `offer_paths`, not a response to our offer):
+	 *     - MUST reject the invoice request if any of the following are present:
+	 *       - `offer_chains`, `offer_features` or `offer_quantity_max`.
+	 *     - MUST reject the invoice request if `invreq_amount` is not present.
+	 */
+	if ((*invreq)->offer_chains)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Unexpected offer_chains");
+	if ((*invreq)->offer_features)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Unexpected offer_features");
+	if ((*invreq)->offer_quantity_max)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Unexpected offer_quantity_max");
+	if (!(*invreq)->invreq_amount)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "Missing invreq_amount");
+
+	/* BOLT #12:
+	 *  - otherwise (no `offer_issuer_id` or `offer_paths`, not a response to our offer):
+	 *...
+	 *     - MAY use `offer_amount` (or `offer_currency`) for informational display to user.
+	 */
+	if ((*invreq)->offer_amount && (*invreq)->offer_currency) {
+		plugin_notify_message(cmd, LOG_INFORM,
+				      "invoice_request offers %.*s%"PRIu64" as %s",
+				      (int)tal_bytelen((*invreq)->offer_currency),
+				      (*invreq)->offer_currency,
+				      *(*invreq)->offer_amount,
+				      fmt_amount_msat(tmpctx,
+						      amount_msat(*(*invreq)->invreq_amount)));
+	}
+	return NULL;
 }
 
-static struct command_result *payersign_done(struct command *cmd,
-					     const char *buf,
-					     const jsmntok_t *result,
-					     struct sent *sent)
+struct command_result *json_sendinvoice(struct command *cmd,
+					const char *buffer,
+					const jsmntok_t *params)
 {
-	const jsmntok_t *sig;
+	const struct offers_data *od = get_offers_data(cmd->plugin);
+	struct amount_msat *msat;
+	u32 *timeout;
+	struct sent *sent = tal(cmd, struct sent);
 
-	sent->inv->refund_signature = tal(sent->inv, struct bip340sig);
-	sig = json_get_member(buf, result, "signature");
-	json_to_bip340sig(buf, sig, sent->inv->refund_signature);
+	sent->offer = NULL;
+	sent->cmd = cmd;
+
+	/* FIXME: Support recurring invoice_requests? */
+	if (!param(cmd, buffer, params,
+		   p_req("invreq", param_invreq, &sent->invreq),
+		   p_req("label", param_label, &sent->inv_label),
+		   p_opt("amount_msat", param_msat, &msat),
+		   p_opt_def("timeout", param_number, &timeout, 90),
+		   NULL))
+		return command_param_failed();
+
+	sent->dev_path_use_scidd = NULL;
+	sent->dev_reply_path = NULL;
+	sent->their_paths = sent->invreq->offer_paths;
+	sent->direct_dest = sent->invreq->invreq_payer_id;
+
+	/* BOLT #12:
+	 *   - if the invoice is in response to an `invoice_request`:
+	 *     - MUST copy all non-signature fields from the invoice request
+	 *       (including unknown fields).
+	 */
+	sent->inv = invoice_for_invreq(sent, sent->invreq);
+
+	/* This is how long we'll wait for a reply for. */
+	sent->wait_timeout = *timeout;
+
+	/* BOLT #12:
+	 * - if `invreq_amount` is present:
+	 *   - MUST set `invoice_amount` to `invreq_amount`
+	 * - otherwise:
+	 *   - MUST set `invoice_amount` to the *expected amount*.
+	 */
+	if (!msat)
+		sent->inv->invoice_amount = tal_dup(sent->inv, u64,
+						    sent->invreq->invreq_amount);
+	else
+		sent->inv->invoice_amount = tal_dup(sent->inv, u64,
+						    &msat->millisatoshis); /* Raw: tlv */
+
+	/* BOLT #12:
+	 *   - MUST set `invoice_created_at` to the number of seconds since Midnight 1
+	 *      January 1970, UTC when the invoice was created.
+	 *    - MUST set `invoice_amount` to the minimum amount it will accept, in units of
+	 *      the minimal lightning-payable unit (e.g. milli-satoshis for bitcoin) for
+	 *      `invreq_chain`.
+	 */
+	sent->inv->invoice_created_at = tal(sent->inv, u64);
+	*sent->inv->invoice_created_at = clock_time().ts.tv_sec;
+
+	/* FIXME: Support blinded paths, in which case use fake nodeid */
+
+	/* BOLT #12:
+	 * - MUST set `invoice_payment_hash` to the SHA256 hash of the
+	 *   `payment_preimage` that will be given in return for payment.
+	 */
+	randbytes(&sent->inv_preimage, sizeof(sent->inv_preimage));
+	sent->inv->invoice_payment_hash = tal(sent->inv, struct sha256);
+	sha256(sent->inv->invoice_payment_hash,
+	       &sent->inv_preimage, sizeof(sent->inv_preimage));
+
+	/* BOLT #12:
+	 * - if `offer_issuer_id` is present:
+	 *   - MUST set `invoice_node_id` to the `offer_issuer_id`
+	 * - otherwise, if `offer_paths` is present:
+	 *   - MUST set `invoice_node_id` to the final `blinded_node_id` on the path it received the invoice request
+	 */
+	sent->inv->invoice_node_id = tal(sent->inv, struct pubkey);
+	sent->inv->invoice_node_id->pubkey = od->id.pubkey;
+
+	/* BOLT #12:
+	 * - if the expiry for accepting payment is not 7200 seconds
+	 *   after `invoice_created_at`:
+	 *    - MUST set `invoice_relative_expiry`.`seconds_from_creation`
+	 *      to the number of seconds after `invoice_created_at` that
+	 *      payment of this invoice should not be attempted.
+	 */
+	if (sent->wait_timeout != 7200) {
+		sent->inv->invoice_relative_expiry = tal(sent->inv, u32);
+		*sent->inv->invoice_relative_expiry = sent->wait_timeout;
+	}
+
+	/* FIXME: recurrence? */
+	if (invoice_recurrence(sent->inv))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "FIXME: handle recurring invreq?");
+
+	sent->inv->invoice_features
+		= plugin_feature_set(cmd->plugin)->bits[BOLT12_INVOICE_FEATURE];
 
 	return sign_invoice(cmd, sent);
 }
 
-/* They're offering a refund, so we need to sign with same key as used
- * in initial payment. */
-static struct command_result *listsendpays_done(struct command *cmd,
-						const char *buf,
-						const jsmntok_t *result,
-						struct sent *sent)
+/* This version doesn't do sanity checks! */
+static struct command_result *param_raw_invreq(struct command *cmd,
+					       const char *name,
+					       const char *buffer,
+					       const jsmntok_t *tok,
+					       struct tlv_invoice_request **invreq)
 {
-	const jsmntok_t *t, *arr = json_get_member(buf, result, "payments");
-	size_t i;
-	const u8 *public_tweak = NULL, *p;
-	u8 *msg;
-	size_t len;
-	struct sha256 merkle;
-	struct out_req *req;
+	const char *fail;
 
-	/* Linearize populates ->fields */
-	msg = tal_arr(tmpctx, u8, 0);
-	towire_invoice(&msg, sent->inv);
-	p = msg;
-	len = tal_bytelen(msg);
-	sent->inv = tlv_invoice_new(cmd);
-	if (!fromwire_invoice(&p, &len, sent->inv))
-		plugin_err(cmd->plugin,
-			   "Could not remarshall %s", tal_hex(tmpctx, msg));
-
-	merkle_tlv(sent->inv->fields, &merkle);
-
-	json_for_each_arr(i, t, arr) {
-		const jsmntok_t *b12tok;
-		struct tlv_invoice *inv;
-		char *fail;
-
-		b12tok = json_get_member(buf, t, "bolt12");
-		if (!b12tok) {
-			/* This could happen if they try to refund a bolt11 */
-			plugin_log(cmd->plugin, LOG_UNUSUAL,
-				   "Not bolt12 string in %.*s?",
-				   json_tok_full_len(t),
-				   json_tok_full(buf, t));
-			continue;
-		}
-
-		inv = invoice_decode(tmpctx, buf + b12tok->start,
-				     b12tok->end - b12tok->start,
-				     plugin_feature_set(cmd->plugin),
-				     chainparams,
-				     &fail);
-		if (!inv) {
-			plugin_log(cmd->plugin, LOG_BROKEN,
-				   "Bad bolt12 string in %.*s?",
-				   json_tok_full_len(t),
-				   json_tok_full(buf, t));
-			continue;
-		}
-
-		public_tweak = inv->payer_info;
-		break;
-	}
-
-	if (!public_tweak)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Cannot find invoice %s for refund",
-				    type_to_string(tmpctx, struct sha256,
-						   sent->offer->refund_for));
-
-	/* BOLT-offers #12:
-	 * - MUST set `refund_signature` to the signature of the
-	 *   `refunded_payment_hash` using prefix `refund_signature` and the
-	 *   `payer_key` from the to-be-refunded invoice.
-	 */
-	req = jsonrpc_request_start(cmd->plugin, cmd, "payersign",
-				    &payersign_done,
-				    &forward_error,
-				    sent);
-	json_add_string(req->js, "messagename", "invoice");
-	json_add_string(req->js, "fieldname", "refund_signature");
-	json_add_sha256(req->js, "merkle", &merkle);
-	json_add_hex_talarr(req->js, "tweak", public_tweak);
-	return send_outreq(cmd->plugin, req);
+	*invreq = invrequest_decode(cmd, buffer + tok->start, tok->end - tok->start,
+				    plugin_feature_set(cmd->plugin), chainparams,
+				    &fail);
+	if (!*invreq)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     tal_fmt(cmd,
+						     "Unparsable invreq: %s",
+						     fail));
+	return NULL;
 }
 
-static struct command_result *json_sendinvoice(struct command *cmd,
-					       const char *buffer,
-					       const jsmntok_t *params)
+struct command_result *json_dev_rawrequest(struct command *cmd,
+					   const char *buffer,
+					   const jsmntok_t *params)
 {
-	struct amount_msat *msat;
-	struct out_req *req;
-	u32 *timeout;
 	struct sent *sent = tal(cmd, struct sent);
+	u32 *timeout;
+	struct pubkey *node_id;
+	struct tlv_onionmsg_tlv *payload;
 
-	sent->inv = tlv_invoice_new(cmd);
-	sent->invreq = NULL;
-	sent->cmd = cmd;
-
-	/* FIXME: Support recurring send_invoice offers? */
 	if (!param(cmd, buffer, params,
-		   p_req("offer", param_offer, &sent->offer),
-		   p_req("label", param_label, &sent->inv_label),
-		   p_opt("msatoshi", param_msat, &msat),
-		   p_opt_def("timeout", param_number, &timeout, 90),
-		   p_opt("quantity", param_u64, &sent->inv->quantity),
+		   p_req("invreq", param_raw_invreq, &sent->invreq),
+		   p_req("nodeid", param_pubkey, &node_id),
+		   p_opt_def("timeout", param_number, &timeout, 60),
 		   NULL))
 		return command_param_failed();
 
 	/* This is how long we'll wait for a reply for. */
 	sent->wait_timeout = *timeout;
+	sent->cmd = cmd;
+	sent->offer = NULL;
+	sent->dev_path_use_scidd = NULL;
+	sent->dev_reply_path = NULL;
+	sent->their_paths = NULL;
+	sent->direct_dest = node_id;
+	sent->issuer_key = node_id;
 
-	/* Check they are really trying to send us money. */
-	if (!sent->offer->send_invoice)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Offer wants an invoice_request, not invoice");
+	payload = tlv_onionmsg_tlv_new(sent);
+	payload->invoice_request = tal_arr(payload, u8, 0);
+	towire_tlv_invoice_request(&payload->invoice_request, sent->invreq);
 
-	/* If they don't tell us how much, base it on offer. */
-	if (!msat) {
-		if (sent->offer->currency)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Offer in different currency: need amount");
-		if (!sent->offer->amount)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Offer did not specify: need amount");
-		sent->inv->amount = tal_dup(sent->inv, u64, sent->offer->amount);
-		if (sent->inv->quantity)
-			*sent->inv->amount *= *sent->inv->quantity;
-	} else
-		sent->inv->amount = tal_dup(sent->inv, u64,
-					    &msat->millisatoshis); /* Raw: tlv */
-
-	/* FIXME: Support blinded paths, in which case use fake nodeid */
-
-	/* BOLT-offers #12:
-	 * - otherwise (responding to a `send_invoice` offer):
-	 *   - MUST set `node_id` to the id of the node to send payment to.
-	 *   - MUST set `description` the same as the offer.
-	 */
-	sent->inv->node_id = tal(sent->inv, struct pubkey32);
-	if (!pubkey32_from_node_id(sent->inv->node_id, &local_id))
-		plugin_err(cmd->plugin, "Invalid local_id %s?",
-			   type_to_string(tmpctx, struct node_id, &local_id));
-
-	sent->inv->description
-		= tal_dup_talarr(sent->inv, char, sent->offer->description);
-
-	/* BOLT-offers #12:
-	 *   - MUST set (or not set) `send_invoice` the same as the offer.
-	 */
-	sent->inv->send_invoice = tal(sent->inv, struct tlv_invoice_send_invoice);
-
-	/* BOLT-offers #12:
-	 * - MUST set `offer_id` to the id of the offer.
-	 */
-	sent->inv->offer_id = tal(sent->inv, struct sha256);
-	merkle_tlv(sent->offer->fields, sent->inv->offer_id);
-
-	/* BOLT-offers #12:
-	 * - SHOULD not respond to an offer if the current time is after
-	 *   `absolute_expiry`.
-	 */
-	if (sent->offer->absolute_expiry
-	    && time_now().ts.tv_sec > *sent->offer->absolute_expiry)
-		return command_fail(cmd, OFFER_EXPIRED, "Offer expired");
-
-	/* BOLT-offers #12:
-	 * - otherwise (responding to a `send_invoice` offer):
-	 *...
-	 *   - if the offer had a `quantity_min` or `quantity_max` field:
-	 *     - MUST set `quantity`
-	 *     - MUST set it within that (inclusive) range.
-	 *   - otherwise:
-	 *     - MUST NOT set `quantity`
-	 */
-	if (sent->offer->quantity_min || sent->offer->quantity_max) {
-		if (!sent->inv->quantity)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "quantity parameter required");
-		if (sent->offer->quantity_min
-		    && *sent->inv->quantity < *sent->offer->quantity_min)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "quantity must be >= %"PRIu64,
-					    *sent->offer->quantity_min);
-		if (sent->offer->quantity_max
-		    && *sent->inv->quantity > *sent->offer->quantity_max)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "quantity must be <= %"PRIu64,
-					    *sent->offer->quantity_max);
-	} else {
-		if (sent->inv->quantity)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "quantity parameter unnecessary");
-	}
-
-	/* BOLT-offers #12:
-	 *   - MUST set `timestamp` to the number of seconds since Midnight 1
-	 *    January 1970, UTC.
-	 */
-	sent->inv->timestamp = tal(sent->inv, u64);
-	*sent->inv->timestamp = time_now().ts.tv_sec;
-
-	/* BOLT-offers #12:
-	 * - if the expiry for accepting payment is not 7200 seconds after
-	 *   `timestamp`:
-	 *   - MUST set `relative_expiry` `seconds_from_timestamp` to the number
-	 *     of seconds after `timestamp` that payment of this invoice should
-	 *     not be attempted.
-	 */
-	if (sent->wait_timeout != 7200) {
-		sent->inv->relative_expiry = tal(sent->inv, u32);
-		*sent->inv->relative_expiry = sent->wait_timeout;
-	}
-
-	/* BOLT-offers #12:
-	 * - MUST set `payer_key` to the `node_id` of the offer.
-	 */
-	sent->inv->payer_key = sent->offer->node_id;
-
-	/* BOLT-offers #12:
-	 *     - FIXME: recurrence!
-	 */
-	if (sent->offer->recurrence)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "FIXME: handle recurring send_invoice offer!");
-
-	/* BOLT-offers #12:
-	 *
-	 * - if the chain for the invoice is not solely bitcoin:
-	 *   - MUST specify `chains` the offer is valid for.
-	 * - otherwise:
-	 *   - the bitcoin chain is implied as the first and only entry.
-	 */
-	if (!streq(chainparams->network_name, "bitcoin")) {
-		sent->inv->chains = tal_arr(sent->inv, struct bitcoin_blkid, 1);
-		sent->inv->chains[0] = chainparams->genesis_blockhash;
-	}
-
-	sent->inv->features
-		= plugin_feature_set(cmd->plugin)->bits[BOLT11_FEATURE];
-
-	randombytes_buf(&sent->inv_preimage, sizeof(sent->inv_preimage));
-	sent->inv->payment_hash = tal(sent->inv, struct sha256);
-	sha256(sent->inv->payment_hash,
-	       &sent->inv_preimage, sizeof(sent->inv_preimage));
-
-	/* BOLT-offers #12:
-	 * - MUST set (or not set) `refund_for` exactly as the offer did.
-	 *   - if it sets `refund_for`:
-	 *      - MUST set `refund_signature` to the signature of the
-	 *        `refunded_payment_hash` using prefix `refund_signature` and
-	 *         the `payer_key` from the to-be-refunded invoice.
-	 *    - otherwise:
-	 *      - MUST NOT set `refund_signature`
-	 */
-	if (sent->offer->refund_for) {
-		sent->inv->refund_for = sent->offer->refund_for;
-		/* Find original payment invoice */
-		req = jsonrpc_request_start(cmd->plugin, cmd, "listsendpays",
-					    &listsendpays_done,
-					    &forward_error,
-					    sent);
-		json_add_sha256(req->js, "payment_hash",
-				sent->offer->refund_for);
-		return send_outreq(cmd->plugin, req);
-	}
-
-	return sign_invoice(cmd, sent);
-}
-
-static const struct plugin_command commands[] = {
-	{
-		"fetchinvoice",
-		"payment",
-		"Request remote node for an invoice for this {offer}, with {amount}, {quanitity}, {recurrence_counter}, {recurrence_start} and {recurrence_label} iff required.",
-		NULL,
-		json_fetchinvoice,
-	},
-	{
-		"sendinvoice",
-		"payment",
-		"Request remote node for to pay this send_invoice {offer}, with {amount}, {quanitity}, {recurrence_counter}, {recurrence_start} and {recurrence_label} iff required.",
-		NULL,
-		json_sendinvoice,
-	},
-};
-
-static const char *init(struct plugin *p, const char *buf UNUSED,
-			const jsmntok_t *config UNUSED)
-{
-	bool exp_offers;
-
-	rpc_scan(p, "getinfo",
-		 take(json_out_obj(NULL, NULL, NULL)),
-		 "{id:%}", JSON_SCAN(json_to_node_id, &local_id));
-
-	rpc_scan(p, "listconfigs",
-		 take(json_out_obj(NULL, "config", "experimental-offers")),
-		 "{experimental-offers:%}",
-		 JSON_SCAN(json_to_bool, &exp_offers));
-
-	if (!exp_offers)
-		return "offers not enabled in config";
-	return NULL;
-}
-
-static const struct plugin_hook hooks[] = {
-	{
-		"onion_message_blinded",
-		recv_onion_message
-	},
-	{
-		"invoice_payment",
-		invoice_payment,
-	},
-};
-
-int main(int argc, char *argv[])
-{
-	setup_locale();
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, true, NULL,
-		    commands, ARRAY_SIZE(commands),
-		    /* No notifications */
-	            NULL, 0,
-		    hooks, ARRAY_SIZE(hooks),
-		    /* No options */
-		    NULL);
+	return send_message(cmd, sent, true, payload, sendonionmsg_done);
 }

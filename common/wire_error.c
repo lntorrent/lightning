@@ -1,6 +1,6 @@
+#include "config.h"
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/wire_error.h>
 #include <wire/peer_wire.h>
@@ -73,6 +73,43 @@ u8 *towire_warningfmt(const tal_t *ctx,
 	return msg;
 }
 
+u8 *towire_abortfmtv(const tal_t *ctx,
+		     const struct channel_id *channel,
+		     const char *fmt,
+		     va_list ap)
+{
+	/* BOLT #1:
+	 *
+	 * The channel is referred to by `channel_id`, unless `channel_id` is
+	 * 0 (i.e. all bytes are 0), in which case it refers to all
+	 * channels. */
+	static const struct channel_id all_channels;
+	char *estr;
+	u8 *msg;
+
+	estr = tal_vfmt(ctx, fmt, ap);
+	/* We need tal_len to work, so we use copy. */
+	msg = towire_tx_abort(ctx, channel ? channel : &all_channels,
+			      (u8 *)tal_dup_arr(estr, char, estr, strlen(estr), 0));
+	tal_free(estr);
+
+	return msg;
+}
+
+u8 *towire_abortfmt(const tal_t *ctx,
+		    const struct channel_id *channel,
+		    const char *fmt, ...)
+{
+	va_list ap;
+	u8 *msg;
+
+	va_start(ap, fmt);
+	msg = towire_abortfmtv(ctx, channel, fmt, ap);
+	va_end(ap);
+
+	return msg;
+}
+
 bool channel_id_is_all(const struct channel_id *channel_id)
 {
 	return memeqzero(channel_id, sizeof(*channel_id));
@@ -84,15 +121,17 @@ char *sanitize_error(const tal_t *ctx, const u8 *errmsg,
 	struct channel_id dummy;
 	u8 *data;
 	size_t i;
-	bool warning;
+	const char *tag;
 
 	if (!channel_id)
 		channel_id = &dummy;
 
 	if (fromwire_error(ctx, errmsg, channel_id, &data))
-		warning = false;
+		tag = "ERROR";
 	else if (fromwire_warning(ctx, errmsg, channel_id, &data))
-		warning = true;
+		tag = "WARNING";
+	else if (fromwire_tx_abort(ctx, errmsg, channel_id, &data))
+		tag = "ABORT";
 	else
 		return tal_fmt(ctx, "Invalid ERROR message '%s'",
 			       tal_hex(ctx, errmsg));
@@ -116,9 +155,26 @@ char *sanitize_error(const tal_t *ctx, const u8 *errmsg,
 	}
 
 	return tal_fmt(ctx, "%s%s%s: %.*s",
-		       warning ? "warning" : "error",
+		       tag,
 		       channel_id_is_all(channel_id) ? "": " channel ",
 		       channel_id_is_all(channel_id) ? ""
-		       : type_to_string(tmpctx, struct channel_id, channel_id),
+		       : fmt_channel_id(tmpctx, channel_id),
 		       (int)tal_count(data), (char *)data);
 }
+
+const char *is_peer_warning(const tal_t *ctx, const u8 *msg)
+{
+	if (fromwire_peektype(msg) != WIRE_WARNING)
+		return NULL;
+	/* connectd demuxes, so we only see it if channel_id is ours. */
+	return sanitize_error(ctx, msg, NULL);
+}
+
+const char *is_peer_error(const tal_t *ctx, const u8 *msg)
+{
+	if (fromwire_peektype(msg) != WIRE_ERROR)
+		return NULL;
+	/* connectd demuxes, so we only see it if channel_id is ours. */
+	return sanitize_error(ctx, msg, NULL);
+}
+

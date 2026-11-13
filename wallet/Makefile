@@ -1,56 +1,67 @@
 #! /usr/bin/make
 
 WALLET_LIB_SRC :=		\
+	wallet/account_migration.c \
+	wallet/datastore.c 	\
 	wallet/db.c		\
 	wallet/invoices.c	\
+	wallet/migrations.c	\
+	wallet/psbt_fixup.c	\
 	wallet/txfilter.c	\
 	wallet/wallet.c		\
 	wallet/walletrpc.c
 
-WALLET_LIB_SRC_NOHDR :=		\
+WALLET_LIB_SRC_NOHDR :=			\
 	wallet/reservation.c
 
-WALLET_DB_DRIVERS :=		\
-	wallet/db_postgres.c	\
-	wallet/db_sqlite3.c
+WALLET_DB_QUERIES  := 			\
+	wallet/db_sqlite3_sqlgen.c 	\
+	wallet/db_postgres_sqlgen.c
 
-WALLET_SRC := $(WALLET_LIB_SRC) $(WALLET_LIB_SRC_NOHDR) $(WALLET_DB_DRIVERS)
+WALLET_SRC := $(WALLET_LIB_SRC) $(WALLET_LIB_SRC_NOHDR) $(WALLET_DB_QUERIES)
 WALLET_HDRS := $(WALLET_LIB_SRC:.c=.h)
 
 WALLET_OBJS := $(WALLET_SRC:.c=.o)
-$(WALLET_OBJS): $(WALLET_HDRS) $(LIGHTNINGD_HEADERS)
+
+# This really should be a subdir of lightningd/.  We depend on their headers!
+$(WALLET_OBJS): $(LIGHTNINGD_SRC:.c=.h)
 
 # Make sure these depend on everything.
-ALL_C_SOURCES += $(WALLET_SRC) wallet/db_sqlite3_sqlgen.c wallet/db_postgres_sqlgen.c
+ALL_C_SOURCES += $(WALLET_SRC) $(WALLET_DB_QUERIES)
 ALL_C_HEADERS += $(WALLET_HDRS)
 
-# Each database driver depends on its rewritten statements.
-wallet/db_sqlite3.o: wallet/db_sqlite3_sqlgen.c
-wallet/db_postgres.o: wallet/db_postgres_sqlgen.c
-
 # The following files contain SQL-annotated statements that we need to extact
-SQL_FILES := 				\
+WALLET_SQL_FILES := 			\
+	$(DB_SQL_FILES)			\
+	wallet/account_migration.c	\
 	wallet/db.c 			\
+	wallet/datastore.c 		\
 	wallet/invoices.c		\
+	wallet/migrations.c 		\
 	wallet/wallet.c 		\
 	wallet/test/run-db.c		\
 	wallet/test/run-wallet.c	\
+	wallet/test/run-chain_moves_duplicate-detect.c	\
+	wallet/test/run-migrate_remove_chain_moves_duplicates.c \
+	wallet/test/run-migrate_backfill_bwatch_tables.c \
+	tools/lightning-downgrade.c \
 
-wallet/statements_gettextgen.po: $(SQL_FILES) FORCE
-	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
-		$(call VERBOSE,"xgettext $@",xgettext -kNAMED_SQL -kSQL --add-location --no-wrap --omit-header -o $@ $(SQL_FILES) && $(call SHA256STAMP,# )); \
+
+wallet/statements_gettextgen.po: $(WALLET_SQL_FILES) $(FORCE)
+	@if $(call SHA256STAMP_CHANGED); then \
+		$(call VERBOSE,"xgettext $@",xgettext -kNAMED_SQL -kSQL --add-location --no-wrap --omit-header -o $@ $(WALLET_SQL_FILES) && $(call SHA256STAMP,# ,)); \
 	fi
 
-wallet/db_%_sqlgen.c: wallet/statements_gettextgen.po devtools/sql-rewrite.py FORCE
-	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
-		$(call VERBOSE,"sql-rewrite $@",devtools/sql-rewrite.py wallet/statements_gettextgen.po $* > $@ && $(call SHA256STAMP,//)); \
+wallet/db_%_sqlgen.c: wallet/statements_gettextgen.po devtools/sql-rewrite.py $(FORCE)
+	@if $(call SHA256STAMP_CHANGED); then \
+		$(call VERBOSE,"sql-rewrite $@",devtools/sql-rewrite.py wallet/statements_gettextgen.po $* > $@ && $(call SHA256STAMP,//,)); \
 	fi
 
-maintainer-clean: wallet-maintainer-clean
+maintainer-clean: clean
+clean: wallet-maintainer-clean
 wallet-maintainer-clean:
 	$(RM) wallet/statements.po
 	$(RM) wallet/statements_gettextgen.po
-	$(RM) wallet/db_sqlite3_sqlgen.c
-	$(RM) wallet/db_postgres_sqlgen.c
+	$(RM) $(WALLET_DB_QUERIES)
 
 include wallet/test/Makefile

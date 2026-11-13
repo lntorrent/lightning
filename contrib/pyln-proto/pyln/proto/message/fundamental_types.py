@@ -254,17 +254,18 @@ def fundamental_types() -> List[FieldType]:
     # Various fundamental types are referred to in the message specifications:
     #
     # * `byte`: an 8-bit byte
+    # * `s8`: an 8-bit signed integer
     # * `u16`: a 2 byte unsigned integer
+    # * `s16`: a 2 byte signed integer
     # * `u32`: a 4 byte unsigned integer
+    # * `s32`: a 4 byte signed integer
     # * `u64`: an 8 byte unsigned integer
-    #
-    # Inside TLV records which contain a single value, leading zeros in
-    # integers can be omitted:
-    #
-    # * `tu16`: a 0 to 2 byte unsigned integer
-    # * `tu32`: a 0 to 4 byte unsigned integer
-    # * `tu64`: a 0 to 8 byte unsigned integer
-    #
+    # * `s64`: an 8 byte signed integer
+    # ...
+    # * `tu16`: a 0 to 2 byte truncated unsigned integer
+    # * `tu32`: a 0 to 4 byte truncated unsigned integer
+    # * `tu64`: a 0 to 8 byte truncated unsigned integer
+    # ...
     # The following convenience types are also defined:
     #
     # * `chain_hash`: a 32-byte chain identifier (see [BOLT
@@ -273,10 +274,12 @@ def fundamental_types() -> List[FieldType]:
     #   #2](02-peer-protocol.md#definition-of-channel-id))
     # * `sha256`: a 32-byte SHA2-256 hash
     # * `signature`: a 64-byte bitcoin Elliptic Curve signature
+    # ...
     # * `point`: a 33-byte Elliptic Curve point (compressed encoding as per
     #   [SEC 1 standard](http://www.secg.org/sec1-v2.pdf#subsubsection.2.3.3))
     # * `short_channel_id`: an 8 byte value identifying a channel (see [BOLT
     #   #7](07-routing-gossip.md#definition-of-short-channel-id))
+    # ...
     # * `bigsize`: a variable-length, unsigned integer similar to Bitcoin's
     #   CompactSize encoding, but big-endian.  Described in
     #   [BigSize](#appendix-a-bigsize-test-vectors).
@@ -284,6 +287,10 @@ def fundamental_types() -> List[FieldType]:
             IntegerType('u16', 2, '>H'),
             IntegerType('u32', 4, '>I'),
             IntegerType('u64', 8, '>Q'),
+            IntegerType('s8', 1, 'b'),
+            IntegerType('s16', 2, '>h'),
+            IntegerType('s32', 4, '>i'),
+            IntegerType('s64', 8, '>q'),
             TruncatedIntType('tu16', 2),
             TruncatedIntType('tu32', 4),
             TruncatedIntType('tu64', 8),
@@ -294,6 +301,9 @@ def fundamental_types() -> List[FieldType]:
             ShortChannelIDType('short_channel_id'),
             FundamentalHexType('signature', 64),
             BigSizeType('bigsize'),
+            # Extra types added in offers draft:
+            IntegerType('utf8', 1, 'B'),
+            FundamentalHexType('bip340sig', 64),
             ]
 
 

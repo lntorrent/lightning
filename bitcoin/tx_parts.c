@@ -10,67 +10,9 @@ static void destroy_wally_tx_input(struct wally_tx_input *in)
 	wally_tx_input_free(in);
 }
 
-static struct wally_tx_input *clone_input(const struct wally_tx_input *src)
-{
-	struct wally_tx_input *in;
-	int ret;
-
-	if (is_elements(chainparams)) {
-		ret = wally_tx_elements_input_init_alloc
-			(src->txhash, sizeof(src->txhash),
-			 src->index, src->sequence,
-			 src->script, src->script_len,
-			 src->witness,
-			 src->blinding_nonce, sizeof(src->blinding_nonce),
-			 src->entropy, sizeof(src->entropy),
-			 src->issuance_amount, src->issuance_amount_len,
-			 src->inflation_keys, src->inflation_keys_len,
-			 src->issuance_amount_rangeproof,
-			 src->issuance_amount_rangeproof_len,
-			 src->inflation_keys_rangeproof,
-			 src->inflation_keys_rangeproof_len,
-			 src->pegin_witness,
-			 &in);
-	} else {
-		ret = wally_tx_input_init_alloc(src->txhash, sizeof(src->txhash),
-						src->index, src->sequence,
-						src->script, src->script_len,
-						src->witness, &in);
-	}
-	assert(ret == WALLY_OK);
-
-	tal_add_destructor(in, destroy_wally_tx_input);
-	return in;
-}
-
 static void destroy_wally_tx_output(struct wally_tx_output *out)
 {
 	wally_tx_output_free(out);
-}
-
-static struct wally_tx_output *clone_output(const struct wally_tx_output *src)
-{
-	struct wally_tx_output *out;
-	int ret;
-
-	if (is_elements(chainparams)) {
-		ret = wally_tx_elements_output_init_alloc
-			(src->script, src->script_len,
-			 src->asset, src->asset_len,
-			 src->value, src->value_len,
-			 src->nonce, src->nonce_len,
-			 src->surjectionproof, src->surjectionproof_len,
-			 src->rangeproof, src->rangeproof_len,
-			 &out);
-	} else {
-		ret = wally_tx_output_init_alloc(src->satoshi,
-						 src->script, src->script_len,
-						 &out);
-	}
-	assert(ret == WALLY_OK);
-
-	tal_add_destructor(out, destroy_wally_tx_output);
-	return out;
 }
 
 struct tx_parts *tx_parts_from_wally_tx(const tal_t *ctx,
@@ -87,13 +29,32 @@ struct tx_parts *tx_parts_from_wally_tx(const tal_t *ctx,
 	for (size_t i = 0; i < wtx->num_inputs; i++) {
 		if (input != -1 && input != i)
 			continue;
-		txp->inputs[i] = clone_input(&wtx->inputs[i]);
+		if (wally_tx_input_clone_alloc(&wtx->inputs[i],
+					       &txp->inputs[i]) != WALLY_OK)
+			abort();
+		tal_add_destructor(txp->inputs[i], destroy_wally_tx_input);
 	}
 
 	for (size_t i = 0; i < wtx->num_outputs; i++) {
 		if (output != -1 && output != i)
 			continue;
-		txp->outputs[i] = clone_output(&wtx->outputs[i]);
+		if (wally_tx_output_clone_alloc(&wtx->outputs[i],
+						&txp->outputs[i]) != WALLY_OK)
+			abort();
+		tal_add_destructor(txp->outputs[i], destroy_wally_tx_output);
+
+		/* Cheat a bit by also setting the numeric satoshi
+		 * value, otherwise we end up converting a
+		 * number of times */
+		if (chainparams->is_elements) {
+			struct amount_asset asset;
+			struct amount_sat sats;
+			asset = wally_tx_output_get_amount(txp->outputs[i]);
+			/* FIXME: non l-btc assets */
+			assert(amount_asset_is_main(&asset));
+			sats = amount_asset_to_sat(&asset);
+			txp->outputs[i]->satoshi = sats.satoshis; /* Raw: wally conversion */
+		}
 	}
 	tal_wally_end(txp);
 
@@ -141,7 +102,7 @@ fromwire_wally_tx_witness_stack(const tal_t *ctx,
 
 	tal_add_destructor(ws, destroy_wally_tx_witness_stack);
 out:
-	tal_wally_end(tal_steal(ctx, ws));
+	tal_wally_end_onto(ctx, ws, struct wally_tx_witness_stack);
 	return ws;
 }
 
@@ -239,7 +200,7 @@ static struct wally_tx_input *fromwire_wally_tx_input(const tal_t *ctx,
 		tal_add_destructor(in, destroy_wally_tx_input);
 	}
 
-	tal_wally_end(tal_steal(ctx, in));
+	tal_wally_end_onto(ctx, in, struct wally_tx_input);
 	return in;
 }
 
@@ -281,6 +242,9 @@ static struct wally_tx_output *fromwire_wally_tx_output(const tal_t *ctx,
 			 surjectionproof, tal_bytelen(surjectionproof),
 			 rangeproof, tal_bytelen(rangeproof),
 			 &out);
+
+		/* As a convenience, we sent the value over as satoshis */
+		out->satoshi = fromwire_u64(cursor, max);
 	} else {
 		u64 satoshi;
 		satoshi = fromwire_u64(cursor, max);
@@ -294,7 +258,7 @@ static struct wally_tx_output *fromwire_wally_tx_output(const tal_t *ctx,
 	} else {
 		tal_add_destructor(out, destroy_wally_tx_output);
 	}
-	tal_wally_end(tal_steal(ctx, out));
+	tal_wally_end_onto(ctx, out, struct wally_tx_output);
 
 	return out;
 }
@@ -348,6 +312,8 @@ static void towire_wally_tx_output(u8 **pptr, const struct wally_tx_output *out)
 				out->surjectionproof_len);
 		towire_u32(pptr, out->rangeproof_len);
 		towire_u8_array(pptr, out->rangeproof, out->rangeproof_len);
+		/* Copy the value over, as a convenience */
+		towire_u64(pptr, out->satoshi);
 	} else {
 		towire_u64(pptr, out->satoshi);
 	}

@@ -3,7 +3,6 @@
 #include "config.h"
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
-#include <stddef.h>
 
 struct wally_psbt;
 struct wally_psbt_input;
@@ -13,21 +12,15 @@ struct wally_tx_output;
 struct wally_map;
 struct amount_asset;
 struct amount_sat;
+struct bitcoin_outpoint;
 struct bitcoin_signature;
 struct bitcoin_txid;
 struct pubkey;
 
-/** psbt_destroy - Destroy a PSBT that is not tal-allocated
- *
- * @psbt - the PSBT to destroy
- *
- * WARNING Do NOT call this function directly if you got the
- * PSBT from create_psbt, new_psbt, psbt_from_bytes,
- * psbt_from_b64, or fromwire_wally_psbt.
- * Those functions register this function as a `tal_destructor`
- * automatically.
- */
-void psbt_destroy(struct wally_psbt *psbt);
+
+/* Utility we need for psbt stuffs;
+ * add the varint onto the given array */
+void add_varint(u8 **arr, size_t val);
 
 /**
  * create_psbt - Create a new psbt object
@@ -41,7 +34,7 @@ struct wally_psbt *create_psbt(const tal_t *ctx, size_t num_inputs, size_t num_o
 
 /*
  * new_psbt - Create a PSBT, using the passed in tx
- * 	      as the global_tx
+ * 	      as the locktime/inputs/output psbt fields
  *
  * @ctx - allocation context
  * @wtx - global_tx starter kit
@@ -55,7 +48,29 @@ struct wally_psbt *new_psbt(const tal_t *ctx,
  * @ctx - allocation context
  * @psbt - psbt to be cloned
  */
-struct wally_psbt *clone_psbt(const tal_t *ctx, struct wally_psbt *psbt);
+struct wally_psbt *clone_psbt(const tal_t *ctx, const struct wally_psbt *psbt);
+
+/**
+ * combine_psbt - Combine two PSBT into a cloned copy
+ *
+ * @ctx - allocation context
+ * @psbt0 - one psbt
+ * @psbt1 - other psbt
+ */
+struct wally_psbt *combine_psbt(const tal_t *ctx,
+				const struct wally_psbt *psbt0,
+				const struct wally_psbt *psbt1);
+
+/**
+ * audit_psbt - Audit the memory structure of the PSBT.
+ *
+ * This checks all known memory allocations in the PSBT and asserts that they
+ * are all allocated with 'ctx' being it's parent.
+ *
+ * ctx - the ctx all memory *should* be attached to
+ * psbt - the PSBT to audit.
+ * */
+void audit_psbt(const tal_t *ctx, const struct wally_psbt *psbt);
 
 /**
  * psbt_is_finalized - Check if tx is ready to be extracted
@@ -104,7 +119,7 @@ bool psbt_finalize(struct wally_psbt *psbt);
  */
 struct wally_tx *psbt_final_tx(const tal_t *ctx, const struct wally_psbt *psbt);
 
-/* psbt_make_key - Create a new, proprietary c-lightning key
+/* psbt_make_key - Create a new, proprietary Core Lightning key
  *
  * @ctx - allocation context
  * @key_subtype - type for this key
@@ -115,13 +130,13 @@ struct wally_tx *psbt_final_tx(const tal_t *ctx, const struct wally_psbt *psbt);
 u8 *psbt_make_key(const tal_t *ctx, u8 key_subtype, const u8 *key_data);
 
 struct wally_psbt_input *psbt_add_input(struct wally_psbt *psbt,
-					struct wally_tx_input *input,
+					const struct wally_tx_input *input,
 					size_t insert_at);
 
 /* One stop shop for adding an input + metadata to a PSBT */
 struct wally_psbt_input *psbt_append_input(struct wally_psbt *psbt,
-					   const struct bitcoin_txid *txid,
-					   u32 outnum, u32 sequence,
+					   const struct bitcoin_outpoint *outpoint,
+					   u32 sequence,
 					   const u8 *scriptSig,
 					   const u8 *input_wscript,
 					   const u8 *redeemscript);
@@ -133,6 +148,9 @@ void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
 /* psbt_input_set_utxo - Set the non-witness utxo field for this PSBT input */
 void psbt_input_set_utxo(struct wally_psbt *psbt, size_t in,
 			 const struct wally_tx *prev_tx);
+
+void psbt_input_set_outpoint(struct wally_psbt *psbt, size_t in,
+			     struct bitcoin_outpoint outpoint);
 
 /* psbt_elements_input_set_asset - Set the asset/value fields for an
  * 				   Elements PSBT (PSET, technically */
@@ -165,23 +183,34 @@ void psbt_rm_output(struct wally_psbt *psbt,
 		    size_t remove_at);
 
 void psbt_input_add_pubkey(struct wally_psbt *psbt, size_t in,
-			   const struct pubkey *pubkey);
+			   const struct pubkey *pubkey, bool is_taproot);
 
 WARN_UNUSED_RESULT bool psbt_input_set_signature(struct wally_psbt *psbt, size_t in,
 						 const struct pubkey *pubkey,
 						 const struct bitcoin_signature *sig);
 
+/* Returns false on error. On success, *signature_found is set to true if the
+ * input has a signature present for `pubkey` and false if if one was not found.
+ * Only signature presence is checked, it is not validated. */
+WARN_UNUSED_RESULT bool psbt_input_have_signature(const struct wally_psbt *psbt,
+						  size_t in,
+						  const struct pubkey *pubkey,
+						  bool *signature_found);
+
+/* Returns false on error. On success *sig is set to the signature otherwise
+ * *sig is set to NULL. */
+WARN_UNUSED_RESULT bool psbt_input_get_ecdsa_sig(const tal_t *ctx,
+						 const struct wally_psbt *psbt,
+						 size_t in,
+						 const struct pubkey *pubkey,
+						 struct bitcoin_signature **sig);
+
 void psbt_input_set_witscript(struct wally_psbt *psbt, size_t in, const u8 *wscript);
-void psbt_elements_input_init(struct wally_psbt *psbt, size_t in,
-			      const u8 *scriptPubkey,
-			      struct amount_asset *asset,
-			      const u8 *nonce);
-void psbt_elements_input_init_witness(struct wally_psbt *psbt, size_t in,
-				      const u8 *witscript,
-				      struct amount_asset *asset,
-				      const u8 *nonce);
-bool psbt_input_set_redeemscript(struct wally_psbt *psbt, size_t in,
-				 const u8 *redeemscript);
+
+const u8 *psbt_input_get_witscript(const tal_t *ctx,
+				   const struct wally_psbt *psbt,
+				   size_t in);
+
 /* psbt_input_set_unknown - Set the given Key-Value in the psbt's input keymap
  * @ctx - tal context for allocations
  * @in - psbt input to set key-value on
@@ -194,16 +223,6 @@ void psbt_input_set_unknown(const tal_t *ctx,
 			    const u8 *key,
 			    const void *value,
 			    size_t value_len);
-/* psbt_get_unknown - Fetch the value from the given map at key
- *
- * @map - map of unknowns to search for key
- * @key - key of key-value pair to return value for
- * @value_len - (out) length of value (if found)
- *
- * Returns: value at @key, or NULL if not found */
-void *psbt_get_unknown(const struct wally_map *map,
-		       const u8 *key,
-		       size_t *val_len);
 
 /* psbt_get_lightning - Fetch a proprietary lightning value from the given map
  *
@@ -215,6 +234,19 @@ void *psbt_get_unknown(const struct wally_map *map,
 void *psbt_get_lightning(const struct wally_map *map,
 			 const u8 proprietary_type,
 			 size_t *val_len);
+
+/* psbt_set_lightning - Set a propreitary lightning value on the given map
+ *
+ * @map - map of unknowns to set the value
+ * @proprietary_type - type no. to set
+ * @value - the value to be set
+ * @val_len - length of value
+ */
+void psbt_set_lightning(const tal_t *ctx,
+			struct wally_map *map,
+			const u8 proprietary_type,
+			const void *value,
+			size_t val_len);
 
 /* psbt_output_set_unknown - Set the given Key-Value in the psbt's output keymap
  *
@@ -237,6 +269,21 @@ void psbt_output_set_unknown(const tal_t *ctx,
 struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
 					size_t in);
 
+enum PSBT_GUESS {
+	PSBT_GUESS_ZERO = 0x0, /* Assume unknown is 0 bytes (fallback) */
+	PSBT_GUESS_2OF2 = 0x1, /* Assume P2WSH is 2of2 multisig (req prevtx) */
+};
+
+/* psbt_input_get_weight - Calculate the tx weight for input index `in`.
+ *
+ * @psbt - psbt
+ * @in - index of input who's weight you want
+ * @guess - How to guess if we have incomplete information
+ * */
+size_t psbt_input_get_weight(const struct wally_psbt *psbt,
+			     size_t in,
+			     enum PSBT_GUESS guess);
+
 /* psbt_output_get_amount - Returns the value of this output
  *
  * @psbt - psbt
@@ -244,6 +291,10 @@ struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
  */
 struct amount_sat psbt_output_get_amount(const struct wally_psbt *psbt,
 					 size_t out);
+
+/* psbt_output_get_weight - Calculate the tx weight for output index `outnum` */
+size_t psbt_output_get_weight(const struct wally_psbt *psbt,
+			      size_t outnum);
 
 /* psbt_compute_fee - Returns value of fee for PSBT
  *
@@ -254,19 +305,45 @@ struct amount_sat psbt_compute_fee(const struct wally_psbt *psbt);
 /* psbt_has_input - Is this input present on this psbt
  *
  * @psbt - psbt
- * @txid - txid of input
- * @outnum - output index of input
+ * @outpoint - txid/index spent by input
  */
 bool psbt_has_input(const struct wally_psbt *psbt,
-		    const struct bitcoin_txid *txid,
-		    u32 outnum);
+		    const struct bitcoin_outpoint *outpoint);
+
+/* wally_psbt_input_spends - Returns true if PSBT input spends given outpoint
+ *
+ * @input - psbt input
+ * @outpoint - outpoint
+ */
+bool wally_psbt_input_spends(const struct wally_psbt_input *input,
+               const struct bitcoin_outpoint *outpoint);
+
+void wally_psbt_input_get_outpoint(const struct wally_psbt_input *in,
+                 struct bitcoin_outpoint *outpoint);
+
+const u8 *wally_psbt_output_get_script(const tal_t *ctx,
+                     const struct wally_psbt_output *output);
+
+void wally_psbt_input_get_txid(const struct wally_psbt_input *in,
+                 struct bitcoin_txid *txid);
+
+struct amount_asset
+wally_psbt_output_get_amount(const struct wally_psbt_output *output);
+
+/* psbt_set_version - Returns false if there was any issue with the PSBT.
+ * Returns true if it was a well-formed PSET and treats it as a no-op
+ */
+bool psbt_set_version(struct wally_psbt *psbt, u32 version);
+
+bool elements_psbt_output_is_fee(const struct wally_psbt *psbt, size_t outnum);
 
 struct wally_psbt *psbt_from_b64(const tal_t *ctx,
 				 const char *b64,
 				 size_t b64len);
-char *psbt_to_b64(const tal_t *ctx, const struct wally_psbt *psbt);
+char *fmt_wally_psbt(const tal_t *ctx, const struct wally_psbt *psbt);
 const u8 *psbt_get_bytes(const tal_t *ctx, const struct wally_psbt *psbt,
 			 size_t *bytes_written);
+bool validate_psbt(const struct wally_psbt *psbt);
 struct wally_psbt *psbt_from_bytes(const tal_t *ctx, const u8 *bytes,
 				   size_t byte_len);
 void towire_wally_psbt(u8 **pptr, const struct wally_psbt *psbt);

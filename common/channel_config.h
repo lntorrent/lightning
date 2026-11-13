@@ -1,8 +1,6 @@
 #ifndef LIGHTNING_COMMON_CHANNEL_CONFIG_H
 #define LIGHTNING_COMMON_CHANNEL_CONFIG_H
 #include "config.h"
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
 #include <common/amount.h>
 
 /* BOLT #2:
@@ -20,7 +18,9 @@
  *    * [`u32`:`feerate_per_kw`]
  *    * [`u16`:`to_self_delay`]
  *    * [`u16`:`max_accepted_htlcs`]
- *...
+ */
+/* BOLT #2:
+ *
  * 1. type: 33 (`accept_channel`)
  * 2. data:
  *    * [`32*byte`:`temporary_channel_id`]
@@ -44,8 +44,8 @@ struct channel_config {
 	/* BOLT #2:
 	 *
 	 * `max_htlc_value_in_flight_msat` is a cap on total value of
-	 * outstanding HTLCs, which allows a node to limit its exposure to
-	 * HTLCs */
+	 * outstanding HTLCs offered by the remote node, which allows the
+	 * local node to limit its exposure to HTLCs */
 	struct amount_msat max_htlc_value_in_flight;
 
 	/* BOLT #2:
@@ -71,9 +71,35 @@ struct channel_config {
 	/* BOLT #2:
 	 *
 	 * similarly, `max_accepted_htlcs` limits the number of outstanding
-	 * HTLCs the other node can offer. */
+	 * HTLCs the remote node can offer. */
 	u16 max_accepted_htlcs;
+
+	/* BOLT-TBD #X
+	 *
+	 * maximum dust exposure allowed for this channel
+	 */
+	struct amount_msat max_dust_htlc_exposure_msat;
 };
+
+/* Bounds on the peer's dust_limit_satoshis, checked at negotiation.
+ * max_dust_htlc_exposure_msat above caps trimmed HTLCs; this caps the
+ * dust limit itself, so our balance output can't be trimmed too. */
+
+/* BOLT #3:
+ *
+ * Bitcoin Core defines the following dust thresholds:
+ *
+ * - pay to pubkey hash (p2pkh): 546 satoshis
+ * - pay to script hash (p2sh): 540 satoshis
+ * - pay to witness pubkey hash (p2wpkh): 294 satoshis
+ * - pay to witness script hash (p2wsh): 330 satoshis
+ * - pay to anchor (p2a): 240 satoshis
+ * - unknown segwit versions: 354 satoshis
+ * - `OP_RETURN` outputs: these are never dust
+ */
+#define MIN_REMOTE_DUST_LIMIT AMOUNT_SAT(354)
+
+#define MAX_REMOTE_DUST_LIMIT AMOUNT_SAT(5000)
 
 void towire_channel_config(u8 **pptr, const struct channel_config *config);
 void fromwire_channel_config(const u8 **ptr, size_t *max,

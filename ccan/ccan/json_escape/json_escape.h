@@ -27,6 +27,9 @@ struct json_escape *json_escape_len(const tal_t *ctx,
 struct json_escape *json_partial_escape(const tal_t *ctx,
 					 const char *str TAKES);
 
+/* Copy a json_escape */
+struct json_escape *json_escape_dup(const tal_t *ctx, const struct json_escape *esc TAKES);
+
 /* Do we need to escape this str? */
 bool json_escape_needed(const char *str, size_t len);
 
@@ -41,4 +44,8 @@ struct json_escape *json_escape_string_(const tal_t *ctx,
 /* Be very careful here!  Can fail!  Doesn't handle \u: use UTF-8 please. */
 const char *json_escape_unescape(const tal_t *ctx,
 				 const struct json_escape *esc);
+
+/* Be very careful here!  Can fail!  Doesn't handle \u: use UTF-8 please. */
+const char *json_escape_unescape_len(const tal_t *ctx,
+				     const char *esc TAKES, size_t len);
 #endif /* CCAN_JSON_ESCAPE_H */

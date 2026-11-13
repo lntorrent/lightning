@@ -1,20 +1,14 @@
-#include <bitcoin/short_channel_id.h>
+#include "config.h"
 #include <ccan/crc32c/crc32c.h>
 #include <ccan/err/err.h>
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
-#include <common/amount.h>
 #include <common/gossip_store.h>
-#include <common/node_id.h>
-#include <common/type_to_string.h>
+#include <common/gossip_store_wiregen.h>
 #include <common/utils.h>
 #include <fcntl.h>
-#include <gossipd/gossip_store_wiregen.h>
 #include <inttypes.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 #include <wire/peer_wire.h>
 
@@ -54,7 +48,8 @@ static void write_outmsg(int outfd, const u8 *outmsg, u32 timestamp)
 {
 	struct gossip_hdr hdr;
 
-	hdr.len = cpu_to_be32(tal_count(outmsg));
+	hdr.flags = CPU_TO_BE16(GOSSIP_STORE_COMPLETED_BIT);
+	hdr.len = cpu_to_be16(tal_count(outmsg));
 	hdr.crc = cpu_to_be32(crc32c(timestamp, outmsg, tal_count(outmsg)));
 	hdr.timestamp = cpu_to_be32(timestamp);
 
@@ -71,12 +66,12 @@ static u32 get_update_timestamp(const u8 *msg, struct short_channel_id *scid)
 	u8 u8_ignore;
 	u16 u16_ignore;
 	u32 u32_ignore;
-	struct amount_msat msat;
+	struct amount_msat msat_ignore;
 
 	if (fromwire_channel_update(msg, &sig, &chain_hash, scid,
 				    &timestamp, &u8_ignore, &u8_ignore,
-				    &u16_ignore, &msat, &u32_ignore,
-				    &u32_ignore))
+				    &u16_ignore, &msat_ignore, &u32_ignore,
+				    &u32_ignore, &msat_ignore))
 		return timestamp;
 	errx(1, "Invalid channel_update");
 }
@@ -88,9 +83,11 @@ static u32 get_node_announce_timestamp(const u8 *msg)
 	struct node_id id;
 	u8 rgb_color[3], alias[32];
 	u8 *features, *addresses;
+	struct tlv_node_ann_tlvs *na_tlvs;
 
 	if (fromwire_node_announcement(tmpctx, msg, &sig, &features, &timestamp,
-				       &id, rgb_color, alias, &addresses))
+				       &id, rgb_color, alias, &addresses,
+				       &na_tlvs))
 		return timestamp;
 
 	errx(1, "Invalid node_announcement");
@@ -160,7 +157,7 @@ int main(int argc, char *argv[])
 	} else
 		outfd = STDOUT_FILENO;
 
-	version = GOSSIP_STORE_VERSION;
+	version = ((0 << 5) | 10);
 	if (!write_all(outfd, &version, sizeof(version)))
 		err(1, "Writing version");
 
@@ -201,7 +198,7 @@ int main(int argc, char *argv[])
 								   &pubkey,
 								   &pubkey))
 					errx(1, "bad channel_announcement");
-			        if (!short_channel_id_eq(&scid, &scidsats[scidi].scid))
+			        if (!short_channel_id_eq(scid, scidsats[scidi].scid))
 					errx(1, "scid of channel_announcement does not match scid in csv");
 				if (last_announce)
 					errx(1, "Expected update before announce");
@@ -214,8 +211,8 @@ int main(int argc, char *argv[])
 			/* We assume update immediately follows announcement */
 			timestamp = get_update_timestamp(inmsg, &scid);
 			if (last_announce) {
-				if (scidsats && !short_channel_id_eq(&scid,
-							 &scidsats[scidi].scid))
+				if (scidsats && !short_channel_id_eq(scid,
+							 scidsats[scidi].scid))
 					errx(1, "scid of channel_update does not match scid in csv");
 
 				/* Now we have timestamp, write out announce */

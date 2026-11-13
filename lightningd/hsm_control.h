@@ -2,9 +2,6 @@
 #define LIGHTNING_LIGHTNINGD_HSM_CONTROL_H
 #include "config.h"
 #include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
-#include <hsmd/capabilities.h>
-#include <stdbool.h>
 
 struct lightningd;
 struct node_id;
@@ -14,10 +11,23 @@ struct ext_key;
 int hsm_get_client_fd(struct lightningd *ld,
 		      const struct node_id *id,
 		      u64 dbid,
-		      int capabilities);
+		      u64 permissions);
 
 /* Ask HSM for an fd for a global subdaemon to use (gossipd, connectd) */
-int hsm_get_global_fd(struct lightningd *ld, int capabilities);
+int hsm_get_global_fd(struct lightningd *ld, u64 permissions);
+
+/* Is this capability supported by the HSM? (So far, always a message
+ * number) */
+bool hsm_capable(struct lightningd *ld, u32 msgtype);
 
 struct ext_key *hsm_init(struct lightningd *ld);
+
+/* Send request to hsmd, get response. */
+const u8 *hsm_sync_req(const tal_t *ctx,
+		       struct lightningd *ld,
+		       const u8 *msg TAKES);
+
+void bip32_pubkey(struct lightningd *ld, struct pubkey *pubkey, u32 index);
+void bip86_pubkey(struct lightningd *ld, struct pubkey *pubkey, u32 index);
+
 #endif /* LIGHTNING_LIGHTNINGD_HSM_CONTROL_H */

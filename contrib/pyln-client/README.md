@@ -15,13 +15,13 @@ pip install pyln-client
 ```
 
 Alternatively you can also install the development version to get access to
-currently unreleased features by checking out the c-lightning source code and
+currently unreleased features by checking out the Core Lightning source code and
 installing into your python3 environment:
 
 ```bash
 git clone https://github.com/ElementsProject/lightning.git
 cd lightning/contrib/pyln-client
-python3 setup.py develop
+uv sync
 ```
 
 This will add links to the library into your environment so changing the
@@ -40,7 +40,7 @@ Generate invoice on one daemon and pay it on the other
 from pyln.client import LightningRpc
 import random
 
-# Create two instances of the LightningRpc object using two different c-lightning daemons on your computer
+# Create two instances of the LightningRpc object using two different Core Lightning daemons on your computer
 l1 = LightningRpc("/tmp/lightning1/lightning-rpc")
 l5 = LightningRpc("/tmp/lightning5/lightning-rpc")
 
@@ -91,11 +91,13 @@ def hello(plugin, name="world"):
 @plugin.init()
 def init(options, configuration, plugin):
     plugin.log("Plugin helloworld.py initialized")
+    # This can also return {'disabled': <reason>} to self-disable,
+	# but normally it returns None.
 
 
 @plugin.subscribe("connect")
-def on_connect(plugin, id, address):
-    plugin.log("Received connect event for peer {}".format(id))
+def on_connect(plugin, connect, **kwargs):
+    plugin.log("Received connect event for peer {}".format(connect))
 
 
 plugin.add_option('greeting', 'Hello', 'The greeting I should use.')

@@ -1,13 +1,9 @@
+#include "config.h"
 #include "wire.h"
 #include <assert.h>
-#include <ccan/crypto/ripemd160/ripemd160.h>
 #include <ccan/crypto/siphash24/siphash24.h>
-#include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
-#include <ccan/tal/tal.h>
-#include <common/amount.h>
-#include <common/errcode.h>
-#include <common/node_id.h>
+#include <channeld/inflight.h>
 #include <common/utils.h>
 
 void towire(u8 **pptr, const void *data, size_t len)
@@ -15,7 +11,9 @@ void towire(u8 **pptr, const void *data, size_t len)
 	size_t oldsize = tal_count(*pptr);
 
 	tal_resize(pptr, oldsize + len);
-	memcpy(*pptr + oldsize, memcheck(data, len), len);
+	/* The C standards committee has a lot to answer for :( */
+	if (len)
+		memcpy(*pptr + oldsize, memcheck(data, len), len);
 }
 
 void towire_u8(u8 **pptr, u8 v)
@@ -41,6 +39,26 @@ void towire_u64(u8 **pptr, u64 v)
 	towire(pptr, &l, sizeof(l));
 }
 
+void towire_s8(u8 **pptr, s8 v)
+{
+	towire_u8(pptr, (u8)v);
+}
+
+void towire_s32(u8 **pptr, s32 v)
+{
+	towire_u32(pptr, (u32)v);
+}
+
+void towire_s16(u8 **pptr, s16 v)
+{
+	towire_u16(pptr, (u16)v);
+}
+
+void towire_s64(u8 **pptr, s64 v)
+{
+	towire_u64(pptr, (u64)v);
+}
+
 static void towire_tlv_uint(u8 **pptr, u64 v)
 {
 	u8 bytes[8];
@@ -48,8 +66,7 @@ static void towire_tlv_uint(u8 **pptr, u64 v)
 	be64 val;
 
 	val = cpu_to_be64(v);
-	BUILD_ASSERT(sizeof(val) == sizeof(bytes));
-	memcpy(bytes, &val, sizeof(bytes));
+	CROSS_TYPE_ASSIGNMENT(&bytes, &val);
 
 	for (num_zeroes = 0; num_zeroes < sizeof(bytes); num_zeroes++)
 		if (bytes[num_zeroes] != 0)
@@ -79,7 +96,7 @@ void towire_bool(u8 **pptr, bool v)
 	towire(pptr, &val, sizeof(val));
 }
 
-void towire_errcode_t(u8 **pptr, errcode_t v)
+void towire_jsonrpc_errcode(u8 **pptr, enum jsonrpc_errcode v)
 {
 	towire_u32(pptr, (u32)v);
 }

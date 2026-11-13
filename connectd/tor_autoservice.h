@@ -9,18 +9,16 @@
 struct wireaddr *tor_autoservice(const tal_t *ctx,
 				 const struct wireaddr_internal *tor_serviceaddr,
 				 const char *tor_password,
-				 const struct wireaddr_internal *bindings,
-				 const bool use_v3_autotor);
+				 const struct wireaddr *localaddr);
 
 struct wireaddr *tor_fixed_service(const tal_t *ctx,
 				 const struct wireaddr_internal *tor_serviceaddr,
 				 const char *tor_password,
-				 const u8 *blob,
+				 const char *blob,
 				 const struct wireaddr *bind,
 				 const u8 index);
 
-const struct wireaddr *
-find_local_address(const struct wireaddr_internal *bindings);
-
+/* For dev_report_fds */
+extern int tor_service_fd;
 
 #endif /* LIGHTNING_CONNECTD_TOR_AUTOSERVICE_H */

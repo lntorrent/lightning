@@ -14,10 +14,11 @@ struct existing_htlc;
  * new_full_channel: Given initial fees and funding, what is initial state?
  * @ctx: tal context to allocate return value from.
  * @cid: The channel id.
- * @funding_txid: The commitment transaction id.
- * @funding_txout: The commitment transaction output number.
+ * @funding: The commitment transaction id/output number.
  * @minimum_depth: The minimum confirmations needed for funding transaction.
- * @funding: The commitment transaction amount.
+ * @blockheight_states: The blockheight update states.
+ * @lease_expiry: The block the lease on this channel expires at; 0 if no lease.
+ * @funding_sats: The commitment transaction amount.
  * @local_msat: The amount for the local side (remainder goes to remote)
  * @fee_states: The fee update states.
  * @local: local channel configuration
@@ -26,53 +27,65 @@ struct existing_htlc;
  * @remote_basepoints: remote basepoints.
  * @local_fundingkey: local funding key
  * @remote_fundingkey: remote funding key
- * @option_static_remotekey: use `option_static_remotekey`.
- * @option_anchor_outputs: use `option_anchor_outputs`.
+ * @type: type for this channel
+ * @option_wumbo: large channel negotiated.
  * @opener: which side initiated it.
  *
  * Returns state, or NULL if malformed.
  */
 struct channel *new_full_channel(const tal_t *ctx,
 				 const struct channel_id *cid,
-				 const struct bitcoin_txid *funding_txid,
-				 unsigned int funding_txout,
+				 const struct bitcoin_outpoint *funding,
 				 u32 minimum_depth,
-				 struct amount_sat funding,
+				 const struct height_states *blockheight_states,
+				 u32 lease_expiry,
+				 struct amount_sat funding_sats,
 				 struct amount_msat local_msat,
-				 const struct fee_states *fee_states,
+				 const struct fee_states *fee_states TAKES,
 				 const struct channel_config *local,
 				 const struct channel_config *remote,
 				 const struct basepoints *local_basepoints,
 				 const struct basepoints *remote_basepoints,
 				 const struct pubkey *local_funding_pubkey,
 				 const struct pubkey *remote_funding_pubkey,
-				 bool option_static_remotekey,
-				 bool option_anchor_outputs,
+				 const struct channel_type *type TAKES,
+				 bool option_wumbo,
 				 enum side opener);
 
 /**
  * channel_txs: Get the current commitment and htlc txs for the channel.
  * @ctx: tal context to allocate return value from.
- * @channel: The channel to evaluate
+ * @funding: the outpoint we're spending
+ * @funding_sats: the amount of @funding
  * @htlc_map: Pointer to htlcs for each tx output (allocated off @ctx).
  * @direct_outputs: If non-NULL, fill with pointers to the direct (non-HTLC) outputs (or NULL if none).
  * @funding_wscript: Pointer to wscript for the funding tx output
+ * @channel: The channel to evaluate
  * @per_commitment_point: Per-commitment point to determine keys
  * @commitment_number: The index of this commitment.
  * @side: which side to get the commitment transaction for
- *
+ * @local_splice_amnt: how much is being spliced in (or out, if -ve) of local side.
+ * @remote_splice_amnt: how much is being spliced in (or out, if -ve) of remote side.
+ * @other_anchor_outnum: which output (-1 if none) is the !!side anchor
+ * @funding_pubkeys: The funding pubkeys (specify NULL to use channel's value).
  * Returns the unsigned commitment transaction for the committed state
  * for @side, followed by the htlc transactions in output order and
  * fills in @htlc_map, or NULL on key derivation failure.
  */
 struct bitcoin_tx **channel_txs(const tal_t *ctx,
+				const struct bitcoin_outpoint *funding,
+				struct amount_sat funding_sats,
 				const struct htlc ***htlcmap,
 				struct wally_tx_output *direct_outputs[NUM_SIDES],
 				const u8 **funding_wscript,
 				const struct channel *channel,
 				const struct pubkey *per_commitment_point,
 				u64 commitment_number,
-				enum side side);
+				enum side side,
+				s64 local_splice_amnt,
+				s64 remote_splice_amnt,
+				int *local_anchor_outnum,
+				const struct pubkey funding_pubkeys[NUM_SIDES]);
 
 /**
  * actual_feerate: what is the actual feerate for the local side.
@@ -101,6 +114,11 @@ u32 actual_feerate(const struct channel *channel,
  * @routing: routing information (copied)
  * @blinding: optional blinding information for this HTLC.
  * @htlcp: optional pointer for resulting htlc: filled in if and only if CHANNEL_ERR_NONE.
+ * @extra_tlvs: optinal tlvs attached to this HTLC.
+ * @err_immediate_failures: in some cases (dusty htlcs) we want to immediately
+ *                          fail the htlc; for peer incoming don't want to
+ *                          error, but rather mark it as failed and fail after
+ *                          it's been committed to (so set this to false)
  *
  * If this returns CHANNEL_ERR_NONE, the fee htlc was added and
  * the output amounts adjusted accordingly.  Otherwise nothing
@@ -115,7 +133,9 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 				      const u8 routing[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
 				      const struct pubkey *blinding TAKES,
 				      struct htlc **htlcp,
-				      struct amount_sat *htlc_fee);
+				      struct amount_sat *htlc_fee,
+				      struct tlv_field *extra_tlvs,
+				      bool err_immediate_failures);
 
 /**
  * channel_get_htlc: find an HTLC
@@ -174,6 +194,18 @@ u32 approx_max_feerate(const struct channel *channel);
 bool can_opener_afford_feerate(const struct channel *channel, u32 feerate);
 
 /**
+ * htlc_dust_ok: will this feerate keep our dusted htlc's beneath
+ * 		 the updated feerate?
+ *
+ * @channel: The channel state
+ * @feerate_per_kw: new feerate to test ok'ness for
+ * @side: which side's htlcs to verify
+ */
+bool htlc_dust_ok(const struct channel *channel,
+		  u32 feerate_per_kw,
+		  enum side side);
+
+/**
  * channel_update_feerate: Change fee rate on non-opener side.
  * @channel: The channel
  * @feerate_per_kw: fee in satoshi per 1000 bytes.
@@ -181,6 +213,13 @@ bool can_opener_afford_feerate(const struct channel *channel, u32 feerate);
  * Returns true if it's affordable, otherwise does nothing.
  */
 bool channel_update_feerate(struct channel *channel, u32 feerate_per_kw);
+
+/*
+ * channel_update_blockheight: Change blockheight on non-opener side.
+ * @channel: The channel
+ * @blockheight: current blockheight
+ */
+void channel_update_blockheight(struct channel *channel, u32 blockheight);
 
 /**
  * channel_feerate: Get fee rate for this side of channel.
@@ -253,6 +292,15 @@ bool channel_force_htlcs(struct channel *channel,
  * Uses status_debug() on every HTLC.
  */
 void dump_htlcs(const struct channel *channel, const char *prefix);
+
+/**
+ * pending_updates: does this side have to send more messages to process channel?
+ * @channel: the channel
+ * @side: the side who is offering or failing/fulfilling HTLC, or feechange
+ *
+ * If this is true, you can't send STFU.
+ */
+bool pending_updates(const struct channel *channel, enum side side);
 
 const char *channel_add_err_name(enum channel_add_err e);
 const char *channel_remove_err_name(enum channel_remove_err e);

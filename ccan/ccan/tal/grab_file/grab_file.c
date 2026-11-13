@@ -8,7 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 
-void *grab_fd(const void *ctx, int fd)
+static void *grab_fd_internal(const void *ctx, int fd, bool add_nul_term)
 {
 	int ret;
 	size_t max, size;
@@ -17,12 +17,14 @@ void *grab_fd(const void *ctx, int fd)
 
 	size = 0;
 
-	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
+	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size != 0)
 		max = st.st_size;
 	else
+		/* Non-regular file, or one reporting a zero size despite
+		 * having content (eg. /proc, /sys): guess and grow. */
 		max = 16384;
 
-	buffer = tal_arr(ctx, char, max+1);
+	buffer = tal_arr(ctx, char, max+add_nul_term);
 	while ((ret = read(fd, buffer + size, max - size)) != 0) {
 		if (ret < 0) {
 			if (errno == EINTR)
@@ -35,19 +37,20 @@ void *grab_fd(const void *ctx, int fd)
 			if (extra > 1024 * 1024)
 				extra = 1024 * 1024;
 
-			if (!tal_resize(&buffer, max+extra+1))
+			if (!tal_resize(&buffer, max+extra+add_nul_term))
 				return NULL;
 
 			max += extra;
 		}
 	}
-	buffer[size] = '\0';
-	tal_resize(&buffer, size+1);
+	if (add_nul_term)
+		buffer[size] = '\0';
+	tal_resize(&buffer, size+add_nul_term);
 
 	return buffer;
 }
 
-void *grab_file(const void *ctx, const char *filename)
+static void *grab_file_internal(const void *ctx, const char *filename, bool add_nul_term)
 {
 	int fd;
 	char *buffer;
@@ -60,7 +63,27 @@ void *grab_file(const void *ctx, const char *filename)
 	if (fd < 0)
 		return NULL;
 
-	buffer = grab_fd(ctx, fd);
+	buffer = grab_fd_internal(ctx, fd, add_nul_term);
 	close_noerr(fd);
 	return buffer;
+}
+
+void *grab_fd_raw(const void *ctx, int fd)
+{
+	return grab_fd_internal(ctx, fd, false);
+}
+
+void *grab_fd_str(const void *ctx, int fd)
+{
+	return grab_fd_internal(ctx, fd, true);
+}
+
+void *grab_file_str(const void *ctx, const char *filename)
+{
+	return grab_file_internal(ctx, filename, true);
+}
+
+void *grab_file_raw(const void *ctx, const char *filename)
+{
+	return grab_file_internal(ctx, filename, false);
 }

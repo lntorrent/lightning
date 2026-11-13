@@ -1,9 +1,8 @@
+#include "config.h"
 #include <bitcoin/privkey.h>
 #include <bitcoin/pubkey.h>
-#include <ccan/crypto/sha256/sha256.h>
 #include <common/key_derive.h>
 #include <common/utils.h>
-#include <wally_bip32.h>
 
 /* BOLT #3:
  *
@@ -13,14 +12,21 @@
  *
  *	pubkey = basepoint + SHA256(per_commitment_point || basepoint) * G
  *
- * The `localpubkey` uses the local node's `payment_basepoint`;
- * The `remotepubkey` uses the remote node's `payment_basepoint`;
- * the `local_htlcpubkey` uses the local node's `htlc_basepoint`;
- * the `remote_htlcpubkey` uses the remote node's `htlc_basepoint`;
- * the `local_delayedpubkey` uses the local node's `delayed_payment_basepoint`;
- * and the `remote_delayedpubkey` uses the remote node's `delayed_payment_basepoint`.
- *...
- * If `option_static_remotekey` or `option_anchor_outputs` is negotiated, the
+ * - The `localpubkey` uses the local node's `payment_basepoint`;
+ * - The `local_htlcpubkey` uses the local node's `htlc_basepoint`;
+ * - The `remote_htlcpubkey` uses the remote node's `htlc_basepoint`;
+ * - The `local_delayedpubkey` uses the local node's `delayed_payment_basepoint`;
+ * - The `remote_delayedpubkey` uses the remote node's `delayed_payment_basepoint`.
+ */
+/* BOLT #3:
+ *
+ * The `remotepubkey` is simply the remote node's `payment_basepoint`.
+ */
+
+/* The old BOLT defined what happened prior to option_static_remotekey,
+ * which we still support for existing channels:
+ *
+ * If `option_static_remotekey` or `option_anchors` is negotiated, the
  * `remotepubkey` is simply the remote node's `payment_basepoint`, otherwise
  * it is calculated as above using the remote node's `payment_basepoint`.
  */
@@ -49,9 +55,9 @@ bool derive_simple_key(const struct pubkey *basepoint,
 		return false;
 #ifdef SUPERVERBOSE
 	printf("# + basepoint (0x%s)\n",
-	       type_to_string(tmpctx, struct pubkey, basepoint));
+	       fmt_pubkey(tmpctx, basepoint));
 	printf("# = 0x%s\n",
-	       type_to_string(tmpctx, struct pubkey, key));
+	       fmt_pubkey(tmpctx, key));
 #endif
 	return true;
 }
@@ -84,7 +90,7 @@ bool derive_simple_privkey(const struct secret *base_secret,
 #endif
 
 	key->secret = *base_secret;
-	if (secp256k1_ec_privkey_tweak_add(secp256k1_ctx, key->secret.data,
+	if (secp256k1_ec_seckey_tweak_add(secp256k1_ctx, key->secret.data,
 					   sha.u.u8) != 1)
 		return false;
 #ifdef SUPERVERBOSE
@@ -141,7 +147,7 @@ bool derive_revocation_key(const struct pubkey *basepoint,
 		return false;
 #ifdef SUPERVERBOSE
 	printf("# x revocation_basepoint = 0x%s\n",
-	       type_to_string(tmpctx, secp256k1_pubkey, &add[0]));
+	       fmt_secp256k1_pubkey(tmpctx, &add[0]));
 #endif
 
 	pubkey_to_der(der_keys, per_commitment_point);
@@ -160,7 +166,7 @@ bool derive_revocation_key(const struct pubkey *basepoint,
 		return false;
 #ifdef SUPERVERBOSE
 	printf("# x per_commitment_point = 0x%s\n",
-	       type_to_string(tmpctx, secp256k1_pubkey, &add[1]));
+	       fmt_secp256k1_pubkey(tmpctx, &add[1]));
 #endif
 
 	args[0] = &add[0];
@@ -171,9 +177,9 @@ bool derive_revocation_key(const struct pubkey *basepoint,
 
 #ifdef SUPERVERBOSE
 	printf("# 0x%s + 0x%s => 0x%s\n",
-	       type_to_string(tmpctx, secp256k1_pubkey, args[0]),
-	       type_to_string(tmpctx, secp256k1_pubkey, args[1]),
-	       type_to_string(tmpctx, struct pubkey, key));
+	       fmt_secp256k1_pubkey(tmpctx, args[0]),
+	       fmt_secp256k1_pubkey(tmpctx, args[1]),
+	       fmt_pubkey(tmpctx, key));
 #endif
 	return true;
 }
@@ -207,7 +213,7 @@ bool derive_revocation_privkey(const struct secret *base_secret,
 #endif
 
 	key->secret = *base_secret;
-	if (secp256k1_ec_privkey_tweak_mul(secp256k1_ctx, key->secret.data,
+	if (secp256k1_ec_seckey_tweak_mul(secp256k1_ctx, key->secret.data,
 					   sha.u.u8)
 	    != 1)
 		return false;
@@ -229,7 +235,7 @@ bool derive_revocation_privkey(const struct secret *base_secret,
 #endif
 
 	part2 = *per_commitment_secret;
-	if (secp256k1_ec_privkey_tweak_mul(secp256k1_ctx, part2.data,
+	if (secp256k1_ec_seckey_tweak_mul(secp256k1_ctx, part2.data,
 					   sha.u.u8) != 1)
 		return false;
 #ifdef SUPERVERBOSE
@@ -239,31 +245,12 @@ bool derive_revocation_privkey(const struct secret *base_secret,
 		printf("# = 0x%s\n", tal_hexstr(tmpctx, &part2, sizeof(part2)));
 #endif
 
-	if (secp256k1_ec_privkey_tweak_add(secp256k1_ctx, key->secret.data,
+	if (secp256k1_ec_seckey_tweak_add(secp256k1_ctx, key->secret.data,
 					   part2.data) != 1)
 		return false;
 
 #ifdef SUPERVERBOSE
 	printf("# => 0x%s\n", tal_hexstr(tmpctx, key, sizeof(*key)));
 #endif
-	return true;
-}
-
-
-bool bip32_pubkey(const struct ext_key *bip32_base,
-		  struct pubkey *pubkey, u32 index)
-{
-	const uint32_t flags = BIP32_FLAG_KEY_PUBLIC | BIP32_FLAG_SKIP_HASH;
-	struct ext_key ext;
-
-	if (index >= BIP32_INITIAL_HARDENED_CHILD)
-		return false;
-
-	if (bip32_key_from_parent(bip32_base, index, flags, &ext) != WALLY_OK)
-		return false;
-
-	if (!secp256k1_ec_pubkey_parse(secp256k1_ctx, &pubkey->pubkey,
-				       ext.pub_key, sizeof(ext.pub_key)))
-		return false;
 	return true;
 }

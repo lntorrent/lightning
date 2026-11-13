@@ -1,27 +1,21 @@
 #include "config.h"
 #include <assert.h>
-#include <bitcoin/privkey.h>
 #include <bitcoin/pubkey.h>
-#include <ccan/build_assert/build_assert.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/endian/endian.h>
 #include <ccan/io/io.h>
 #include <ccan/mem/mem.h>
+#include <ccan/time/time.h>
 #include <common/crypto_state.h>
 #include <common/ecdh.h>
+#include <common/randbytes.h>
 #include <common/status.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/wireaddr.h>
 #include <connectd/handshake.h>
 #include <errno.h>
-#include <secp256k1.h>
 #include <secp256k1_ecdh.h>
 #include <sodium/crypto_aead_chacha20poly1305.h>
-#include <sodium/randombytes.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <wire/wire.h>
 
 #ifndef SUPERVERBOSE
 #define SUPERVERBOSE(...)
@@ -179,11 +173,23 @@ struct handshake {
 	/* Are we initiator or responder. */
 	enum bolt8_side side;
 
+	/* Timeout timer if we take too long. */
+	struct oneshot *timeout;
+
+	/* Are we connected via a websocket? */
+	enum is_websocket is_websocket;
+
+	/* Time they first connected */
+	struct timemono starttime;
+
 	/* Function to call once handshake complete. */
 	struct io_plan *(*cb)(struct io_conn *conn,
 			      const struct pubkey *their_id,
 			      const struct wireaddr_internal *wireaddr,
 			      struct crypto_state *cs,
+			      struct oneshot *timeout,
+			      enum is_websocket is_websocket,
+			      struct timemono starttime,
 			      void *cbarg);
 	void *cbarg;
 };
@@ -193,7 +199,7 @@ static struct keypair generate_key(void)
 	struct keypair k;
 
 	do {
-		randombytes_buf(k.priv.secret.data, sizeof(k.priv.secret.data));
+		randbytes(k.priv.secret.data, sizeof(k.priv.secret.data));
 	} while (!secp256k1_ec_pubkey_create(secp256k1_ctx,
 					     &k.pub.pubkey, k.priv.secret.data));
 	return k;
@@ -252,9 +258,9 @@ static void le64_nonce(unsigned char *npub, u64 nonce)
 {
 	/* BOLT #8:
 	 *
-	 * ...with nonce `n` encoded as 32 zero bits, followed by a
+	 * with nonce `n` encoded as 32 zero bits, followed by a
 	 * *little-endian* 64-bit value. Note: this follows the Noise
-	 * Protocol convention, rather than our normal endian
+	 * Protocol convention, rather than our normal endian.
 	 */
 	le64 le_nonce = cpu_to_le64(nonce);
 	const size_t zerolen = crypto_aead_chacha20poly1305_ietf_NPUBBYTES - sizeof(le_nonce);
@@ -354,10 +360,16 @@ static struct io_plan *handshake_succeeded(struct io_conn *conn,
 			      const struct pubkey *their_id,
 			      const struct wireaddr_internal *addr,
 			      struct crypto_state *cs,
+			      struct oneshot *timeout,
+			      enum is_websocket is_websocket,
+			      struct timemono starttime,
 			      void *cbarg);
 	void *cbarg;
 	struct pubkey their_id;
 	struct wireaddr_internal addr;
+	struct oneshot *timeout;
+	enum is_websocket is_websocket;
+	struct timemono starttime;
 
 	/* BOLT #8:
 	 *
@@ -377,15 +389,24 @@ static struct io_plan *handshake_succeeded(struct io_conn *conn,
 		hkdf_two_keys(&cs.sk, &cs.rk, &h->ck, NULL, 0);
 
 	cs.rn = cs.sn = 0;
+	/* BOLT #8:
+	 *
+	 * 11. `rck = sck = ck`
+	 *      * The sending and receiving chaining keys are initialized the same.
+	 */
+
 	cs.r_ck = cs.s_ck = h->ck;
 
 	cb = h->cb;
 	cbarg = h->cbarg;
 	their_id = h->their_id;
 	addr = h->addr;
+	timeout = h->timeout;
+	is_websocket = h->is_websocket;
+	starttime = h->starttime;
 
 	tal_free(h);
-	return cb(conn, &their_id, &addr, &cs, cbarg);
+	return cb(conn, &their_id, &addr, &cs, timeout, is_websocket, starttime, cbarg);
 }
 
 static struct handshake *new_handshake(const tal_t *ctx,
@@ -409,8 +430,7 @@ static struct handshake *new_handshake(const tal_t *ctx,
 	 *
 	 * 2. `ck = h`
 	 */
-	BUILD_ASSERT(sizeof(handshake->h) == sizeof(handshake->ck));
-	memcpy(&handshake->ck, &handshake->h, sizeof(handshake->ck));
+	CROSS_TYPE_ASSIGNMENT(&handshake->ck, &handshake->h);
 	SUPERVERBOSE("# ck=%s",
 		     tal_hexstr(tmpctx, &handshake->ck, sizeof(handshake->ck)));
 
@@ -473,6 +493,7 @@ static struct io_plan *act_three_initiator(struct io_conn *conn,
 	 * 3. `se = ECDH(s.priv, re)`
 	 *     * where `re` is the ephemeral public key of the responder
 	 */
+	tal_free(h->ss);
 	h->ss = tal(h, struct secret);
 	ecdh(&h->re, h->ss);
 	SUPERVERBOSE("# ss=0x%s", tal_hexstr(tmpctx, h->ss, sizeof(*h->ss)));
@@ -500,7 +521,7 @@ static struct io_plan *act_three_initiator(struct io_conn *conn,
 
 	/* BOLT #8:
 	 *
-	 * 8.  Send `m = 0 || c || t` over the network buffer.
+	 * 9.  Send `m = 0 || c || t` over the network buffer.
 	 *
 	 */
 	h->act3.v = 0;
@@ -533,7 +554,7 @@ static struct io_plan *act_two_initiator2(struct io_conn *conn,
 				      h->act2.pubkey, sizeof(h->act2.pubkey)) != 1)
 		return handshake_failed(conn, h);
 
-	SUPERVERBOSE("# re=0x%s", type_to_string(tmpctx, struct pubkey, &h->re));
+	SUPERVERBOSE("# re=0x%s", fmt_pubkey(tmpctx, &h->re));
 
 	/* BOLT #8:
 	 *
@@ -619,7 +640,7 @@ static struct io_plan *act_one_initiator(struct io_conn *conn,
 	SUPERVERBOSE("e.priv: 0x%s",
 		     tal_hexstr(tmpctx, &h->e.priv, sizeof(h->e.priv)));
 	SUPERVERBOSE("e.pub: 0x%s",
-		     type_to_string(tmpctx, struct pubkey, &h->e.pub));
+		     fmt_pubkey(tmpctx, &h->e.pub));
 
 	/* BOLT #8:
 	 *
@@ -796,7 +817,7 @@ static struct io_plan *act_two_responder(struct io_conn *conn,
 	 */
 	h->e = generate_key();
 	SUPERVERBOSE("# e.pub=0x%s e.priv=0x%s",
-		     type_to_string(tmpctx, struct pubkey, &h->e.pub),
+		     fmt_pubkey(tmpctx, &h->e.pub),
 		     tal_hexstr(tmpctx, &h->e.priv, sizeof(h->e.priv)));
 
 	/* BOLT #8:
@@ -863,7 +884,6 @@ static struct io_plan *act_two_responder(struct io_conn *conn,
 	return io_write(conn, &h->act2, ACT_TWO_SIZE, act_three_responder, h);
 }
 
-
 static struct io_plan *act_one_responder2(struct io_conn *conn,
 					 struct handshake *h)
 {
@@ -886,7 +906,7 @@ static struct io_plan *act_one_responder2(struct io_conn *conn,
 				      h->act1.pubkey, sizeof(h->act1.pubkey)) != 1)
 		return handshake_failed(conn, h);
 
-	SUPERVERBOSE("# re=0x%s", type_to_string(tmpctx, struct pubkey, &h->re));
+	SUPERVERBOSE("# re=0x%s", fmt_pubkey(tmpctx, &h->re));
 
 	/* BOLT #8:
 	 *
@@ -963,20 +983,28 @@ static struct io_plan *act_one_responder(struct io_conn *conn,
 struct io_plan *responder_handshake_(struct io_conn *conn,
 				     const struct pubkey *my_id,
 				     const struct wireaddr_internal *addr,
+				     struct oneshot *timeout,
+				     enum is_websocket is_websocket,
 				     struct io_plan *(*cb)(struct io_conn *,
 							   const struct pubkey *,
 							   const struct wireaddr_internal *,
 							   struct crypto_state *,
+							   struct oneshot *,
+							   enum is_websocket,
+							   struct timemono,
 							   void *cbarg),
 				     void *cbarg)
 {
 	struct handshake *h = new_handshake(conn, my_id);
 
 	h->side = RESPONDER;
+	h->starttime = time_mono();
 	h->my_id = *my_id;
 	h->addr = *addr;
 	h->cbarg = cbarg;
 	h->cb = cb;
+	h->timeout = timeout;
+	h->is_websocket = is_websocket;
 
 	return act_one_responder(conn, h);
 }
@@ -985,21 +1013,29 @@ struct io_plan *initiator_handshake_(struct io_conn *conn,
 				     const struct pubkey *my_id,
 				     const struct pubkey *their_id,
 				     const struct wireaddr_internal *addr,
+				     struct oneshot *timeout,
+				     enum is_websocket is_websocket,
 				     struct io_plan *(*cb)(struct io_conn *,
 							   const struct pubkey *,
 							   const struct wireaddr_internal *,
 							   struct crypto_state *,
+							   struct oneshot *timeout,
+							   enum is_websocket is_websocket,
+							   struct timemono,
 							   void *cbarg),
 				     void *cbarg)
 {
 	struct handshake *h = new_handshake(conn, their_id);
 
 	h->side = INITIATOR;
+	h->starttime = time_mono();
 	h->my_id = *my_id;
 	h->their_id = *their_id;
 	h->addr = *addr;
 	h->cbarg = cbarg;
 	h->cb = cb;
+	h->is_websocket = is_websocket;
+	h->timeout = timeout;
 
 	return act_one_initiator(conn, h);
 }

@@ -1,80 +1,63 @@
-#include <channeld/channeld_wiregen.h>
+#include "config.h"
 #include <common/json_command.h>
-#include <common/jsonrpc_errors.h>
-#include <common/param.h>
-#include <common/sphinx.h>
-#include <common/utils.h>
-#include <gossipd/gossipd_wiregen.h>
-#include <lightningd/htlc_end.h>
-#include <lightningd/json.h>
+#include <connectd/connectd_wiregen.h>
+#include <inttypes.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/log.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/ping.h>
 #include <lightningd/subd.h>
 
 struct ping_command {
 	struct list_node list;
-	struct node_id id;
+	u64 reqid;
 	struct command *cmd;
 };
 
-static struct ping_command *find_ping_cmd(struct lightningd *ld,
-					  const struct node_id *id)
+static void destroy_ping_command(struct ping_command *ping_command,
+				 struct lightningd *ld)
+{
+	list_del_from(&ld->ping_commands, &ping_command->list);
+}
+
+static struct ping_command *find_ping_command(struct lightningd *ld,
+					      u64 reqid)
 {
 	struct ping_command *i;
-
 	list_for_each(&ld->ping_commands, i, list) {
-		if (node_id_eq(id, &i->id))
+		if (i->reqid == reqid)
 			return i;
 	}
 	return NULL;
 }
 
-static void destroy_ping_command(struct ping_command *pc)
-{
-	list_del(&pc->list);
-}
-
-static struct ping_command *new_ping_command(const tal_t *ctx,
-					     struct lightningd *ld,
-					     const struct node_id *peer_id,
-					     struct command *cmd)
-{
-	struct ping_command *pc = tal(ctx, struct ping_command);
-
-	pc->id = *peer_id;
-	pc->cmd = cmd;
-	list_add_tail(&ld->ping_commands, &pc->list);
-	tal_add_destructor(pc, destroy_ping_command);
-
-	return pc;
-}
-
-void ping_reply(struct subd *subd, const u8 *msg)
+void handle_ping_done(struct subd *connectd, const u8 *msg)
 {
 	u16 totlen;
-	bool ok, sent = true;
-	struct node_id id;
-	struct ping_command *pc;
+	bool sent;
+	u64 reqid;
+	struct ping_command *ping_command;
 
-	log_debug(subd->ld->log, "Got ping reply!");
-	ok = fromwire_gossipd_ping_reply(msg, &id, &sent, &totlen);
+	if (!fromwire_connectd_ping_done(msg, &reqid, &sent, &totlen)) {
+		log_broken(connectd->log, "Malformed ping reply %s",
+			   tal_hex(tmpctx, msg));
+		return;
+	}
 
-	pc = find_ping_cmd(subd->ld, &id);
-	assert(pc);
+	ping_command = find_ping_command(connectd->ld, reqid);
+	if (!ping_command) {
+		log_broken(connectd->log, "ping reply for unknown reqid %"PRIu64, reqid);
+		return;
+	}
 
-	if (!ok)
-		was_pending(command_fail(pc->cmd, LIGHTNINGD,
-					 "Bad reply message"));
-	else if (!sent)
-		was_pending(command_fail(pc->cmd, LIGHTNINGD, "Unknown peer"));
+	log_debug(connectd->log, "Got ping reply!");
+	if (!sent)
+		was_pending(command_fail(ping_command->cmd, LIGHTNINGD,
+					 "Ping already pending"));
 	else {
-		struct json_stream *response = json_stream_success(pc->cmd);
+		struct json_stream *response = json_stream_success(ping_command->cmd);
 
 		json_add_num(response, "totlen", totlen);
-		was_pending(command_success(pc->cmd, response));
+		was_pending(command_success(ping_command->cmd, response));
 	}
 }
 
@@ -83,15 +66,17 @@ static struct command_result *json_ping(struct command *cmd,
 					const jsmntok_t *obj UNNEEDED,
 					const jsmntok_t *params)
 {
-	u8 *msg;
 	unsigned int *len, *pongbytes;
 	struct node_id *id;
+	u8 *msg;
+	static u64 reqid;
+	struct ping_command *ping_command;
 
-	if (!param(cmd, buffer, params,
-		   p_req("id", param_node_id, &id),
-		   p_opt_def("len", param_number, &len, 128),
-		   p_opt_def("pongbytes", param_number, &pongbytes, 128),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("id", param_node_id, &id),
+			 p_opt_def("len", param_number, &len, 128),
+			 p_opt_def("pongbytes", param_number, &pongbytes, 128),
+			 NULL))
 		return command_param_failed();
 
 	/* BOLT #1:
@@ -119,19 +104,26 @@ static struct command_result *json_ping(struct command *cmd,
 				    "pongbytes %u > 65535", *pongbytes);
 	}
 
-	/* parent is cmd, so when we complete cmd, we free this. */
-	new_ping_command(cmd, cmd->ld, id, cmd);
+	if (!peer_by_id(cmd->ld, id))
+		return command_fail(cmd, LIGHTNINGD, "Peer not connected");
 
-	/* gossipd handles all pinging, even if it's in another daemon. */
-	msg = towire_gossipd_ping(NULL, id, *pongbytes, *len);
-	subd_send_msg(cmd->ld->gossip, take(msg));
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	ping_command = tal(cmd, struct ping_command);
+	ping_command->cmd = cmd;
+	ping_command->reqid = ++reqid;
+	list_add_tail(&cmd->ld->ping_commands, &ping_command->list);
+	tal_add_destructor2(ping_command, destroy_ping_command, cmd->ld);
+
+	msg = towire_connectd_ping(NULL, ping_command->reqid, id, *pongbytes, *len);
+	subd_send_msg(cmd->ld->connectd, take(msg));
+
 	return command_still_pending(cmd);
 }
 
 static const struct json_command ping_command = {
 	"ping",
-	"network",
 	json_ping,
-	"Send peer {id} a ping of length {len} (default 128) asking for {pongbytes} (default 128)"
 };
 AUTODATA(json_command, &ping_command);

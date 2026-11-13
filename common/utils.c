@@ -1,13 +1,20 @@
-#include "utils.h"
+#include "config.h"
+#include <assert.h>
 #include <bitcoin/chainparams.h>
+#include <ccan/err/err.h>
 #include <ccan/list/list.h>
+#include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
+#include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <ccan/utf8/utf8.h>
+#include <common/utils.h>
 #include <errno.h>
 #include <locale.h>
+#include <sodium.h>
+#include <string.h>
 
-const tal_t *wally_tal_ctx;
+const tal_t *wally_tal_ctx = NULL;
 secp256k1_context *secp256k1_ctx;
 const tal_t *tmpctx;
 
@@ -29,86 +36,43 @@ void tal_wally_start(void)
 	wally_tal_ctx = tal_arr(NULL, char, 0);
 }
 
-void tal_wally_end(const tal_t *parent)
+void tal_wally_discard(void)
 {
-	tal_t *p;
-	while ((p = tal_first(wally_tal_ctx)) != NULL) {
-		if (p != parent)
-			tal_steal(parent, p);
-	}
+	assert(wally_tal_ctx);
+	assert(tal_first(wally_tal_ctx) == NULL);
 	wally_tal_ctx = tal_free(wally_tal_ctx);
 }
 
-#if DEVELOPER
-/* If you've got a softref, we assume no reallocs. */
-static void dont_move_softref(tal_t *ctx, enum tal_notify_type ntype, void *info)
+void tal_wally_end(const tal_t *parent)
 {
-	abort();
-}
-#endif
-
-static void softref_nullify(tal_t *obj, void **ptr)
-{
-	*ptr = NULL;
-#if DEVELOPER
-	tal_del_notifier(obj, dont_move_softref);
-#endif
-}
-
-static void softref_cleanup(const tal_t *outer, void **ptr)
-{
-	if (*ptr) {
-		tal_del_destructor2(*ptr, softref_nullify, ptr);
+	tal_t *p;
+	if (!wally_tal_ctx) {
+		/* This makes valgrind show us backtraces! */
+		*(u8 *)wally_tal_ctx = '\0';
+		abort();
 	}
-#if DEVELOPER
-	tal_del_notifier(outer, dont_move_softref);
-#endif
+	while ((p = tal_first(wally_tal_ctx)) != NULL) {
+		/* Refuse to make a loop!
+		 * Did you mean to use tal_wally_end_onto? */
+		assert(p != parent);
+		/* Don't steal backtrace from wally_tal_ctx! */
+		if (tal_name(p) && streq(tal_name(p), "backtrace")) {
+			tal_free(p);
+			continue;
+		}
+		tal_steal(parent, p);
+	}
+	assert(tal_check(wally_tal_ctx, "tal_wally_end ctx check"));
+	wally_tal_ctx = tal_free(wally_tal_ctx);
 }
 
-void set_softref_(const tal_t *outer, size_t outersize, void **ptr, tal_t *obj)
+void tal_wally_end_onto_(const tal_t *parent,
+			 tal_t *from_wally,
+			 const char *from_wally_name)
 {
-	/* pointer is inside outer, right? */
-	assert((char *)ptr >= (char *)outer);
-	assert((char *)ptr < (char *)outer + outersize);
-
-	/* This is harmless if there was no prior, otherwise constrains the
-	 * leak: we don't have enough information in softref_nullify to
-	 * clear softref_cleanup */
-	tal_del_destructor2(outer, softref_cleanup, ptr);
-
-	if (obj) {
-		tal_add_destructor2(outer, softref_cleanup, ptr);
-		tal_add_destructor2(obj, softref_nullify, ptr);
-#if DEVELOPER
-		tal_add_notifier(obj, TAL_NOTIFY_MOVE, dont_move_softref);
-#endif
-	}
-
-#if DEVELOPER
-	tal_add_notifier(outer, TAL_NOTIFY_MOVE, dont_move_softref);
-#endif
-
-	*ptr = obj;
-}
-
-void clear_softref_(const tal_t *outer, size_t outersize, void **ptr)
-{
-	assert((char *)ptr >= (char *)outer);
-	assert((char *)ptr < (char *)outer + outersize);
-
-	if (*ptr) {
-		tal_del_destructor2(outer, softref_cleanup, ptr);
-		tal_del_destructor2(*ptr, softref_nullify, ptr);
-#if DEVELOPER
-		tal_del_notifier(*ptr, dont_move_softref);
-#endif
-	}
-
-#if DEVELOPER
-	tal_del_notifier(outer, dont_move_softref);
-#endif
-
-	*ptr = NULL;
+	if (from_wally)
+		tal_set_name_(from_wally, from_wally_name, 1);
+	tal_wally_end(tal_steal(parent, from_wally));
 }
 
 char *tal_hexstr(const tal_t *ctx, const void *data, size_t len)
@@ -131,6 +95,36 @@ u8 *tal_hexdata(const tal_t *ctx, const void *str, size_t len)
 	return data;
 }
 
+static void destroy_munlock(const tal_t *ptr)
+{
+	sodium_munlock((void *)ptr, tal_bytelen(ptr));
+}
+
+void mlock_tal_memory(const tal_t *ptr)
+{
+	if (sodium_mlock((void *)ptr, tal_bytelen(ptr)) != 0) {
+		warnx("FATAL: could not lock %zu bytes of sensitive memory"
+		      " into RAM: %s\n"
+		      "Memory locking is required to keep secrets out of"
+		      " swap.\n"
+		      "If you are running in a container or jail, the"
+		      " privilege must be granted:\n"
+		      "  FreeBSD jail: set allow.mlock=1 for the jail\n"
+		      "  Linux: raise RLIMIT_MEMLOCK (ulimit -l), or grant"
+		      " the CAP_IPC_LOCK capability\n"
+		      "  Docker/Podman: --ulimit memlock=-1:-1 or"
+		      " --cap-add=IPC_LOCK",
+		      tal_bytelen(ptr), strerror(errno));
+		abort();
+	}
+	tal_add_destructor(ptr, destroy_munlock);
+}
+
+bool tal_arr_eq_(const void *a, const void *b, size_t unused)
+{
+	return memeq(a, tal_bytelen(a), b, tal_bytelen(b));
+}
+
 /* Use the POSIX C locale. */
 void setup_locale(void)
 {
@@ -141,6 +135,8 @@ void setup_locale(void)
 /* Initial creation of tmpctx. */
 void setup_tmpctx(void)
 {
+	/* Don't call me twice! */
+	assert(!tmpctx);
 	tmpctx = tal_arr_label(NULL, char, 0, "tmpctx");
 }
 
@@ -156,7 +152,7 @@ void clean_tmpctx(void)
 
 void tal_arr_remove_(void *p, size_t elemsize, size_t n)
 {
-    // p is a pointer-to-pointer for tal_resize.
+    /* p is a pointer-to-pointer for tal_resize. */
     char *objp = *(char **)p;
     size_t len = tal_bytelen(objp);
     assert(len % elemsize == 0);
@@ -166,14 +162,37 @@ void tal_arr_remove_(void *p, size_t elemsize, size_t n)
     tal_resize((char **)p, len - elemsize);
 }
 
-void *tal_dup_talarr_(const tal_t *ctx, const tal_t *src TAKES, const char *label)
+void tal_arr_remove_range_(void *p, size_t position, size_t chunk_size)
 {
-	if (!src) {
-		/* Correctly handle TAKES on a NULL `src`.  */
-		(void) taken(src);
-		return NULL;
-	}
-	return tal_dup_(ctx, src, 1, tal_bytelen(src), 0, label);
+	/* p is a pointer-to-pointer for tal_resize. */
+	char *objp = *(char **)p;
+	size_t len = tal_bytelen(objp);
+	assert(chunk_size + position <= len);
+	memmove(objp + position, objp + position + chunk_size,
+		len - (chunk_size + position));
+	tal_resize((char **)p, len - chunk_size);
+}
+
+static void tal_arr_append_bytes(void *p, const void *append, size_t bytes)
+{
+	void **pptr = p;
+	size_t oldsize = tal_bytelen(*pptr);
+	tal_resize(pptr, oldsize + bytes);
+	/* Blah blah blah memcpy NULL blah blah */
+	if (append || bytes)
+		memcpy(*pptr + oldsize, memcheck(append, bytes), bytes);
+	if (taken(append))
+		tal_free(append);
+}
+
+void tal_arr_append_(void *p, const void *append TAKES)
+{
+	tal_arr_append_bytes(p, append, tal_bytelen(append));
+}
+
+void tal_arr_appendn_(void *p, const void *append TAKES, size_t bytes)
+{
+	tal_arr_append_bytes(p, append, bytes);
 }
 
 /* Check for valid UTF-8 */
@@ -200,8 +219,7 @@ char *utf8_str(const tal_t *ctx, const u8 *buf TAKES, size_t buflen)
 	char *ret;
 
 	if (!utf8_check(buf, buflen)) {
-		if (taken(buf))
-			tal_free(buf);
+		tal_free_if_taken(buf);
 		return NULL;
 	}
 
@@ -209,4 +227,75 @@ char *utf8_str(const tal_t *ctx, const u8 *buf TAKES, size_t buflen)
 	ret = tal_dup_arr(ctx, char, (const char *)buf, buflen, 1);
 	ret[buflen] = '\0';
 	return ret;
+}
+
+char *tal_strdup_or_null(const tal_t *ctx, const char *str)
+{
+	if (!str) {
+		/* You might have taken NULL; that's legal!  Release now. */
+		taken(str);
+		return NULL;
+	}
+	return tal_strdup(ctx, str);
+}
+
+int tmpdir_mkstemp(const tal_t *ctx, const char *template TAKES, char **created)
+{
+	char *tmpdir = getenv("TMPDIR");
+	char *path = path_join(ctx, tmpdir ?: "/tmp", template);
+	int fd = mkstemp(path);
+
+	if (fd >= 0)
+		*created = path;
+	else
+		tal_free(path);
+
+	return fd;
+}
+
+char *str_lowering(const void *ctx, const char *string TAKES)
+{
+	char *ret;
+
+	ret = tal_strdup(ctx, string);
+	for (char *p = ret; *p; p++) *p = tolower(*p);
+	return ret;
+}
+
+char *str_uppering(const void *ctx, const char *string TAKES)
+{
+	char *ret;
+
+	ret = tal_strdup(ctx, string);
+	for (char *p = ret; *p; p++) *p = toupper(*p);
+	return ret;
+}
+
+/* Realloc helper for tal membufs */
+void *membuf_tal_resize(struct membuf *mb, void *rawelems, size_t newsize)
+{
+	char *p = rawelems;
+
+	tal_resize(&p, newsize);
+	return p;
+}
+
+bool str_to_u64(const char *buf, size_t buflen, u64 *num)
+{
+	u64 val = 0;
+
+	if (buflen == 0)
+		return false;
+
+	for (size_t i = 0; i < buflen; i++) {
+		u64 digit;
+		if (buf[i] < '0' || buf[i] > '9')
+			return false;
+		digit = buf[i] - '0';
+		if (val > (UINT64_MAX - digit) / 10)
+			return false;
+		val = val * 10 + digit;
+	}
+	*num = val;
+	return true;
 }

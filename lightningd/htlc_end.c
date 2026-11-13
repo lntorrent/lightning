@@ -1,13 +1,11 @@
+#include "config.h"
 #include <ccan/cast/cast.h>
-#include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/tal/str/str.h>
-#include <ccan/tal/tal.h>
-#include <common/htlc.h>
-#include <common/memleak.h>
-#include <common/pseudorand.h>
+#include <common/clock_time.h>
+#include <common/htlc_wire.h>
+#include <common/utils.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/log.h>
-#include <stdio.h>
 
 size_t hash_htlc_key(const struct htlc_key *k)
 {
@@ -93,7 +91,7 @@ static void *corrupt(const char *abortstr, const char *fmt, ...)
 
 struct htlc_in *htlc_in_check(const struct htlc_in *hin, const char *abortstr)
 {
-	if (amount_msat_eq(hin->msat, AMOUNT_MSAT(0)))
+	if (amount_msat_is_zero(hin->msat))
 		return corrupt(abortstr, "zero msatoshi");
 	else if (htlc_state_owner(hin->hstate) != REMOTE)
 		return corrupt(abortstr, "invalid state %s",
@@ -130,9 +128,10 @@ struct htlc_in *new_htlc_in(const tal_t *ctx,
 			    struct amount_msat msat, u32 cltv_expiry,
 			    const struct sha256 *payment_hash,
 			    const struct secret *shared_secret TAKES,
-			    const struct pubkey *blinding TAKES,
-			    const struct secret *blinding_ss,
-			    const u8 *onion_routing_packet)
+			    const struct pubkey *path_key TAKES,
+			    const u8 *onion_routing_packet,
+			    const struct tlv_field *extra_tlvs,
+			    bool fail_immediate)
 {
 	struct htlc_in *hin = tal(ctx, struct htlc_in);
 
@@ -142,25 +141,25 @@ struct htlc_in *new_htlc_in(const tal_t *ctx,
 	hin->msat = msat;
 	hin->cltv_expiry = cltv_expiry;
 	hin->payment_hash = *payment_hash;
-	if (shared_secret)
-		hin->shared_secret = tal_dup(hin, struct secret, shared_secret);
-	else
-		hin->shared_secret = NULL;
-	if (blinding) {
-		hin->blinding = tal_dup(hin, struct pubkey, blinding);
-		hin->blinding_ss = *blinding_ss;
-	} else
-		hin->blinding = NULL;
+	hin->status = NULL;
+	hin->fail_immediate = fail_immediate;
+	hin->shared_secret = tal_dup_or_null(hin, struct secret, shared_secret);
+	hin->path_key = tal_dup_or_null(hin, struct pubkey, path_key);
 	memcpy(hin->onion_routing_packet, onion_routing_packet,
 	       sizeof(hin->onion_routing_packet));
+	if (extra_tlvs)
+		hin->extra_tlvs = tlv_field_arr_dup(hin, extra_tlvs);
+	else
+		hin->extra_tlvs = NULL;
 
 	hin->hstate = RCVD_ADD_COMMIT;
 	hin->badonion = 0;
 	hin->failonion = NULL;
 	hin->preimage = NULL;
 	hin->we_filled = NULL;
+	hin->payload = NULL;
 
-	hin->received_time = time_now();
+	hin->received_time = clock_time();
 
 	return htlc_in_check(hin, "new_htlc_in");
 }
@@ -181,10 +180,8 @@ struct htlc_out *htlc_out_check(const struct htlc_out *hout,
 		if (amount_msat_less(hout->in->msat, hout->msat))
 			return corrupt(abortstr, "Input amount %s"
 				       " less than %s",
-				       type_to_string(tmpctx, struct amount_msat,
-						      &hout->in->msat),
-				       type_to_string(tmpctx, struct amount_msat,
-						      &hout->msat));
+				       fmt_amount_msat(tmpctx, hout->in->msat),
+				       fmt_amount_msat(tmpctx, hout->msat));
 		if (hout->in->cltv_expiry <= hout->cltv_expiry)
 			return corrupt(abortstr, "Input cltv_expiry %u"
 				       " less than %u",
@@ -201,16 +198,13 @@ struct htlc_out *htlc_out_check(const struct htlc_out *hout,
 				return corrupt(abortstr,
 					       "Output failmsg, input preimage");
 		} else if (hout->failmsg) {
-			if (hout->in->failonion)
-				return corrupt(abortstr,
-					       "Output failmsg, input failonion");
 			if (hout->in->preimage)
 				return corrupt(abortstr,
 					       "Output failmsg, input preimage");
 		} else if (hout->preimage) {
-			if (hout->in->failonion)
-				return corrupt(abortstr,
-					       "Output preimage, input failonion");
+			/* If we abandoned the HTLC to save the incoming channel,
+			 * (see consider_failing_incoming), hout->in->failonion
+			 * will be set! */
 			if (hout->in->badonion)
 				return corrupt(abortstr,
 					       "Output preimage, input badonion");
@@ -275,9 +269,12 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 			      u32 cltv_expiry,
 			      const struct sha256 *payment_hash,
 			      const u8 *onion_routing_packet,
-			      const struct pubkey *blinding,
+			      const struct pubkey *path_key,
+			      const struct tlv_field* extra_tlvs,
 			      bool am_origin,
+			      struct amount_msat final_msat,
 			      u64 partid,
+			      u64 groupid,
 			      struct htlc_in *in)
 {
 	struct htlc_out *hout = tal(ctx, struct htlc_out);
@@ -297,17 +294,39 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 	hout->failmsg = NULL;
 	hout->failonion = NULL;
 	hout->preimage = NULL;
+	hout->timeout = NULL;
 
-	if (blinding)
-		hout->blinding = tal_dup(hout, struct pubkey, blinding);
+	hout->path_key = tal_dup_or_null(hout, struct pubkey, path_key);
+
+	if (extra_tlvs)
+		hout->extra_tlvs = tlv_field_arr_dup(hout, extra_tlvs);
 	else
-		hout->blinding = NULL;
+		hout->extra_tlvs = NULL;
+
 	hout->am_origin = am_origin;
-	if (am_origin)
+	if (am_origin) {
 		hout->partid = partid;
+		hout->groupid = groupid;
+
+		/* Stash the fees (for accounting) */
+		if (!amount_msat_sub(&hout->fees, msat, final_msat))
+			return corrupt("new_htlc_out",
+				       "overflow subtract %s-%s",
+				       fmt_amount_msat(tmpctx, msat),
+				       fmt_amount_msat(tmpctx, final_msat));
+
+	}
 	hout->in = NULL;
-	if (in)
+	if (in) {
 		htlc_out_connect_htlc_in(hout, in);
+
+		/* Stash the fees (for accounting) */
+		if (!amount_msat_sub(&hout->fees, in->msat, msat))
+			return corrupt("new_htlc_out",
+				       "overflow subtract %s-%s",
+				       fmt_amount_msat(tmpctx, in->msat),
+				       fmt_amount_msat(tmpctx, msat));
+	}
 
 	return htlc_out_check(hout, "new_htlc_out");
 }

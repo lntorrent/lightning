@@ -1,15 +1,16 @@
 #ifndef LIGHTNING_CHANNELD_WATCHTOWER_H
 #define LIGHTNING_CHANNELD_WATCHTOWER_H
 #include "config.h"
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
-#include <common/derive_basepoints.h>
 #include <common/initial_channel.h>
+
+struct ext_key;
 
 const struct bitcoin_tx *
 penalty_tx_create(const tal_t *ctx,
 		  const struct channel *channel,
 		  u32 penalty_feerate,
+		  u32 *final_index,
+		  struct ext_key *final_ext_key,
 		  u8 *final_scriptpubkey,
 		  const struct secret *revocation_preimage,
 		  const struct bitcoin_txid *commitment_txid,

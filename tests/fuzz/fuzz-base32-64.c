@@ -1,11 +1,9 @@
 #include "config.h"
 #include <assert.h>
-#include <stdint.h>
-#include <string.h>
-#include <tests/fuzz/libfuzz.h>
 
 #include <common/base32.h>
 #include <common/base64.h>
+#include <tests/fuzz/libfuzz.h>
 
 void init(int *argc, char ***argv)
 {
@@ -23,5 +21,8 @@ void run(const uint8_t *data, size_t size)
 	tal_free(decoded);
 
 	encoded = b64_encode(NULL, data, size);
+	decoded = b64_decode(NULL, encoded, strlen(encoded));
+	assert(memcmp(decoded, data, size) == 0);
 	tal_free(encoded);
+	tal_free(decoded);
 }

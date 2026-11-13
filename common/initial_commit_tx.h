@@ -2,13 +2,12 @@
 #ifndef LIGHTNING_COMMON_INITIAL_COMMIT_TX_H
 #define LIGHTNING_COMMON_INITIAL_COMMIT_TX_H
 #include "config.h"
-#include <bitcoin/chainparams.h>
 #include <bitcoin/pubkey.h>
-#include <common/amount.h>
+#include <bitcoin/tx.h>
 #include <common/htlc.h>
 #include <common/utils.h>
 
-struct bitcoin_txid;
+struct bitcoin_outpoint;
 struct keyset;
 struct wally_tx_output;
 
@@ -25,21 +24,25 @@ u64 commit_number_obscurer(const struct pubkey *opener_payment_basepoint,
 
 /* The base weight of a commitment tx */
 static inline size_t commit_tx_base_weight(size_t num_untrimmed_htlcs,
-					   bool option_anchor_outputs)
+					   bool option_anchor_outputs,
+					   bool option_anchors_zero_fee_htlc_tx)
 {
 	size_t weight;
+	size_t num_outputs;
 
 	/* BOLT #3:
 	 *
 	 * The base fee for a commitment transaction:
 	 *  - MUST be calculated to match:
-	 *    1. Start with `weight` = 724 (1124 if `option_anchor_outputs` applies).
+	 *    1. Start with `weight` = 724 (1124 if `option_anchors` applies).
 	 */
-	if (option_anchor_outputs)
+	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
 		weight = 1124;
-	else
+		num_outputs = 4;
+	} else {
 		weight = 724;
-
+		num_outputs = 2;
+	}
 	/* BOLT #3:
 	 *
 	 *    2. For each committed HTLC, if that output is not trimmed as
@@ -47,27 +50,10 @@ static inline size_t commit_tx_base_weight(size_t num_untrimmed_htlcs,
 	 *       to `weight`.
 	 */
 	weight += 172 * num_untrimmed_htlcs;
+	num_outputs += num_untrimmed_htlcs;
 
-	if (chainparams->is_elements) {
-		/* Each transaction has surjection and rangeproof (both empty
-		 * for us as long as we use unblinded L-BTC transactions). */
-		weight += 2 * 4;
-
-		/* Inputs have 6 bytes of blank proofs attached. This TX only
-		 * has a single input. */
-		weight += 6;
-
-		/* Each direct output has a bit more weight to it */
-		weight += (32 + 1 + 1 + 1) * 4 * 2; /* Elements added fields */
-
-		/* Each HTLC output also carries a bit more weight */
-		weight += (32 + 1 + 1 + 1) * 4 * num_untrimmed_htlcs;
-
-		/* For elements we also need to add the fee output and the
-		 * overhead for rangeproofs into the mix. */
-		weight += (8 + 1) * 4; /* Bitcoin style output */
-		weight += (32 + 1 + 1 + 1) * 4; /* Elements added fields */
-	}
+	/* Extra fields for Elements */
+	weight += elements_tx_overhead(chainparams, 1, num_outputs);
 
 	return weight;
 }
@@ -75,18 +61,19 @@ static inline size_t commit_tx_base_weight(size_t num_untrimmed_htlcs,
 /* Helper to calculate the base fee if we have this many htlc outputs */
 static inline struct amount_sat commit_tx_base_fee(u32 feerate_per_kw,
 						   size_t num_untrimmed_htlcs,
-						   bool option_anchor_outputs)
+						   bool option_anchor_outputs,
+						   bool option_anchors_zero_fee_htlc_tx)
 {
 	return amount_tx_fee(feerate_per_kw,
 			     commit_tx_base_weight(num_untrimmed_htlcs,
-						   option_anchor_outputs));
+						   option_anchor_outputs,
+						   option_anchors_zero_fee_htlc_tx));
 }
 
 /**
  * initial_commit_tx: create (unsigned) commitment tx to spend the funding tx output
  * @ctx: context to allocate transaction and @htlc_map from.
- * @funding_txid, @funding_out, @funding: funding outpoint.
- * @funding_wscript: scriptPubkey of the funding output
+ * @funding, @funding_sats: funding outpoint and amount
  * @funding_keys: funding bitcoin keys
  * @opener: is the LOCAL or REMOTE paying the fee?
  * @keyset: keys derived for this commit tx.
@@ -106,9 +93,8 @@ static inline struct amount_sat commit_tx_base_fee(u32 feerate_per_kw,
  * transaction, so we carefully use the terms "self" and "other" here.
  */
 struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
-				     const struct bitcoin_txid *funding_txid,
-				     unsigned int funding_txout,
-				     struct amount_sat funding,
+				     const struct bitcoin_outpoint *funding,
+				     struct amount_sat funding_sats,
 				     const struct pubkey funding_key[NUM_SIDES],
 				     enum side opener,
 				     u16 to_self_delay,
@@ -121,7 +107,9 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 				     u64 obscured_commitment_number,
 				     struct wally_tx_output *direct_outputs[NUM_SIDES],
 				     enum side side,
+				     u32 csv_lock,
 				     bool option_anchor_outputs,
+				     bool option_anchors_zero_fee_htlc_tx,
 				     char** err_reason);
 
 /* try_subtract_fee - take away this fee from the opener (and return true), or all if insufficient (and return false). */
@@ -134,6 +122,7 @@ bool try_subtract_fee(enum side opener, enum side side,
  * scriptpubkey_p2wsh(ctx, wscript) gives the scriptpubkey */
 u8 *to_self_wscript(const tal_t *ctx,
 		    u16 to_self_delay,
+		    u32 csv,
 		    const struct keyset *keyset);
 
 /* To-other is simply: scriptpubkey_p2wpkh(tx, keyset->other_payment_key) */

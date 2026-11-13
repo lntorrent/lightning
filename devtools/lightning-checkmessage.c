@@ -1,8 +1,7 @@
+#include "config.h"
 #include <bitcoin/pubkey.h>
 #include <bitcoin/shadouble.h>
-#include <ccan/crypto/sha256/sha256.h>
 #include <ccan/err/err.h>
-#include <ccan/short_types/short_types.h>
 #include <common/bech32.h>
 #include <common/utils.h>
 #include <secp256k1_recovery.h>
@@ -75,7 +74,7 @@ int main(int argc, char *argv[])
 				     shad.sha.u.u8))
 		errx(1, "Signature not recoverable");
 
-	keystr = pubkey_to_hexstr(NULL, &reckey);
+	keystr = fmt_pubkey(NULL, &reckey);
 	if (argv[3]) {
 		if (!streq(keystr, argv[3]))
 			errx(1, "Signature is invalid");

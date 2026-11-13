@@ -1,22 +1,21 @@
 #include "config.h"
 #include <assert.h>
+/*~ This is Ian Lance Taylor's libbacktrace.  It turns out that it's
+ * horrifically difficult to obtain a decent backtrace in C; the standard
+ * backtrace function is useless in most programs. */
 #include <backtrace-supported.h>
 #include <backtrace.h>
 #include <ccan/err/err.h>
 #include <ccan/io/io.h>
-#include <ccan/str/str.h>
 #include <ccan/tal/str/str.h>
+#include <common/clock_time.h>
 #include <common/daemon.h>
 #include <common/memleak.h>
+#include <common/randbytes.h>
 #include <common/setup.h>
-#include <common/status.h>
 #include <common/utils.h>
 #include <common/version.h>
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #if BACKTRACE_SUPPORTED
 static void (*bt_print)(const char *fmt, ...) PRINTF_FMT(1,2);
@@ -38,10 +37,42 @@ void send_backtrace(const char *why)
 	if (backtrace_state)
 		backtrace_print(backtrace_state, 0, stderr);
 
+	if (!bt_print)
+		return;
+
 	/* Now send to parent. */
 	bt_print("%s (version %s)", why, version());
 	if (backtrace_state)
 		backtrace_full(backtrace_state, 0, backtrace_status, NULL, NULL);
+}
+
+static void extract_symname(void *data, uintptr_t pc,
+			    const char *symname,
+			    uintptr_t symval,
+			    uintptr_t symsize)
+{
+	const char **ret = data;
+
+	/* ret is context to alloc off, and value to set */
+	if (symname)
+		*ret = tal_strdup(*ret, symname);
+	else
+		*ret = NULL;
+}
+
+const char *backtrace_symname(const tal_t *ctx, const void *addr)
+{
+	const char *ret = ctx;
+	if (!backtrace_state)
+		return tal_fmt(ctx, "%p (backtrace disabled)", addr);
+
+	if (!backtrace_syminfo(backtrace_state, (uintptr_t)addr,
+			       extract_symname, NULL, &ret))
+		ret = NULL;
+
+	if (ret)
+		return ret;
+	return tal_fmt(ctx, "%p", addr);
 }
 
 static void crashdump(int sig)
@@ -52,7 +83,8 @@ static void crashdump(int sig)
 	send_backtrace(why);
 
 	/* Probably shouldn't return. */
-	bt_exit();
+	if (bt_exit)
+		bt_exit();
 
 	/* This time it will kill us instantly. */
 	kill(getpid(), sig);
@@ -73,29 +105,7 @@ static void crashlog_activate(void)
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGBUS, &sa, NULL);
 }
-#else
-void send_backtrace(const char *why)
-{
-}
-#endif
 
-int daemon_poll(struct pollfd *fds, nfds_t nfds, int timeout)
-{
-	const char *t;
-
-	t = taken_any();
-	if (t)
-		errx(1, "Outstanding taken pointers: %s", t);
-
-	if (wally_tal_ctx)
-		errx(1, "Outstanding tal_wally_start!");
-
-	clean_tmpctx();
-
-	return poll(fds, nfds, timeout);
-}
-
-#if DEVELOPER && BACKTRACE_SUPPORTED
 static void steal_notify(tal_t *child, enum tal_notify_type n, tal_t *newparent)
 {
 	tal_t *p = newparent;
@@ -126,7 +136,36 @@ static void remove_steal_notifiers(void)
 	/* We remove this from root, assuming everything else freed. */
 	tal_del_notifier(NULL, add_steal_notifier);
 }
+#else
+void send_backtrace(const char *why)
+{
+}
+
+const char *backtrace_symname(const tal_t *ctx, const void *addr)
+{
+	return "unknown (backtrace unsupported)";
+}
+
+static void add_steal_notifiers(const tal_t *root)
+{
+}
 #endif
+
+int daemon_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+	const char *t;
+
+	t = taken_any();
+	if (t)
+		errx(1, "Outstanding taken pointers: %s", t);
+
+	if (wally_tal_ctx)
+		errx(1, "Outstanding tal_wally_start!");
+
+	clean_tmpctx();
+
+	return poll(fds, nfds, timeout);
+}
 
 void daemon_setup(const char *argv0,
 		  void (*backtrace_print)(const char *fmt, ...),
@@ -136,22 +175,14 @@ void daemon_setup(const char *argv0,
 #if BACKTRACE_SUPPORTED
 	bt_print = backtrace_print;
 	bt_exit = backtrace_exit;
-#if DEVELOPER
+
 	/* Suppresses backtrace (breaks valgrind) */
 	if (!getenv("LIGHTNINGD_DEV_NO_BACKTRACE"))
 		backtrace_state = backtrace_create_state(argv0, 0, NULL, NULL);
-	add_steal_notifiers(NULL);
-#else
-	backtrace_state = backtrace_create_state(argv0, 0, NULL, NULL);
-#endif
 	crashlog_activate();
 #endif
 
-#if DEVELOPER
-	/* This has significant overhead, so we only enable it if told */
-	if (getenv("LIGHTNINGD_DEV_MEMLEAK"))
-		memleak_init();
-#endif
+	memleak_init();
 
 	/* We handle write returning errors! */
 	signal(SIGPIPE, SIG_IGN);
@@ -163,18 +194,28 @@ void daemon_shutdown(void)
 {
 	common_shutdown();
 
-#if DEVELOPER && BACKTRACE_SUPPORTED
+#if BACKTRACE_SUPPORTED
+	/* Harmless if it wasn't applied */
 	remove_steal_notifiers();
 #endif
 }
 
-void daemon_maybe_debug(char *argv[])
+bool daemon_developer_mode(char *argv[])
 {
-#if DEVELOPER
-	for (int i = 1; argv[i]; i++) {
-		if (!streq(argv[i], "--debugger"))
-			continue;
+	bool developer = false, debug = false;
+	const char *entropy_override, *time_override;
 
+	for (int i = 1; argv[i]; i++) {
+		if (streq(argv[i], "--dev-debug-self"))
+			debug = true;
+		else if (streq(argv[i], "--developer"))
+			developer = true;
+	}
+
+	if (!developer)
+		return false;
+
+	if (debug) {
 		/* Don't let this mess up stdout, so redir to /dev/null */
 		char *cmd = tal_fmt(NULL, "${DEBUG_TERM:-gnome-terminal --} gdb -ex 'attach %u' %s >/dev/null &", getpid(), argv[0]);
 		fprintf(stderr, "Running %s\n", cmd);
@@ -182,8 +223,31 @@ void daemon_maybe_debug(char *argv[])
 		 * https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66425 */
 		if (system(cmd))
 			;
+		tal_free(cmd);
 		/* Continue in the debugger. */
 		kill(getpid(), SIGSTOP);
 	}
-#endif /* DEVELOPER */
+
+	/* We can override cryptographic randomness with this var in development
+	 * mode, for reproducible results */
+	entropy_override = getenv("CLN_DEV_ENTROPY_SEED");
+	if (entropy_override)
+		dev_override_randbytes(argv[0], atol(entropy_override));
+
+	/* We can also control TIME ITSELF! */
+	time_override = getenv("CLN_DEV_SET_TIME");
+	if (time_override) {
+		struct timeabs t;
+		t.ts.tv_nsec = 0;
+		t.ts.tv_sec = atol(time_override);
+		dev_override_clock_time(t);
+	}
+
+	/* This checks for any tal_steal loops, but it's not free:
+	 * only use if we're already using the fairly heavy memleak
+	 * detection. */
+	if (getenv("LIGHTNINGD_DEV_MEMLEAK"))
+		add_steal_notifiers(NULL);
+
+	return true;
 }

@@ -15,6 +15,7 @@
 void *io_loop_return;
 
 struct io_plan io_conn_freed;
+static bool io_extended_errors;
 
 struct io_listener *io_new_listener_(const tal_t *ctx, int fd,
 				     struct io_plan *(*init)(struct io_conn *,
@@ -32,6 +33,11 @@ struct io_listener *io_new_listener_(const tal_t *ctx, int fd,
 	l->ctx = ctx;
 	if (!add_listener(l))
 		return tal_free(l);
+
+	/* Keep accept() async: a connection which vanishes between
+	 * poll() and accept() (eg. peer RST) must not block the loop. */
+	io_fd_block(fd, false);
+
 	return l;
 }
 
@@ -383,9 +389,19 @@ void io_wake(const void *wait)
 	backend_wake(wait);
 }
 
-/* Returns false if this should not be touched (eg. freed). */
-static bool do_plan(struct io_conn *conn, struct io_plan *plan,
-		    bool idle_on_epipe)
+enum plan_result {
+	/* Destroyed, do not touch */
+	FREED,
+	/* Worked, call again. */
+	KEEP_GOING,
+	/* Failed with EAGAIN or did partial. */
+	EXHAUSTED,
+	/* No longer interested in read (or write) */
+	UNINTERESTED
+};
+
+static enum plan_result do_plan(struct io_conn *conn, struct io_plan *plan,
+				bool idle_on_epipe)
 {
 	/* We shouldn't have polled for this event if this wasn't true! */
 	assert(plan->status == IO_POLLING_NOTSTARTED
@@ -393,18 +409,34 @@ static bool do_plan(struct io_conn *conn, struct io_plan *plan,
 
 	switch (plan->io(conn->fd.fd, &plan->arg)) {
 	case -1:
+		/* This is expected, as we call optimistically! */
+		if (errno == EAGAIN)
+			return EXHAUSTED;
 		if (errno == EPIPE && idle_on_epipe) {
 			plan->status = IO_UNSET;
+			/* Clear any exclusivity on this (now-idle) plan:
+			 * otherwise it stays counted, permanently
+			 * suppressing polling on the *other* direction too
+			 * (see exclude_pollfds()), even though nothing will
+			 * ever clear it since this plan isn't active to be
+			 * un-exclusived through the normal io_conn_*_exclusive()
+			 * call the caller would otherwise make. */
+			backend_set_exclusive(plan, false);
 			backend_new_plan(conn);
-			return false;
+			return UNINTERESTED;
 		}
 		io_close(conn);
-		return false;
+		return FREED;
 	case 0:
 		plan->status = IO_POLLING_STARTED;
-		return true;
+		/* If it started but didn't finish, don't call again. */
+		return EXHAUSTED;
 	case 1:
-		return next_plan(conn, plan);
+		if (!next_plan(conn, plan))
+			return FREED;
+		if (plan->status == IO_POLLING_NOTSTARTED)
+			return KEEP_GOING;
+		return UNINTERESTED;
 	default:
 		/* IO should only return -1, 0 or 1 */
 		abort();
@@ -413,16 +445,43 @@ static bool do_plan(struct io_conn *conn, struct io_plan *plan,
 
 void io_ready(struct io_conn *conn, int pollflags)
 {
-	if (pollflags & POLLIN)
-		if (!do_plan(conn, &conn->plan[IO_IN], false))
-			return;
+	enum plan_result res;
 
-	if (pollflags & POLLOUT)
-		/* If we're writing to a closed pipe, we need to wait for
-		 * read to fail if we're duplex: we want to drain it! */
-		do_plan(conn, &conn->plan[IO_OUT],
-			conn->plan[IO_IN].status == IO_POLLING_NOTSTARTED
-			|| conn->plan[IO_IN].status == IO_POLLING_STARTED);
+	if (pollflags & POLLIN) {
+		for (;;) {
+			res = do_plan(conn, &conn->plan[IO_IN], false);
+			switch (res) {
+			case FREED:
+				return;
+			case EXHAUSTED:
+			case UNINTERESTED:
+				goto try_write;
+			case KEEP_GOING:
+				continue;
+			}
+			abort();
+		}
+	}
+
+try_write:
+	if (pollflags & POLLOUT) {
+		for (;;) {
+			/* If we're writing to a closed pipe, we need to wait for
+			 * read to fail if we're duplex: we want to drain it! */
+			res = do_plan(conn, &conn->plan[IO_OUT],
+				      conn->plan[IO_IN].status == IO_POLLING_NOTSTARTED
+				      || conn->plan[IO_IN].status == IO_POLLING_STARTED);
+			switch (res) {
+			case FREED:
+			case EXHAUSTED:
+			case UNINTERESTED:
+				return;
+			case KEEP_GOING:
+				continue;
+			}
+			abort();
+		}
+	}
 }
 
 void io_do_always(struct io_plan *plan)
@@ -529,6 +588,20 @@ bool io_plan_out_started(const struct io_conn *conn)
 	return conn->plan[IO_OUT].status == IO_POLLING_STARTED;
 }
 
+/* Despite being a TCP expert, I missed the full extent of this
+ * problem.  The legendary ZmnSCPxj implemented it (with the URL
+ * pointing to the explanation), and I imitate that here. */
+struct io_plan *io_sock_shutdown(struct io_conn *conn)
+{
+	if (shutdown(io_conn_fd(conn), SHUT_WR) != 0)
+		return io_close(conn);
+
+	/* We need to make sure we don't try to write again, so
+	 * "wait" on something which will never be woken: otherwise
+	 * we will try to write, fail, and immediately close. */
+	return io_wait_dir(conn, io_sock_shutdown, IO_OUT, io_never, NULL);
+}
+
 bool io_flush_sync(struct io_conn *conn)
 {
 	struct io_plan *plan = &conn->plan[IO_OUT];
@@ -563,4 +636,14 @@ again:
 
 	io_fd_block(io_conn_fd(conn), false);
 	return ok;
+}
+
+void io_set_extended_errors(bool state)
+{
+	io_extended_errors = state;
+}
+
+bool io_get_extended_errors(void)
+{
+	return io_extended_errors;
 }

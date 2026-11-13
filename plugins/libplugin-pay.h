@@ -2,9 +2,9 @@
 #define LIGHTNING_PLUGINS_LIBPLUGIN_PAY_H
 #include "config.h"
 
-#include <common/bolt11.h>
+#include <ccan/io/io.h>
 #include <plugins/libplugin.h>
-#include <wire/onion_wire.h>
+#include <wire/onion_wiregen.h>
 
 struct legacy_payload {
 	struct short_channel_id scid;
@@ -15,10 +15,7 @@ struct legacy_payload {
 /* struct holding the information necessary to call createonion */
 struct createonion_hop {
 	struct node_id pubkey;
-
-	enum route_hop_style style;
-	struct tlv_tlv_payload *tlv_payload;
-	struct legacy_payload *legacy_payload;
+	struct tlv_payload *tlv_payload;
 };
 
 struct createonion_request {
@@ -29,9 +26,9 @@ struct createonion_request {
 
 /* States returned by listsendpays, waitsendpay, etc. */
 enum payment_result_state {
-	PAYMENT_PENDING,
-	PAYMENT_COMPLETE,
-	PAYMENT_FAILED,
+	PAYMENT_PENDING = 1,
+	PAYMENT_COMPLETE = 2,
+	PAYMENT_FAILED = 4,
 };
 
 /* A parsed version of the possible outcomes that a sendpay / payment may
@@ -55,24 +52,7 @@ struct payment_result {
 	int *erring_direction;
 };
 
-/* Information about channels we inferred from a) looking at our channels, and
- * b) from failures encountered during attempts to perform a payment. These
- * are attached to the root payment, since that information is
- * global. Attempts update the estimated channel capacities when starting, and
- * get remove on failure. Success keeps the capacities, since the capacities
- * changed due to the successful HTLCs. */
-struct channel_hint {
-	struct short_channel_id_dir scid;
-
-	/* Upper bound on remove channels inferred from payment failures. */
-	struct amount_msat estimated_capacity;
-
-	/* Is the channel enabled? */
-	bool enabled;
-
-	/* True if we are one endpoint of this channel */
-	bool local;
-
+struct local_hint {
 	/* How many more htlcs can we send over this channel? Only set if this
 	 * is a local channel, because those are the channels we have exact
 	 * numbers on, and they are the bottleneck onto the network. */
@@ -159,23 +139,23 @@ struct payment_constraints {
 };
 
 struct payment {
-	/* The command that triggered this payment. Only set for the root
-	 * payment. */
-	struct command *cmd;
-	struct plugin *plugin;
+	/* Usually in global payments list */
 	struct list_node list;
+	/* The command that triggered this payment. Only set for the root
+	 * payment.  It's an aux command if finished is set. */
+	struct command *cmd;
+	bool finished;
+	struct plugin *plugin;
 	struct node_id *local_id;
-
-	const char *json_buffer;
-	const jsmntok_t *json_toks;
 
 	/* The current phase we are in. */
 	enum payment_step step;
 
-	/* Real destination we want to route to */
-	struct node_id *destination;
-	/* Do we know for sure that this supports OPT_VAR_ONION? */
-	bool destination_has_tlv;
+	/* Destination we want to route to */
+	struct node_id *route_destination;
+
+	/* Destination we want to pay to (can be different for blinded paths!) */
+	struct node_id *pay_destination;
 
 	/* Payment hash extracted from the invoice if any. */
 	struct sha256 *payment_hash;
@@ -183,6 +163,16 @@ struct payment {
 	/* Payment secret, from the invoice if any. */
 	struct secret *payment_secret;
 
+	/* Payment metadata, from the invoice if any. */
+	u8 *payment_metadata;
+
+	/* Blinded path (for bolt12) */
+	struct blinded_path *blindedpath;
+	struct blinded_payinfo *blindedpay;
+	struct amount_msat blindedouramount;
+	struct amount_msat blindedfinalamount;
+
+	u64 groupid;
 	u32 partid;
 	u32 next_partid;
 
@@ -195,7 +185,9 @@ struct payment {
 	struct createonion_response *createonion_response;
 
 	/* Target amount to be delivered at the destination */
-	struct amount_msat amount;
+	struct amount_msat final_amount;
+	/* Amount we are trying to deliver with this payment (usually the same) */
+	struct amount_msat our_amount;
 
 	/* tal_arr of route_hops we decoded from the `getroute` call. Exposed
 	 * here so it can be amended by mixins. */
@@ -208,7 +200,7 @@ struct payment {
 	u32 start_block;
 
 	struct timeabs start_time, end_time;
-	struct timeabs deadline;
+	struct timemono deadline;
 
 	/* Constraints the state machine and modifiers needs to maintain. */
 	struct payment_constraints constraints;
@@ -220,6 +212,9 @@ struct payment {
 	struct payment_constraints *start_constraints;
 
 	struct short_channel_id *exclusions;
+
+	/* Local modifications, from listpeerchannels */
+	struct gossmap_localmods *mods;
 
 	/* Tree structure of payments and subpayments. */
 	struct payment *parent, **children;
@@ -239,7 +234,7 @@ struct payment {
 
 	/* tal_arr of channel_hints we incrementally learn while performing
 	 * payment attempts. */
-	struct channel_hint *channel_hints;
+	struct channel_hint_set *hints;
 	struct node_id *excluded_nodes;
 
 	/* Optional temporarily excluded channels/nodes (i.e. this routehint) */
@@ -254,13 +249,20 @@ struct payment {
 	 * true. Set only on the root payment. */
 	bool abort;
 
+	/* We only set invstring/description on one of our sendpays per group,
+	 * so we track when we've done that. */
+	bool invstring_used;
+
 	/* Serialized bolt11/12 string, kept attachd to the root so we can filter
 	 * by the invoice. */
 	const char *invstring;
 
-	/* If this is paying a local offer, this is the one (sendpay ensures we
-	 * don't pay twice for single-use offers) */
-	struct sha256 *local_offer_id;
+	/* Description, usually set if bolt11 has only description_hash */
+	const char *description;
+
+	/* If this is paying a local invoice_request, this is the one (sendpay
+	 * ensures we don't pay twice for single-use invoice requests) */
+	struct sha256 *local_invreq_id;
 
 	/* Textual explanation of why this payment was attempted. */
 	const char *why;
@@ -296,12 +298,26 @@ struct payment {
 	/* A human readable error message that is used as a top-level
 	 * explanation if a payment is aborted. */
 	char *aborterror;
+	/* A numeric error code to return to JSON-RPC callers. Allows
+	 * programmatically differentiate various errors, without
+	 * having to parse the `p->aborterror` string. */
+	u32 errorcode;
+
+	/* How many blocks are we lagging behind the rest of the
+	network? This needs to be taken into consideration when
+	sending payments before being fully caught up.*/
+	u32 chainlag;
+
+	/* Callback to be called when the entire payment process
+	 * completes successfully. */
+	void (*on_payment_success)(struct payment *p);
+	void (*on_payment_failure)(struct payment *p);
 };
 
 struct payment_modifier {
 	const char *name;
 	void *(*data_init)(struct payment *p);
-	void (*post_step_cb)(void *data, struct payment *p);
+	struct command_result *(*post_step_cb)(void *data, struct payment *p);
 };
 
 void *payment_mod_get_data(const struct payment *payment,
@@ -312,8 +328,8 @@ void *payment_mod_get_data(const struct payment *payment,
 	    stringify(name),                                                   \
 	    typesafe_cb_cast(void *(*)(struct payment *),                      \
 			     data_type (*)(struct payment *), data_init_cb),   \
-	    typesafe_cb_cast(void (*)(void *, struct payment *),               \
-			     void (*)(data_type, struct payment *), step_cb),  \
+	    typesafe_cb_cast(struct command_result *(*)(void *, struct payment *), \
+			     struct command_result *(*)(data_type, struct payment *), step_cb),  \
 	};
 
 /* The UNUSED marker is used to shut some compilers up. */
@@ -371,9 +387,7 @@ struct exemptfee_data {
 };
 
 struct shadow_route_data {
-#if DEVELOPER
 	bool use_shadow;
-#endif
 	struct payment_constraints constraints;
 	struct node_id destination;
 	struct route_hop *route;
@@ -399,13 +413,16 @@ struct adaptive_split_mod_data {
 	u32 htlc_budget;
 };
 
+struct route_exclusions_data {
+	struct route_exclusion **exclusions;
+};
+
 /* List of globally available payment modifiers. */
 REGISTER_PAYMENT_MODIFIER_HEADER(retry, struct retry_mod_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(routehints, struct routehints_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(exemptfee, struct exemptfee_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(shadowroute, struct shadow_route_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(directpay, struct direct_pay_data);
-extern struct payment_modifier waitblockheight_pay_mod;
 REGISTER_PAYMENT_MODIFIER_HEADER(presplit, struct presplit_mod_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(adaptive_splitter, struct adaptive_split_mod_data);
 
@@ -419,13 +436,16 @@ REGISTER_PAYMENT_MODIFIER_HEADER(local_channel_hints, void);
  * we detect the payee to have, in order to not exhaust the number of HTLCs
  * each of those channels can bear.  */
 REGISTER_PAYMENT_MODIFIER_HEADER(payee_incoming_limit, void);
+REGISTER_PAYMENT_MODIFIER_HEADER(route_exclusions, struct route_exclusions_data);
+
 
 struct payment *payment_new(tal_t *ctx, struct command *cmd,
 			    struct payment *parent,
+			    struct channel_hint_set *channel_hints,
 			    struct payment_modifier **mods);
 
 void payment_start(struct payment *p);
-void payment_continue(struct payment *p);
+struct command_result *payment_continue(struct payment *p);
 
 /**
  * Set the payment to the current step.
@@ -438,19 +458,31 @@ void payment_set_step(struct payment *p, enum payment_step newstep);
 
 
 /* Fails a partial payment and continues with the core flow. */
-void payment_fail(struct payment *p, const char *fmt, ...) PRINTF_FMT(2,3);
+struct command_result *payment_fail(struct payment *p, const char *fmt, ...) PRINTF_FMT(2,3);
 
 /* Fails a payment process by setting the root payment to
  * aborted. This will cause all subpayments to terminate as soon as
  * they can, and sets the root failreason so we have a sensible error
  * message. The failreason is overwritten if it is already set, since
  * we probably know better what happened in the modifier.. */
-void payment_abort(struct payment *p, const char *fmt, ...) PRINTF_FMT(2,3);
+struct command_result *payment_abort(struct payment *p, enum jsonrpc_errcode code, const char *fmt, ...) PRINTF_FMT(3,4);
 
 struct payment *payment_root(struct payment *p);
 struct payment_tree_result payment_collect_result(struct payment *p);
 
-/* For special effects, like inspecting your own routes. */
-struct gossmap *get_gossmap(struct plugin *plugin);
+/* If you need an unmodified gossmap */
+struct gossmap *get_raw_gossmap(struct payment *payment);
+
+/* Add fields for successful payment: result can be NULL for selfpay */
+void json_add_payment_success(struct json_stream *js,
+			      struct payment *p,
+			      const struct preimage *preimage,
+			      const struct payment_tree_result *result);
+
+/* Overriding io_poll for extra checks. */
+int libplugin_pay_poll(struct pollfd *fds, nfds_t nfds, int timeout);
+
+void
+paymod_log(struct payment *p, enum log_level l, const char *fmt, ...);
 
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_PAY_H */

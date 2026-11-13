@@ -1,10 +1,10 @@
 #include "config.h"
 #include <assert.h>
+#include <bitcoin/signature.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <common/node_id.h>
-#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <wire/wire.h>
 
@@ -26,16 +26,6 @@ bool pubkey_from_node_id(struct pubkey *key, const struct node_id *id)
 					 sizeof(id->k));
 }
 
-WARN_UNUSED_RESULT
-bool pubkey32_from_node_id(struct pubkey32 *key, const struct node_id *id)
-{
-	struct pubkey k;
-	if (!pubkey_from_node_id(&k, id))
-		return false;
-	return secp256k1_xonly_pubkey_from_pubkey(secp256k1_ctx, &key->pubkey,
-						  NULL, &k.pubkey) == 1;
-}
-
 /* It's valid if we can convert to a real pubkey. */
 bool node_id_valid(const struct node_id *id)
 {
@@ -44,11 +34,10 @@ bool node_id_valid(const struct node_id *id)
 }
 
 /* Convert to hex string of SEC1 encoding */
-char *node_id_to_hexstr(const tal_t *ctx, const struct node_id *id)
+char *fmt_node_id(const tal_t *ctx, const struct node_id *id)
 {
 	return tal_hexstr(ctx, id->k, sizeof(id->k));
 }
-REGISTER_TYPE_TO_STRING(node_id, node_id_to_hexstr);
 
 /* Convert from hex string of SEC1 encoding */
 bool node_id_from_hexstr(const char *str, size_t slen, struct node_id *id)
@@ -67,9 +56,25 @@ void fromwire_node_id(const u8 **cursor, size_t *max, struct node_id *id)
 	fromwire(cursor, max, &id->k, sizeof(id->k));
 }
 
+bool dev_towire_allow_invalid_node_id = false;
+
 void towire_node_id(u8 **pptr, const struct node_id *id)
 {
-	/* Cheap sanity check */
-	assert(id->k[0] == 0x2 || id->k[0] == 0x3);
+	/* Cheap sanity check. For wire fuzzing, we only care about correct
+	 * encoding of node IDs and not whether the IDs are valid, so we disable
+	 * this check while fuzzing. */
+	if (!dev_towire_allow_invalid_node_id)
+		assert(id->k[0] == 0x2 || id->k[0] == 0x3);
+
 	towire(pptr, id->k, sizeof(id->k));
+}
+
+bool check_signed_hash_nodeid(const struct sha256_double *hash,
+			      const secp256k1_ecdsa_signature *signature,
+			      const struct node_id *id)
+{
+	struct pubkey key;
+
+	return pubkey_from_node_id(&key, id)
+		&& check_signed_hash(hash, signature, &key);
 }

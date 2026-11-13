@@ -1,10 +1,8 @@
+#include "config.h"
 /* FIXME: io_plan needs size_t */
  #include <unistd.h>
 #include <ccan/io/io_plan.h>
 #include <ccan/mem/mem.h>
-#include <ccan/take/take.h>
-#include <ccan/tal/tal.h>
-#include <common/utils.h>
 #include <errno.h>
 #include <wire/wire_io.h>
 
@@ -28,8 +26,12 @@ static int do_read_wire_header(int fd, struct io_plan_arg *arg)
 	u8 *p = *(u8 **)arg->u1.vp;
 
 	ret = read(fd, p + len, HEADER_LEN - len);
-	if (ret <= 0)
+	if (ret <= 0) {
+		/* Errno isn't set if we hit EOF, so set it to distinct value */
+		if (ret == 0)
+			errno = 0;
 		return -1;
+	}
 	arg->u2.s += ret;
 
 	/* Length bytes read?  Set up for normal read of data. */
@@ -53,13 +55,21 @@ static int do_read_wire(int fd, struct io_plan_arg *arg)
 	ssize_t ret;
 
 	/* Still reading header? */
-	if (arg->u2.s & INSIDE_HEADER_BIT)
-		return do_read_wire_header(fd, arg);
+	if (arg->u2.s & INSIDE_HEADER_BIT) {
+		ret = do_read_wire_header(fd, arg);
+		/* If this is OK, and finished header, we continue below. */
+		if (ret != 0 || (arg->u2.s & INSIDE_HEADER_BIT))
+			return ret;
+	}
 
 	/* Normal read */
 	ret = read(fd, arg->u1.cp, arg->u2.s);
-	if (ret <= 0)
+	if (ret <= 0) {
+		/* Errno isn't set if we hit EOF, so set it to distinct value */
+		if (ret == 0)
+			errno = 0;
 		return -1;
+	}
 
 	arg->u1.cp += ret;
 	arg->u2.s -= ret;
@@ -108,8 +118,12 @@ static int do_write_wire(int fd, struct io_plan_arg *arg)
 	size_t totlen = tal_bytelen(arg->u1.cp);
 
 	/* Still writing header? */
-	if (arg->u2.s & INSIDE_HEADER_BIT)
-		return do_write_wire_header(fd, arg);
+	if (arg->u2.s & INSIDE_HEADER_BIT) {
+		ret = do_write_wire_header(fd, arg);
+		/* If this is OK, and finished header, we continue below. */
+		if (ret != 0 || (arg->u2.s & INSIDE_HEADER_BIT))
+			return ret;
+	}
 
 	/* Normal write */
 	ret = write(fd, arg->u1.cp + arg->u2.s, totlen - arg->u2.s);

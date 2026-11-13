@@ -28,7 +28,8 @@ enum prop_type {
 
 struct tal_hdr {
 	struct list_node list;
-	struct prop_hdr *prop;
+	/* Use is_prop_hdr tell if this is a struct prop_hdr or string! */
+	char *prop;
 	/* XOR with TAL_PTR_OBFUSTICATOR */
 	intptr_t parent_child;
 	size_t bytelen;
@@ -36,7 +37,8 @@ struct tal_hdr {
 
 struct prop_hdr {
 	enum prop_type type;
-	struct prop_hdr *next;
+	/* Use is_prop_hdr to tell if this is a struct prop_hdr or string! */
+	char *next;
 };
 
 struct children {
@@ -72,7 +74,7 @@ static struct {
 	struct tal_hdr hdr;
 	struct children c;
 } null_parent = { { { &null_parent.hdr.list, &null_parent.hdr.list },
-		    &null_parent.c.hdr, TAL_PTR_OBFUSTICATOR, 0 },
+		(char *)&null_parent.c.hdr, TAL_PTR_OBFUSTICATOR, 0 },
 		  { { CHILDREN, NULL },
 		    &null_parent.hdr,
 		    { { &null_parent.c.children.n,
@@ -123,9 +125,11 @@ void tal_cleanup(void)
 }
 
 /* We carefully start all real properties with a zero byte. */
-static bool is_literal(const struct prop_hdr *prop)
+static struct prop_hdr *is_prop_hdr(const char *ptr)
 {
-	return ((char *)prop)[0] != 0;
+	if (*ptr != 0)
+		return NULL;
+	return (struct prop_hdr *)ptr;
 }
 
 #ifndef NDEBUG
@@ -174,8 +178,11 @@ static struct tal_hdr *to_tal_hdr(const void *ctx)
 	check_bounds(ignore_destroying_bit(t->parent_child));
 	check_bounds(t->list.next);
 	check_bounds(t->list.prev);
-	if (t->prop && !is_literal(t->prop))
-		check_bounds(t->prop);
+	if (t->prop) {
+		struct prop_hdr *p = is_prop_hdr(t->prop);
+		if (p)
+			check_bounds(p);
+	}
 	return t;
 }
 
@@ -215,13 +222,12 @@ static void notify(const struct tal_hdr *ctx,
 		   enum tal_notify_type type, const void *info,
 		   int saved_errno)
 {
-        const struct prop_hdr *p;
+        const char *ptr;
+	const struct prop_hdr *p;
 
-        for (p = ctx->prop; p; p = p->next) {
+        for (ptr = ctx->prop; ptr && (p = is_prop_hdr(ptr)) != NULL; ptr = p->next) {
 		struct notifier *n;
 
-                if (is_literal(p))
-			break;
                 if (p->type != NOTIFIER)
 			continue;
 		n = (struct notifier *)p;
@@ -238,6 +244,9 @@ static void notify(const struct tal_hdr *ctx,
 						    EXTRA_ARG(n));
 				else
 					cb.destroy(from_tal_hdr(ctx));
+				/* Restore: object may have been rescued by a
+				 * tal_steal() from inside the destructor. */
+				n->u = cb;
 			} else
 				n->u.notifyfn(from_tal_hdr_or_null(ctx), type,
 					      (void *)info);
@@ -255,29 +264,54 @@ static void *allocate(size_t size)
 	return ret;
 }
 
-static struct prop_hdr **find_property_ptr(const struct tal_hdr *t,
-					   enum prop_type type)
+/* Returns a pointer to the pointer: can cast (*ret) to a (struct prop_ptr *) */
+static char **find_property_ptr(struct tal_hdr *t, enum prop_type type)
 {
-        struct prop_hdr **p;
+	char **ptr;
+        struct prop_hdr *p;
 
-        for (p = (struct prop_hdr **)&t->prop; *p; p = &(*p)->next) {
-                if (is_literal(*p)) {
-                        if (type == NAME)
-                                return p;
-                        break;
-                }
-                if ((*p)->type == type)
-                        return p;
-        }
-        return NULL;
+	/* NAME is special, as it can be a literal: see find_name_property */
+	assert(type != NAME);
+	for (ptr = &t->prop; *ptr; ptr = &p->next) {
+		if (!is_prop_hdr(*ptr))
+			break;
+		p = (struct prop_hdr *)*ptr;
+                if (p->type == type)
+                        return ptr;
+	}
+	return NULL;
 }
 
-static void *find_property(const struct tal_hdr *parent, enum prop_type type)
+/* This is special:
+ * NULL - not found
+ * *literal: true - char **, pointer to literal pointer.
+ * *literal: false - struct prop_hdr **, pointer to header ptr.
+ */
+static char **find_name_property(struct tal_hdr *t, bool *literal)
 {
-        struct prop_hdr **p = find_property_ptr(parent, type);
+	char **ptr;
+        struct prop_hdr *p;
 
-        if (p)
-                return *p;
+	for (ptr = &t->prop; *ptr; ptr = &p->next) {
+		if (!is_prop_hdr(*ptr)) {
+			*literal = true;
+			return ptr;
+		}
+		p = (struct prop_hdr *)*ptr;
+                if (p->type == NAME) {
+			*literal = false;
+                        return ptr;
+		}
+	}
+	return NULL;
+}
+
+static void *find_property(struct tal_hdr *parent, enum prop_type type)
+{
+        char **ptr = find_property_ptr(parent, type);
+
+        if (ptr)
+                return (struct prop_hdr *)*ptr;
         return NULL;
 }
 
@@ -287,7 +321,7 @@ static void init_property(struct prop_hdr *hdr,
 {
 	hdr->type = type;
 	hdr->next = parent->prop;
-	parent->prop = hdr;
+	parent->prop = (char *)hdr;
 }
 
 static struct notifier *add_notifier_property(struct tal_hdr *t,
@@ -321,17 +355,20 @@ static enum tal_notify_type del_notifier_property(struct tal_hdr *t,
 						  bool match_extra_arg,
 						  void *extra_arg)
 {
-        struct prop_hdr **p;
+	char **ptr;
+	struct prop_hdr *p;
 
-        for (p = (struct prop_hdr **)&t->prop; *p; p = &(*p)->next) {
+	for (ptr = &t->prop; *ptr; ptr = &p->next) {
 		struct notifier *n;
 		enum tal_notify_type types;
 
-                if (is_literal(*p))
+		p = is_prop_hdr(*ptr);
+		if (!p)
 			break;
-                if ((*p)->type != NOTIFIER)
+
+                if (p->type != NOTIFIER)
 			continue;
-		n = (struct notifier *)*p;
+		n = (struct notifier *)p;
 		if (n->u.notifyfn != fn)
 			continue;
 
@@ -341,8 +378,8 @@ static enum tal_notify_type del_notifier_property(struct tal_hdr *t,
 		    && extra_arg != EXTRA_ARG(n))
 			continue;
 
-		*p = (*p)->next;
-		freefn(n);
+		*ptr = p->next;
+		freefn(p);
 		return types & ~(NOTIFY_IS_DESTRUCTOR|NOTIFY_EXTRA_ARG);
         }
         return 0;
@@ -386,26 +423,31 @@ static bool add_child(struct tal_hdr *parent, struct tal_hdr *child)
 	return true;
 }
 
-static void del_tree(struct tal_hdr *t, const tal_t *orig, int saved_errno)
+static void del_tree(struct tal_hdr *t, const tal_t *orig, int saved_errno);
+
+/* Free t's children, properties and t itself.  The destroying bit is
+ * already set (by del_tree() or tal_free()). */
+static void del_tree_inner(struct tal_hdr *t, const tal_t *orig,
+			   int saved_errno)
 {
-	struct prop_hdr **prop, *p, *next;
+	struct prop_hdr *prop;
+	char *ptr, *next;
 
 	assert(!taken(from_tal_hdr(t)));
-
-        /* Already being destroyed?  Don't loop. */
-        if (unlikely(get_destroying_bit(t->parent_child)))
-                return;
-
-        set_destroying_bit(&t->parent_child);
 
 	/* Call free notifiers. */
 	notify(t, TAL_NOTIFY_FREE, (tal_t *)orig, saved_errno);
 
+	/* A destructor/notifier can rescue the object by tal_steal()ing
+	 * it elsewhere: add_child() clears the destroying bit. */
+	if (!get_destroying_bit(t->parent_child))
+		return;
+
 	/* Now free children and groups. */
-	prop = find_property_ptr(t, CHILDREN);
+	prop = find_property(t, CHILDREN);
 	if (prop) {
 		struct tal_hdr *i;
-		struct children *c = (struct children *)*prop;
+		struct children *c = (struct children *)prop;
 
 		while ((i = list_top(&c->children, struct tal_hdr, list))) {
 			list_del(&i->list);
@@ -414,11 +456,31 @@ static void del_tree(struct tal_hdr *t, const tal_t *orig, int saved_errno)
 	}
 
         /* Finally free our properties. */
-        for (p = t->prop; p && !is_literal(p); p = next) {
-                next = p->next;
-		freefn(p);
+	for (ptr = t->prop; ptr && (prop = is_prop_hdr(ptr)); ptr = next) {
+                next = prop->next;
+		freefn(ptr);
         }
         freefn(t);
+}
+
+static void del_tree(struct tal_hdr *t, const tal_t *orig, int saved_errno)
+{
+        /* Already being destroyed?  Don't loop. */
+        if (unlikely(get_destroying_bit(t->parent_child)))
+                return;
+
+        set_destroying_bit(&t->parent_child);
+	del_tree_inner(t, orig, saved_errno);
+}
+
+/* Don't have compiler complain we're returning NULL if we promised not to! */
+static void *null_alloc_failed(void)
+{
+#ifdef CCAN_TAL_NEVER_RETURN_NULL
+	abort();
+#else
+	return NULL;
+#endif /* CCAN_TAL_NEVER_RETURN_NULL */
 }
 
 void *tal_alloc_(const tal_t *ctx, size_t size, bool clear, const char *label)
@@ -427,7 +489,8 @@ void *tal_alloc_(const tal_t *ctx, size_t size, bool clear, const char *label)
 
         child = allocate(sizeof(struct tal_hdr) + size);
 	if (!child)
-		return NULL;
+		return null_alloc_failed();
+
 	if (clear)
 		memset(from_tal_hdr(child), 0, size);
         child->prop = (void *)label;
@@ -435,7 +498,7 @@ void *tal_alloc_(const tal_t *ctx, size_t size, bool clear, const char *label)
 
         if (!add_child(parent, child)) {
 		freefn(child);
-		return NULL;
+		return null_alloc_failed();
 	}
 	debug_tal(parent);
 	if (notifiers)
@@ -466,7 +529,7 @@ void *tal_alloc_arr_(const tal_t *ctx, size_t size, size_t count, bool clear,
 		     const char *label)
 {
 	if (!adjust_size(&size, count))
-		return NULL;
+		return null_alloc_failed();
 
 	return tal_alloc_(ctx, size, clear, label);
 }
@@ -479,11 +542,21 @@ void *tal_free(const tal_t *ctx)
 		t = debug_tal(to_tal_hdr(ctx));
 		if (unlikely(get_destroying_bit(t->parent_child)))
 			return NULL;
+		/* Unlink and mark destroying before notifying the parent:
+		 * a notifier which (recursively) calls tal_free() on ctx
+		 * is then a no-op rather than unbounded recursion. */
+		list_del(&t->list);
+		set_destroying_bit(&t->parent_child);
 		if (notifiers)
 			notify(ignore_destroying_bit(t->parent_child)->parent,
 			       TAL_NOTIFY_DEL_CHILD, ctx, saved_errno);
-		list_del(&t->list);
-		del_tree(t, ctx, saved_errno);
+		/* A notifier can rescue ctx by tal_steal()ing it elsewhere:
+		 * add_child() clears the destroying bit. */
+		if (!get_destroying_bit(t->parent_child)) {
+			errno = saved_errno;
+			return NULL;
+		}
+		del_tree_inner(t, ctx, saved_errno);
 		errno = saved_errno;
 	}
 	return NULL;
@@ -497,11 +570,28 @@ void *tal_steal_(const tal_t *new_parent, const tal_t *ctx)
                 newpar = debug_tal(to_tal_hdr_or_null(new_parent));
                 t = debug_tal(to_tal_hdr(ctx));
 
-                /* Unlink it from old parent. */
-		list_del(&t->list);
+		/* Can't steal into a parent which is being destroyed:
+		 * we'd be linked into the list del_tree() is draining,
+		 * and freed (or looped on) anyway. */
+		if (unlikely(get_destroying_bit(newpar->parent_child)))
+			return NULL;
+
+                /* Unlink it from old parent (an object being destroyed
+		 * has already been unlinked: it can only be stolen as a
+		 * rescue from its destructor/notifier). */
+		if (!get_destroying_bit(t->parent_child))
+			list_del(&t->list);
 		old_parent = ignore_destroying_bit(t->parent_child)->parent;
 
                 if (unlikely(!add_child(newpar, t))) {
+			/* No fallback for a rescue from a destructor:
+			 * re-linking into the old parent would silently
+			 * keep the object (its destructor saw NULL), and if
+			 * the old parent is mid-del_tree it would re-enter
+			 * the list being drained.  Leave it unlinked and
+			 * destroying; the free proceeds. */
+			if (get_destroying_bit(t->parent_child))
+				return NULL;
 			/* We can always add to old parent, because it has a
 			 * children property already. */
 			if (!add_child(old_parent, t))
@@ -590,25 +680,34 @@ bool tal_del_destructor2_(const tal_t *ctx, void (*destroy)(void *me, void *arg)
 bool tal_set_name_(tal_t *ctx, const char *name, bool literal)
 {
         struct tal_hdr *t = debug_tal(to_tal_hdr(ctx));
-        struct prop_hdr **prop = find_property_ptr(t, NAME);
+	bool was_literal;
+	char **nptr;
 
         /* Get rid of any old name */
-        if (prop) {
-                struct name *name = (struct name *)*prop;
-                if (is_literal(&name->hdr))
-                        *prop = NULL;
-                else {
-                        *prop = name->hdr.next;
-			freefn(name);
-                }
+	nptr = find_name_property(t, &was_literal);
+	if (nptr) {
+		if (was_literal)
+			*nptr = NULL;
+		else {
+			struct name *oldname;
+
+			oldname = (struct name *)*nptr;
+			*nptr = oldname->hdr.next;
+			freefn(oldname);
+		}
         }
 
         if (literal && name[0]) {
-                struct prop_hdr **p;
+		char **ptr;
+		struct prop_hdr *prop;
 
                 /* Append literal. */
-                for (p = &t->prop; *p && !is_literal(*p); p = &(*p)->next);
-                *p = (struct prop_hdr *)name;
+		for (ptr = &t->prop; *ptr; ptr = &prop->next) {
+			prop = is_prop_hdr(*ptr);
+			if (!prop)
+				break;
+		}
+                *ptr = (char *)name;
         } else if (!add_name_property(t, name))
 		return false;
 
@@ -620,15 +719,16 @@ bool tal_set_name_(tal_t *ctx, const char *name, bool literal)
 
 const char *tal_name(const tal_t *t)
 {
-        struct name *n;
+	char **nptr;
+	bool literal;
 
-	n = find_property(debug_tal(to_tal_hdr(t)), NAME);
-	if (!n)
+	nptr = find_name_property(debug_tal(to_tal_hdr(t)), &literal);
+	if (!nptr)
 		return NULL;
+	if (literal)
+		return *nptr;
 
-	if (is_literal(&n->hdr))
-		return (const char *)n;
-	return n->name;
+	return ((struct name *)(*nptr))->name;
 }
 
 size_t tal_bytelen(const tal_t *ptr)
@@ -744,6 +844,12 @@ bool tal_expand_(tal_t **ctxp, const void *src, size_t size, size_t count)
 
 	old_len = debug_tal(to_tal_hdr(*ctxp))->bytelen;
 
+	/* Check for multiplicative overflow */
+	if (size && unlikely(count * size / size != count)) {
+		call_error("dup size overflow");
+		goto out;
+	}
+
 	/* Check for additive overflow */
 	if (old_len + count * size < old_len) {
 		call_error("dup size overflow");
@@ -754,7 +860,9 @@ bool tal_expand_(tal_t **ctxp, const void *src, size_t size, size_t count)
 	assert(src < *ctxp
 	       || (char *)src >= (char *)(*ctxp) + old_len);
 
-	if (!tal_resize_(ctxp, size, old_len/size + count, false))
+	/* Resize by raw length, so excess bytes are preserved and
+	 * tal_count() grows by exactly count. */
+	if (!tal_resize_(ctxp, 1, old_len + count * size, false))
 		goto out;
 
 	memcpy((char *)*ctxp + old_len, src, count * size);
@@ -767,11 +875,17 @@ out:
 }
 
 void *tal_dup_(const tal_t *ctx, const void *p, size_t size,
-	       size_t n, size_t extra, const char *label)
+	       size_t n, size_t extra, bool nullok, const char *label)
 {
 	void *ret;
 	size_t nbytes = size;
 
+	if (nullok && p == NULL) {
+		/* take(NULL) works. */
+		(void)taken(p);
+		return NULL;
+	}
+	
 	if (!adjust_size(&nbytes, n)) {
 		if (taken(p))
 			tal_free(p);
@@ -797,9 +911,14 @@ void *tal_dup_(const tal_t *ctx, const void *p, size_t size,
 	}
 
 	ret = tal_alloc_arr_(ctx, size, n + extra, false, label);
-	if (ret)
+	if (ret && p)
 		memcpy(ret, p, nbytes);
 	return ret;
+}
+
+void *tal_dup_talarr_(const tal_t *ctx, const tal_t *src TAKES, const char *label)
+{
+	return tal_dup_(ctx, src, 1, tal_bytelen(src), 0, true, label);
 }
 
 void tal_set_backend(void *(*alloc_fn)(size_t size),
@@ -821,39 +940,41 @@ void tal_set_backend(void *(*alloc_fn)(size_t size),
 static void dump_node(unsigned int indent, const struct tal_hdr *t)
 {
 	unsigned int i;
-        const struct prop_hdr *p;
+        const struct prop_hdr *prop;
+	const char *ptr;
 
 	for (i = 0; i < indent; i++)
-		printf("  ");
-	printf("%p len=%zu", t, t->bytelen);
-        for (p = t->prop; p; p = p->next) {
+		fprintf(stderr, "  ");
+	fprintf(stderr, "%p len=%zu", t, t->bytelen);
+        for (ptr = t->prop; ptr; ptr = prop->next) {
 		struct children *c;
 		struct name *n;
 		struct notifier *no;
-                if (is_literal(p)) {
-			printf(" \"%s\"", (const char *)p);
+                prop = is_prop_hdr(ptr);
+		if (!prop) {
+			fprintf(stderr, " \"%s\"", ptr);
 			break;
 		}
-		switch (p->type) {
+		switch (prop->type) {
 		case CHILDREN:
-			c = (struct children *)p;
-			printf(" CHILDREN(%p):parent=%p,children={%p,%p}\n",
-			       p, c->parent,
+			c = (struct children *)prop;
+			fprintf(stderr, " CHILDREN(%p):parent=%p,children={%p,%p}",
+			       prop, c->parent,
 			       c->children.n.prev, c->children.n.next);
 			break;
 		case NAME:
-			n = (struct name *)p;
-			printf(" NAME(%p):%s", p, n->name);
+			n = (struct name *)prop;
+			fprintf(stderr, " NAME(%p):%s", prop, n->name);
 			break;
 		case NOTIFIER:
-			no = (struct notifier *)p;
-			printf(" NOTIFIER(%p):fn=%p", p, no->u.notifyfn);
+			no = (struct notifier *)prop;
+			fprintf(stderr, " NOTIFIER(%p):fn=%p", prop, no->u.notifyfn);
 			break;
 		default:
-			printf(" **UNKNOWN(%p):%i**", p, p->type);
+			fprintf(stderr, " **UNKNOWN(%p):%i**", prop, prop->type);
 		}
 	}
-	printf("\n");
+	fprintf(stderr, "\n");
 }
 
 static void tal_dump_(unsigned int level, const struct tal_hdr *t)
@@ -862,7 +983,7 @@ static void tal_dump_(unsigned int level, const struct tal_hdr *t)
 
 	dump_node(level, t);
 
-	children = find_property(t, CHILDREN);
+	children = find_property((struct tal_hdr *)t, CHILDREN);
 	if (children) {
 		struct tal_hdr *i;
 
@@ -884,7 +1005,8 @@ static bool check_err(struct tal_hdr *t, const char *errorstr,
 	if (errorstr) {
 		/* Try not to malloc: it may be corrupted. */
 		char msg[strlen(errorstr) + 20 + strlen(errmsg) + 1];
-		sprintf(msg, "%s:%p %s", errorstr, from_tal_hdr(t), errmsg);
+		snprintf(msg, sizeof(msg), "%s:%p %s", errorstr, from_tal_hdr(t), errmsg);
+		msg[sizeof(msg) - 1] = '\0';
 		call_error(msg);
 	}
 	return false;
@@ -893,7 +1015,8 @@ static bool check_err(struct tal_hdr *t, const char *errorstr,
 static bool check_node(struct children *parent_child,
 		       struct tal_hdr *t, const char *errorstr)
 {
-	struct prop_hdr *p;
+	struct prop_hdr *prop;
+	char *p;
 	struct name *name = NULL;
 	struct children *children = NULL;
 
@@ -903,23 +1026,24 @@ static bool check_node(struct children *parent_child,
 	if (ignore_destroying_bit(t->parent_child) != parent_child)
 		return check_err(t, errorstr, "incorrect parent");
 
-	for (p = t->prop; p; p = p->next) {
-		if (is_literal(p)) {
+	for (p = t->prop; p; p = prop->next) {
+		prop = is_prop_hdr(p);
+		if (!prop) {
 			if (name)
 				return check_err(t, errorstr,
 						 "has extra literal");
 			break;
 		}
-		if (!in_bounds(p))
+		if (!in_bounds(prop))
 			return check_err(t, errorstr,
 					 "has bad property pointer");
 
-		switch (p->type) {
+		switch (prop->type) {
 		case CHILDREN:
 			if (children)
 				return check_err(t, errorstr,
 						 "has two child nodes");
-			children = (struct children *)p;
+			children = (struct children *)prop;
 			break;
 		case NOTIFIER:
 			break;
@@ -927,7 +1051,7 @@ static bool check_node(struct children *parent_child,
 			if (name)
 				return check_err(t, errorstr,
 						 "has two names");
-			name = (struct name *)p;
+			name = (struct name *)prop;
 			break;
 		default:
 			return check_err(t, errorstr, "has unknown property");
